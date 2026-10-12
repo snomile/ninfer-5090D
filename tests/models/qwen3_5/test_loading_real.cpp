@@ -72,6 +72,14 @@ void check_selection(const qwen::LoadPlan& plan, const LoadOptions& options) {
     }
     require(end == plan.materialization().device_capacity_bytes,
             "weight capacity differs from actual placements");
+    const auto& embedding = plan.parameter(weights.text.token_embedding);
+    require(embedding.residency == (options.host_mapped_embedding
+                                        ? artifact::Residency::HostMapped
+                                        : artifact::Residency::Device),
+            "embedding residency differs from startup selection");
+    require(plan.materialization().mapped_host_objects.size() ==
+                static_cast<std::size_t>(options.host_mapped_embedding),
+            "mapped Host object count differs from startup selection");
 }
 
 // Exercise native grouping after Reader destruction, independently of Program selection.
@@ -184,6 +192,8 @@ int main(int argc, char** argv) {
                 path = value();
             } else if (arg == "--vision") {
                 options.vision = true;
+            } else if (arg == "--host-mapped-embedding") {
+                options.host_mapped_embedding = true;
             } else if (arg == "--host-only") {
                 host_only = true;
             } else if (arg == "--scoring") {
@@ -211,8 +221,10 @@ int main(int argc, char** argv) {
                     throw std::invalid_argument("unknown proposal head");
                 }
             } else if (arg == "--help") {
-                std::cout << "--artifact PATH [--vision] [--speculative none|mtp|dflash|dflash2]\n"
-                             "[--proposal full|optimized] [--host-only] [--scoring]\n";
+                std::cout
+                    << "--artifact PATH [--vision] [--host-mapped-embedding] "
+                       "[--speculative none|mtp|dflash|dflash2]\n"
+                       "[--proposal full|optimized] [--host-only] [--scoring]\n";
                 return 0;
             } else {
                 throw std::invalid_argument("unknown argument " + arg);
@@ -226,6 +238,7 @@ int main(int argc, char** argv) {
         std::unique_ptr<qwen::Model> model;
         std::map<std::string, std::vector<Sample>> samples;
         std::uint64_t expected_h2d = 0;
+        std::uint64_t expected_mapped_host = 0;
         {
             artifact::Reader reader(path);
             auto plan = qwen::plan_load(reader, options);
@@ -252,11 +265,24 @@ int main(int argc, char** argv) {
                         {offset, reader.read_range(object.offset + offset, count)});
                 }
             }
+            for (const auto& item : plan.materialization().mapped_host_objects) {
+                const auto& object = reader.directory().tensor(item.object);
+                expected_mapped_host += object.bytes;
+                const auto size = std::min<std::uint64_t>(64, object.bytes);
+                for (const auto offset :
+                     {std::uint64_t{0}, (object.bytes - size) / 2, object.bytes - size}) {
+                    const auto count = std::min<std::uint64_t>(size, object.bytes - offset);
+                    samples[object.id].push_back(
+                        {offset, reader.read_range(object.offset + offset, count)});
+                }
+            }
             device = std::make_unique<DeviceContext>();
             model  = qwen::materialize_model(std::move(plan), *device);
         }
         require(model->storage_stats().h2d_bytes == expected_h2d,
                 "H2D did not cover all selected parent bytes");
+        require(model->storage_stats().mapped_host_bytes == expected_mapped_host,
+                "mapped Host bytes differ from selected parent bytes");
         std::set<const WeightParent*> visited;
         for (const auto& weight : model->weight_data()) {
             require(weight.view.parts.size() == weight.source_objects.size(),

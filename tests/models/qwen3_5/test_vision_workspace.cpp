@@ -148,9 +148,11 @@ int main() {
         selected.proposal_head = ninfer::ProposalHead::Optimized;
         auto model             = qwen::load_model(artifact, selected, device);
         const qwen::execution::Parameters parameters(*model);
-        const auto capacity = [&](std::uint32_t max_context) {
+        const auto capacity = [&](std::uint32_t max_context,
+                                  std::uint32_t max_vision_item_tokens = 16'384) {
             ninfer::EngineOptions options;
             options.max_context         = max_context;
+            options.max_vision_item_tokens = max_vision_item_tokens;
             options.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
             options.prefill_chunk       = 1024;
             options.kv_cache            = ninfer::KvCacheStorage::Fp8E4M3Row256;
@@ -167,11 +169,14 @@ int main() {
         // Increasing total context cannot exceed the single Vision item's 16K workspace.
         const auto at_item_limit    = capacity(16384);
         const auto above_item_limit = capacity(131072);
+        const auto at_4k_item_limit = capacity(131072, 4096);
         if (at_item_limit == 0 || at_item_limit > kWorkspaceCeiling ||
-            above_item_limit != at_item_limit) {
+            above_item_limit != at_item_limit || at_4k_item_limit == 0 ||
+            at_4k_item_limit >= at_item_limit) {
             throw std::runtime_error("Vision workspace exceeded the single-item bound: at=" +
                                      std::to_string(at_item_limit) +
-                                     " above=" + std::to_string(above_item_limit));
+                                     " above=" + std::to_string(above_item_limit) +
+                                     " at_4k=" + std::to_string(at_4k_item_limit));
         }
         test_handoff_lifetime(device, parameters);
         std::cout << "Vision workspace remains bounded for long text context\n";

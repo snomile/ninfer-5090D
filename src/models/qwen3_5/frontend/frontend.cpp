@@ -551,10 +551,22 @@ public:
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
+        if (options.max_vision_item_tokens == 0 ||
+            options.max_vision_item_tokens > kMaximumVisionItemTokens) {
+            throw std::invalid_argument(
+                "frontend max_vision_item_tokens must be in [1,16384]");
+        }
         const std::uint64_t vision_tokens =
             std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
         processor.max_vision_tokens = vision_tokens;
         processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
+        const std::uint64_t item_tokens =
+            std::min<std::uint64_t>({options.max_context, options.max_vision_item_tokens,
+                                     kMaximumVisionItemTokens});
+        processor.max_item_vision_tokens = item_tokens;
+        processor.max_item_raw_patches   = item_tokens * kRawPatchesPerVisionToken;
+        processor.image_max_pixels = std::min(processor.image_max_pixels, item_tokens * 1024);
+        processor.video_max_pixels = std::min(processor.video_max_pixels, item_tokens * 2048);
         if (vision_enabled) {
             const std::uint64_t minimum_live =
                 processor.max_raw_patches * kPreparedVisionPatchFeatures * sizeof(std::uint16_t);

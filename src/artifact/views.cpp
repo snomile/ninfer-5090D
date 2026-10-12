@@ -11,7 +11,8 @@ WeightView bind_view(const ParameterReference& reference,
     out.shape             = reference.shape;
     std::uint64_t covered = 0;
     for (const auto& part : reference.binding.parts) {
-        const auto& parent = reference.residency == Residency::Device
+        const auto& parent = reference.residency == Residency::Device ||
+                                     reference.residency == Residency::HostMapped
                                  ? materialized.device_parent(part.object)
                                  : materialized.host_parent(part.object);
         if (part.begin >= part.end || part.end > parent.geometry.elements) {

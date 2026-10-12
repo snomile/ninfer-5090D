@@ -95,6 +95,7 @@ std::string usage_text(const char* argv0) {
            "        --regex PATTERN | --choice TEXT ...]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max] [--vision]\n"
+           "       [--max-vision-item-tokens N] [--host-mapped-embedding]\n"
            "       [--no-cuda-graph]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "\n"
@@ -175,6 +176,11 @@ Options parse_options(int argc, char** argv) {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--max-vision-item-tokens") {
+            options.max_vision_item_tokens =
+                parse_u32(value(arg), "max-vision-item-tokens");
+        } else if (arg == "--host-mapped-embedding") {
+            options.host_mapped_embedding = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--stop-token-id") {
@@ -236,6 +242,9 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
+    }
+    if (options.max_vision_item_tokens == 0 || options.max_vision_item_tokens > 16'384) {
+        throw std::invalid_argument("--max-vision-item-tokens must be in [1,16384]");
     }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {

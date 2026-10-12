@@ -727,7 +727,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(plan.capacity, kMaximumVisionItemTokens));
+            std::min<std::uint64_t>({plan.capacity, plan.max_vision_item_tokens,
+                                     kMaximumVisionItemTokens}));
         out.vision = execution::VisionContext::plan_workspace(
             *parameters.model.config().vision, *parameters.vision, merged, out.general_capacity);
         out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
@@ -755,6 +756,10 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
+    }
+    if (options.max_vision_item_tokens == 0 ||
+        options.max_vision_item_tokens > kMaximumVisionItemTokens) {
+        throw std::invalid_argument("max_vision_item_tokens must be in [1,16384]");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
@@ -828,6 +833,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency      = inputs.max_concurrency;
     impl->prefill_chunk        = inputs.prefill_chunk;
+    impl->max_vision_item_tokens = inputs.max_vision_item_tokens;
     impl->draft_window         = inputs.draft_window;
     impl->speculative_backend  = inputs.speculative_backend;
     impl->proposal_head        = inputs.proposal_head;
@@ -907,6 +913,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity             = options.max_context,
         .max_concurrency      = options.max_concurrency,
         .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
+        .max_vision_item_tokens = options.max_vision_item_tokens,
         .draft_window         = options.speculative.draft_tokens,
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,

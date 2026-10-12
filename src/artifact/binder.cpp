@@ -58,6 +58,8 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
             require_device(part.object);
         } else if (residency == Residency::Host) {
             (void)host_object(part.object);
+        } else if (residency == Residency::HostMapped) {
+            require_mapped_host(part.object);
         }
     }
     return {std::move(name), std::move(shape), binding, residency};
@@ -83,6 +85,11 @@ void Binder::require_device(ObjectHandle object, std::uint64_t alignment) {
     auto& demand     = demands_.at(object.index);
     demand.device    = true;
     demand.alignment = std::max({demand.alignment, alignment, geometry.alignment});
+}
+
+void Binder::require_mapped_host(ObjectHandle object) {
+    reader_.validate_object(object);
+    demands_.at(object.index).mapped_host = true;
 }
 
 std::span<const std::byte> Binder::host_object(ObjectHandle object) {
@@ -162,6 +169,11 @@ MaterializationPlan Binder::finish() && {
     plan.owned_value_bytes = owned_value_bytes_;
     for (std::size_t i = 0; i < demands_.size(); ++i) {
         auto& demand = demands_[i];
+        if (demand.mapped_host && (demand.device || demand.host)) {
+            throw ArtifactError(
+                object_id(reader_.directory().object(ObjectHandle{i})) +
+                ": mapped Host placement conflicts with another physical residency");
+        }
         if (demand.device) {
             const ObjectHandle handle{i};
             const auto& geometry = reader_.geometry(handle);
@@ -172,6 +184,10 @@ MaterializationPlan Binder::finish() && {
         }
         if (demand.host) {
             plan.host_objects.push_back({ObjectHandle{i}, std::move(demand.host_data)});
+        }
+        if (demand.mapped_host) {
+            const ObjectHandle handle{i};
+            plan.mapped_host_objects.push_back({handle, object_bytes(reader_.directory().object(handle))});
         }
     }
     return plan;

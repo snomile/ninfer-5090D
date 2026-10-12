@@ -9,6 +9,7 @@ namespace ninfer::models {
 struct LoadOptions {
     EnginePurpose purpose          = EnginePurpose::Generation;
     bool vision                    = false;
+    bool host_mapped_embedding     = false;
     SpeculativeBackend speculative = SpeculativeBackend::None;
     ProposalHead proposal_head     = ProposalHead::Full;
 
@@ -55,6 +56,7 @@ struct LoadOptions {
 [[nodiscard]] inline LoadOptions load_options(const EngineOptions& options) noexcept {
     return {.purpose       = options.purpose,
             .vision        = options.enable_vision,
+            .host_mapped_embedding = options.host_mapped_embedding,
             .speculative   = options.speculative.backend,
             .proposal_head = options.speculative.proposal_head};
 }

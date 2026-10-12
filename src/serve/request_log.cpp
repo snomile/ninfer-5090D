@@ -511,9 +511,12 @@ std::string format_server_start_json(
                                                           {"prefill_signature", load.prefill_signature},
                                                           {"bytes_read", load.artifact_bytes_read},
                                                           {"host_to_device_bytes", load.host_to_device_bytes},
+                                                          {"mapped_host_bytes", load.mapped_host_bytes},
                                                           {"peak_staging_bytes", load.peak_staging_bytes},
                                                           {"device_object_count", load.device_object_count},
                                                           {"host_object_count", load.host_object_count},
+                                                          {"mapped_host_object_count",
+                                                           load.mapped_host_object_count},
                                                           {"load_seconds", load.load_seconds},
                                                           {"upload_seconds", load.upload_seconds}};
     const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
@@ -535,6 +538,8 @@ std::string format_server_start_json(
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
              {"vision", engine_options.enable_vision},
+             {"max_vision_item_tokens", engine_options.max_vision_item_tokens},
+             {"host_mapped_embedding", engine_options.host_mapped_embedding},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"prefix_reuse", options.allow_prefix_reuse},
              {"speculative_backend",

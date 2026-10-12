@@ -1420,6 +1420,30 @@ int test_image_resize_rejection_policy() {
     return failures;
 }
 
+int test_4k_item_limit_preserves_1080p() {
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.vision_enabled          = true;
+    options.max_context             = 32'768;
+    options.max_vision_item_tokens  = 4'096;
+    const Frontend frontend         = make_frontend(resources(), options);
+    ninfer::PromptInput input =
+        image_text_input(block_ppm(1920, 1080, 127), {}, "1920x1080.ppm");
+    const std::uint32_t counted = frontend.count_tokens(input);
+    const auto prepared         = frontend.prepare(std::move(input));
+    const auto& data            = FrontendFactory::inspect(prepared);
+    if (data.vision_items.size() != 1) {
+        return check(false, "4K item limit lost the 1080p Vision item");
+    }
+    const auto& item = data.vision_items.front();
+    return check(item.grid.temporal == 1 && item.grid.height == 68 &&
+                     item.grid.width == 120 && item.patch_count == 8'160 &&
+                     data.prepare.raw_patches == 8'160 &&
+                     data.prepare.vision_tokens == 2'040 &&
+                     item.token_spans.size() == 1 && item.token_spans.front().count == 2'040 &&
+                     counted == data.token_ids.size(),
+                 "4K item limit resized or changed the 1920x1080 Vision geometry");
+}
+
 int test_explicit_leading_instruction_cache_boundary() {
     const Frontend frontend           = make_frontend(resources(), false);
     constexpr std::string_view stable = "stable cache section.";
@@ -2617,6 +2641,7 @@ int main() {
     failures += test_media_token_ids_come_from_tokenizer();
     failures += test_template_media_contract();
     failures += test_image_resize_rejection_policy();
+    failures += test_4k_item_limit_preserves_1080p();
     failures += test_explicit_leading_instruction_cache_boundary();
     failures += test_trimmed_source_cache_boundaries();
     failures += test_source_part_recovery_boundary();

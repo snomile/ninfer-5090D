@@ -32,8 +32,10 @@ struct Options {
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
-    bool enable_vision  = false;
-    bool use_cuda_graph = true;
+    std::uint32_t max_vision_item_tokens = 16'384;
+    bool host_mapped_embedding           = false;
+    bool enable_vision                   = false;
+    bool use_cuda_graph                  = true;
 
     bool raw_output      = false;
     bool print_token_ids = false;

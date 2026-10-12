@@ -50,6 +50,22 @@ void file_set_and_bindings() {
     require(plan.device_objects.size() == 1 && plan.device_capacity_bytes == 528 &&
                 plan.host_objects.size() == 1,
             "selected parent deduplication or residency failed");
+
+    Binder mapped(reader);
+    const auto mapped_matrix =
+        mapped.parameter("matrix", {2, 130}, Residency::HostMapped);
+    auto mapped_plan = std::move(mapped).finish();
+    require(mapped_matrix.residency == Residency::HostMapped &&
+                mapped_plan.device_capacity_bytes == 0 &&
+                mapped_plan.mapped_host_objects.size() == 1 &&
+                mapped_plan.mapped_host_objects.front().bytes == 528,
+            "mapped Host demand retained a device allocation");
+
+    Binder conflicting(reader);
+    (void)conflicting.parameter("matrix", {2, 130});
+    (void)conflicting.parameter("row", {1, 130}, Residency::HostMapped);
+    rejects([&] { (void)std::move(conflicting).finish(); },
+            "one physical parent accepted conflicting device and mapped Host residency");
 }
 
 void geometry_and_views() {

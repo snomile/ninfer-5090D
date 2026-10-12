@@ -314,6 +314,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
+    engine_options.max_vision_item_tokens   = options_.max_vision_item_tokens;
+    engine_options.host_mapped_embedding    = options_.host_mapped_embedding;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;

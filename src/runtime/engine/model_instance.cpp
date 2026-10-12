@@ -54,6 +54,9 @@ void validate_options(const EngineOptions& options) {
         throw std::invalid_argument(
             "Engine media_live_bytes must be nonzero when Vision is enabled");
     }
+    if (options.max_vision_item_tokens == 0 || options.max_vision_item_tokens > 16'384) {
+        throw std::invalid_argument("Engine max_vision_item_tokens must be in [1,16384]");
+    }
     if (options.media_preprocess_threads > 64) {
         throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
     }
@@ -110,6 +113,7 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                                .architecture             = model->config().text.architecture,
                                .vision_enabled           = options.enable_vision,
                                .max_context              = options.max_context,
+                               .max_vision_item_tokens   = options.max_vision_item_tokens,
                                .media_cache_bytes        = options.media_cache_bytes,
                                .media_live_bytes         = options.media_live_bytes,
                                .media_preprocess_threads = options.media_preprocess_threads})),
@@ -173,8 +177,10 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     summary.artifact_bytes_read  = stats.read_bytes;
     summary.host_to_device_bytes = stats.h2d_bytes;
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
+    summary.mapped_host_bytes    = stats.mapped_host_bytes;
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
+    summary.mapped_host_object_count = stats.mapped_host_object_count;
     summary.context_cost         = std::move(context_cost.summary);
     return {std::move(instance), std::move(summary), std::move(context_cost.model)};
 }

@@ -160,6 +160,8 @@ struct EngineOptions {
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
+    std::uint32_t max_vision_item_tokens    = 16'384;
+    bool host_mapped_embedding              = false;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
@@ -1109,8 +1111,10 @@ struct LoadSummary {
     std::uint64_t artifact_bytes_read  = 0;
     std::uint64_t host_to_device_bytes = 0;
     std::uint64_t peak_staging_bytes   = 0;
+    std::uint64_t mapped_host_bytes    = 0;
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;
+    std::size_t mapped_host_object_count = 0;
     ContextCostSummary context_cost;
 };
 

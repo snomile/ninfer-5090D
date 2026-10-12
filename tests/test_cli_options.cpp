@@ -94,6 +94,18 @@ int main() {
                           dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
                           dflash_vision.speculative.draft_tokens == 7,
                       "CLI did not preserve the combined DFlash and Vision startup features");
+    const auto memory_optimized =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision",
+               "--max-vision-item-tokens", "4096", "--host-mapped-embedding"});
+    failures += check(memory_optimized.max_vision_item_tokens == 4096 &&
+                          memory_optimized.host_mapped_embedding,
+                      "CLI did not preserve memory optimization options");
+    failures += check(
+        rejects([] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                         "--max-vision-item-tokens", "16385"});
+        }),
+        "CLI accepted a Vision item limit above the compiled execution capacity");
     for (const auto k : {1U, 2U, 7U, 15U}) {
         const auto dflash2 = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
                                     "dflash2", "--draft-tokens", std::to_string(k)});

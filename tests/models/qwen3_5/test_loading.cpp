@@ -192,6 +192,9 @@ void logical_data_and_instances() {
                 plan.parameter(plan.weights().text.output_head).binding.parts[0].object,
             "explicit shared embedding/head did not bind the same parent");
     const auto capacity = plan.materialization().device_capacity_bytes;
+    rejects([&] {
+        (void)qwen::plan_load(reader, {.host_mapped_embedding = true});
+    }, "shared embedding/output-head parent accepted incompatible mapped residency");
     require(!plan.weights().vision && plan.resources().preprocessor_config_json.empty(),
             "unused Vision was required");
     rejects([&] { (void)qwen::plan_load(reader, {.vision = true}); },
