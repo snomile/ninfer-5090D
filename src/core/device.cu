@@ -66,7 +66,7 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
 }
 
 DeviceContext::DeviceContext(int device_id) : device(device_id) {
-    const unsigned int sync_flags = sync_schedule_from_environment();
+    const unsigned int device_flags = sync_schedule_from_environment() | cudaDeviceMapHost;
     int count       = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
     if (err != cudaSuccess) {
@@ -77,7 +77,7 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
 
     bind_to_current_thread();
 
-    err = cudaSetDeviceFlags(sync_flags);
+    err = cudaSetDeviceFlags(device_flags);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaSetDeviceFlags failed", err));
     }

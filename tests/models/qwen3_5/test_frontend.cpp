@@ -1431,23 +1431,6 @@ int test_4k_item_limit_preserves_1080p() {
     const std::uint32_t counted = frontend.count_tokens(input);
     const auto prepared         = frontend.prepare(std::move(input));
     const auto& data            = FrontendFactory::inspect(prepared);
-    std::array<double, 3> repeated_preprocess{};
-    std::array<double, 3> repeated_total{};
-    for (std::size_t index = 0; index < repeated_preprocess.size(); ++index) {
-        const Frontend repeated_frontend = make_frontend(resources(), options);
-        const auto repeated = repeated_frontend.prepare(
-            image_text_input(block_ppm(1920, 1080, 127), {}, "1920x1080.ppm"));
-        const auto stats               = repeated.preparation_stats();
-        repeated_preprocess[index]     = stats.media_preprocess_seconds;
-        repeated_total[index]          = stats.seconds;
-    }
-    std::sort(repeated_preprocess.begin(), repeated_preprocess.end());
-    std::sort(repeated_total.begin(), repeated_total.end());
-    std::cout << "vision_1080p_4k cold_preprocess_seconds="
-              << data.prepare.media_preprocess_seconds
-              << " repeated_preprocess_median_seconds=" << repeated_preprocess[1]
-              << " cold_total_seconds=" << data.prepare.seconds
-              << " repeated_total_median_seconds=" << repeated_total[1] << '\n';
     if (data.vision_items.size() != 1) {
         return check(false, "4K item limit lost the 1080p Vision item");
     }
