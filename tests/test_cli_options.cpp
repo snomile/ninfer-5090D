@@ -31,7 +31,11 @@ int check(bool condition, const char* message) {
 } // namespace
 
 int main() {
-    int failures      = 0;
+    int failures        = 0;
+    const auto defaults = parse({"ninfer", "model.ninfer", "--prompt", "hello"});
+    failures += check(!defaults.host_mapped_dflash2_codebooks &&
+                          !defaults.host_pinned_vision_weights && !defaults.host_state_images,
+                      "CLI Host memory optimizations are not disabled by default");
     const auto choice = parse({"ninfer", "model.ninfer", "--prompt", "hello", "--choice", "",
                                "--choice", "a|b", "--choice", "你好"});
     failures += check(choice.choices == std::vector<std::string>{"", "a|b", "你好"},
@@ -94,18 +98,30 @@ int main() {
                           dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
                           dflash_vision.speculative.draft_tokens == 7,
                       "CLI did not preserve the combined DFlash and Vision startup features");
-    const auto memory_optimized =
-        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision",
-               "--max-vision-item-tokens", "4096", "--host-mapped-embedding"});
-    failures += check(memory_optimized.max_vision_item_tokens == 4096 &&
-                          memory_optimized.host_mapped_embedding,
-                      "CLI did not preserve memory optimization options");
+    const auto memory_optimized = parse(
+        {"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision", "--spec", "dflash2",
+         "--draft-tokens", "7", "--max-vision-item-tokens", "4096", "--host-mapped-embedding",
+         "--host-mapped-dflash2-codebooks", "--host-pinned-vision-weights", "--host-state-images"});
     failures += check(
-        rejects([] {
-            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
-                         "--max-vision-item-tokens", "16385"});
-        }),
-        "CLI accepted a Vision item limit above the compiled execution capacity");
+        memory_optimized.max_vision_item_tokens == 4096 && memory_optimized.host_mapped_embedding &&
+            memory_optimized.host_mapped_dflash2_codebooks &&
+            memory_optimized.host_pinned_vision_weights && memory_optimized.host_state_images,
+        "CLI did not preserve memory optimization options");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--host-mapped-dflash2-codebooks"});
+                      }),
+                      "CLI accepted Host-mapped codebooks without DFlash2");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--host-pinned-vision-weights"});
+                      }),
+                      "CLI accepted Host-pinned Vision weights without Vision");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--max-vision-item-tokens", "16385"});
+                      }),
+                      "CLI accepted a Vision item limit above the compiled execution capacity");
     for (const auto k : {1U, 2U, 7U, 15U}) {
         const auto dflash2 = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
                                     "dflash2", "--draft-tokens", std::to_string(k)});

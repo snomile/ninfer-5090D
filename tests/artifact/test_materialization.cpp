@@ -95,6 +95,20 @@ void failure_and_host_only(DeviceContext& device) {
     require(backing.stats().device_capacity_bytes == 0 && backing.stats().h2d_bytes == 0 &&
                 backing.host_bytes(resource).size() == 5,
             "Host-only demand allocated device weights");
+    Binder pinned_binder(reader);
+    const auto pinned_reference =
+        pinned_binder.parameter("matrix", {2, 130}, Residency::HostPinned);
+    auto pinned            = materialize(reader, std::move(pinned_binder).finish(), device);
+    const auto pinned_view = bind_view(pinned_reference, pinned);
+    require(pinned.stats().device_capacity_bytes == 0 && pinned.stats().pinned_host_bytes == 528 &&
+                pinned.stats().pinned_host_object_count == 1 &&
+                pinned.stats().retained_host_bytes == 528 &&
+                pinned_view.parts.front().parent->data ==
+                    pinned.host_bytes(reader.find("q5")).data(),
+            "pinned Host materialization did not retain one Host weight parent");
+    require(std::equal(pinned.host_bytes(reader.find("q5")).begin(),
+                       pinned.host_bytes(reader.find("q5")).end(), fixture.payload.begin() + 256),
+            "pinned Host materialization changed object bytes");
     materialization(device);
 }
 

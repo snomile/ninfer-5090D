@@ -2,6 +2,7 @@
 #include "artifact/fixture.h"
 #include "artifact/formats.h"
 #include "models/qwen3_5/load.h"
+#include "models/qwen3_5/load/bindings.h"
 
 #include <algorithm>
 #include <array>
@@ -192,9 +193,12 @@ void logical_data_and_instances() {
                 plan.parameter(plan.weights().text.output_head).binding.parts[0].object,
             "explicit shared embedding/head did not bind the same parent");
     const auto capacity = plan.materialization().device_capacity_bytes;
-    rejects([&] {
-        (void)qwen::plan_load(reader, {.host_mapped_embedding = true});
-    }, "shared embedding/output-head parent accepted incompatible mapped residency");
+    rejects([&] { (void)qwen::plan_load(reader, {.host_mapped_embedding = true}); },
+            "shared embedding/output-head parent accepted incompatible mapped residency");
+    rejects([&] { (void)qwen::plan_load(reader, {.host_pinned_vision_weights = true}); },
+            "Host-pinned Vision weights were accepted without Vision");
+    rejects([&] { (void)qwen::plan_load(reader, {.host_mapped_dflash2_codebooks = true}); },
+            "Host-mapped DFlash2 codebooks were accepted without DFlash2");
     require(!plan.weights().vision && plan.resources().preprocessor_config_json.empty(),
             "unused Vision was required");
     rejects([&] { (void)qwen::plan_load(reader, {.vision = true}); },
@@ -296,6 +300,141 @@ void native_uses() {
         "combined coverage hid an incorrect gate/up boundary");
 }
 
+void optional_host_residencies() {
+    ModelFixture fixture;
+    const qwen::VisionConfig vision{
+        .depth                   = 1,
+        .hidden_size             = 8,
+        .intermediate_size       = 12,
+        .num_heads               = 1,
+        .patch_size              = 2,
+        .temporal_patch_size     = 1,
+        .spatial_merge_size      = 2,
+        .num_position_embeddings = 4,
+        .position_grid_side      = 2,
+    };
+    const std::uint64_t h = vision.hidden_size;
+    fixture.parameter("vision/patch_embedding", {h, vision.patch_width()}, "vision/patch_input");
+    fixture.parameter("vision/patch_embedding_bias", {h});
+    fixture.parameter("vision/position_embedding", {vision.num_position_embeddings, h});
+    const std::string p = "vision/layers/0/";
+    for (const auto* name : {"norm1_weight", "norm1_bias", "norm2_weight", "norm2_bias"}) {
+        fixture.parameter(p + name, {h});
+    }
+    for (const auto* name : {"query", "key", "value"}) {
+        fixture.parameter(p + "attention/" + name, {h, h}, p + "attention_input");
+    }
+    for (const auto* name : {"query_bias", "key_bias", "value_bias"}) {
+        fixture.parameter(p + "attention/" + name, {h});
+    }
+    fixture.parameter(p + "attention/output", {h, h}, p + "attention_output");
+    fixture.parameter(p + "attention/output_bias", {h});
+    fixture.parameter(p + "mlp/fc1", {vision.intermediate_size, h}, p + "mlp_input");
+    fixture.parameter(p + "mlp/fc1_bias", {vision.intermediate_size});
+    fixture.parameter(p + "mlp/fc2", {h, vision.intermediate_size}, p + "mlp_activation");
+    fixture.parameter(p + "mlp/fc2_bias", {h});
+    fixture.parameter("vision/merger/norm_weight", {h});
+    fixture.parameter("vision/merger/norm_bias", {h});
+    fixture.parameter("vision/merger/fc1", {vision.merger_width(), vision.merger_width()},
+                      "vision/merger/input");
+    fixture.parameter("vision/merger/fc1_bias", {vision.merger_width()});
+    fixture.parameter("vision/merger/fc2", {128, vision.merger_width()},
+                      "vision/merger/activation");
+    fixture.parameter("vision/merger/fc2_bias", {128});
+
+    qwen::DraftConfig draft;
+    draft.num_hidden_layers = 1;
+    draft.dflash2           = qwen::DFlash2Config{
+                  .conv_kernel_size = 2, .conv_group_size = 16, .selector_rank = 4, .selector_top_k = 2};
+    const std::uint64_t rows =
+        2ULL * draft.dflash2->conv_kernel_size * 128 / draft.dflash2->conv_group_size;
+    for (const auto* name : {"attention_conv", "mlp_conv"}) {
+        fixture.parameter("dflash2/layers/0/" + std::string(name) + "/base_kernel",
+                          {2, draft.dflash2->conv_kernel_size, 128});
+        fixture.parameter("dflash2/layers/0/" + std::string(name) + "/kernel_projection",
+                          {rows, 128}, "dflash2/layers/0/" + std::string(name) + "_input");
+    }
+    fixture.parameter("dflash2/candidate_selector/hidden_projection",
+                      {draft.dflash2->selector_rank, 128}, "dflash2/final_hidden");
+    fixture.parameter("dflash2/candidate_selector/predecessor_codebook",
+                      {272, draft.dflash2->selector_rank});
+    fixture.parameter("dflash2/candidate_selector/successor_codebook",
+                      {272, draft.dflash2->selector_rank});
+    fixture.file.root["files"][0]["payload_bytes"] = fixture.file.payload.size();
+    fixture.file.write();
+
+    artifact::Reader reader(fixture.file.entry);
+    artifact::Binder default_vision_binder(reader);
+    qwen::loading::Bindings default_vision_bindings(default_vision_binder);
+    (void)qwen::loading::bind_vision(default_vision_bindings, vision,
+                                     qwen::TextConfig{.hidden_size = 128}, {});
+    for (const auto& weight : default_vision_bindings.weights) {
+        require(weight.reference.residency == artifact::Residency::Device,
+                "default Vision selection changed weight residency");
+    }
+    const auto default_vision_count = default_vision_bindings.weights.size();
+    const auto default_vision_plan  = std::move(default_vision_binder).finish();
+    require(default_vision_plan.pinned_host_objects.empty() &&
+                default_vision_plan.device_objects.size() == default_vision_count,
+            "default Vision selection no longer uses Device parents");
+
+    artifact::Binder vision_binder(reader);
+    qwen::loading::Bindings vision_bindings(vision_binder);
+    const auto vision_weights =
+        qwen::loading::bind_vision(vision_bindings, vision, qwen::TextConfig{.hidden_size = 128},
+                                   {.vision = true, .host_pinned_vision_weights = true});
+    (void)vision_weights;
+    for (const auto& weight : vision_bindings.weights) {
+        require(weight.reference.residency == artifact::Residency::HostPinned,
+                "Host-pinned Vision selection left a Device parameter");
+    }
+    const auto vision_count = vision_bindings.weights.size();
+    const auto vision_plan  = std::move(vision_binder).finish();
+    require(vision_plan.device_objects.empty() &&
+                vision_plan.pinned_host_objects.size() == vision_count,
+            "Host-pinned Vision selection retained Device parents");
+
+    artifact::Binder dflash_binder(reader);
+    qwen::loading::Bindings dflash_bindings(dflash_binder);
+    qwen::DraftWeights draft_weights;
+    draft_weights.layers.resize(1);
+    qwen::TextConfig target;
+    target.hidden_size = 128;
+    target.vocab_size  = 272;
+    artifact::Binder default_dflash_binder(reader);
+    qwen::loading::Bindings default_dflash_bindings(default_dflash_binder);
+    qwen::DraftWeights default_draft_weights;
+    default_draft_weights.layers.resize(1);
+    qwen::loading::bind_dflash2(default_dflash_bindings, default_draft_weights, draft, target, {});
+    require(default_draft_weights.selector &&
+                default_dflash_bindings.at(default_draft_weights.selector->predecessor_codebook)
+                        .reference.residency == artifact::Residency::Device &&
+                default_dflash_bindings.at(default_draft_weights.selector->successor_codebook)
+                        .reference.residency == artifact::Residency::Device,
+            "default DFlash2 selector codebooks changed residency");
+    const auto default_dflash_plan = std::move(default_dflash_binder).finish();
+    require(default_dflash_plan.mapped_host_objects.empty() &&
+                default_dflash_plan.device_objects.size() == default_dflash_bindings.weights.size(),
+            "default DFlash2 selection retained mapped Host parents");
+
+    qwen::loading::bind_dflash2(
+        dflash_bindings, draft_weights, draft, target,
+        {.host_mapped_dflash2_codebooks = true, .speculative = SpeculativeBackend::DFlash2});
+    require(
+        draft_weights.selector &&
+            dflash_bindings.at(draft_weights.selector->predecessor_codebook).reference.residency ==
+                artifact::Residency::HostMapped &&
+            dflash_bindings.at(draft_weights.selector->successor_codebook).reference.residency ==
+                artifact::Residency::HostMapped &&
+            dflash_bindings.at(draft_weights.selector->hidden_projection).reference.residency ==
+                artifact::Residency::Device,
+        "DFlash2 Host-mapped selection changed the wrong selector parameters");
+    const auto dflash_plan = std::move(dflash_binder).finish();
+    require(dflash_plan.mapped_host_objects.size() == 2 &&
+                dflash_plan.device_objects.size() + 2 == dflash_bindings.weights.size(),
+            "DFlash2 codebook selection did not isolate two mapped Host parents");
+}
+
 void invalid_model_data() {
     ModelFixture fixture;
     const Json original = fixture.file.root;
@@ -328,6 +467,7 @@ int main() {
     try {
         logical_data_and_instances();
         native_uses();
+        optional_host_residencies();
         invalid_model_data();
         std::cout << "model config, binding, resources and Use checks passed\n";
         return 0;

@@ -81,22 +81,24 @@ int main() {
     };
 
     ninfer::LoadSummary load;
-    load.architecture         = "Qwen3_5ForCausalLM";
-    load.model_name           = "qwen3.6-27b";
-    load.weight_formats       = {"q4_g64_fp16", "q8_g32_fp16"};
-    load.load_seconds         = 1.234567890123;
-    load.upload_seconds       = 0.345678901234;
-    load.artifact_bytes_read  = 1000;
-    load.host_to_device_bytes = 900;
-    load.peak_staging_bytes   = 128;
-    load.device_object_count  = 42;
-    load.host_object_count    = 6;
-    load.context_cost         = {
-                .transfer_source   = ninfer::ContextCostPresetSource::External,
-                .prefill_source    = ninfer::ContextCostPresetSource::CompiledDefault,
-                .hardware_class    = "nvidia-geforce-rtx-5090-sm120",
-                .prefill_signature = "example-prefill-signature",
-                .preset_path       = "local-costs.json",
+    load.architecture             = "Qwen3_5ForCausalLM";
+    load.model_name               = "qwen3.6-27b";
+    load.weight_formats           = {"q4_g64_fp16", "q8_g32_fp16"};
+    load.load_seconds             = 1.234567890123;
+    load.upload_seconds           = 0.345678901234;
+    load.artifact_bytes_read      = 1000;
+    load.host_to_device_bytes     = 900;
+    load.peak_staging_bytes       = 128;
+    load.pinned_host_bytes        = 64;
+    load.device_object_count      = 42;
+    load.host_object_count        = 6;
+    load.pinned_host_object_count = 3;
+    load.context_cost             = {
+                    .transfer_source   = ninfer::ContextCostPresetSource::External,
+                    .prefill_source    = ninfer::ContextCostPresetSource::CompiledDefault,
+                    .hardware_class    = "nvidia-geforce-rtx-5090-sm120",
+                    .prefill_signature = "example-prefill-signature",
+                    .preset_path       = "local-costs.json",
     };
 
     ninfer::MemorySummary memory;
@@ -110,14 +112,17 @@ int main() {
     memory.sequence.capacity_bytes     = 200;
     memory.workspace.capacity_bytes    = 500;
     memory.vision_workspace            = ninfer::VisionWorkspaceMemorySummary{
-                   .aggregate_prompt_tokens = 32768,
-                   .max_item_tokens         = 16384,
-                   .general_capacity_bytes  = 300,
-                   .encode_peak_bytes       = 400,
-                   .handoff_offset_bytes    = 300,
-                   .handoff_capacity_bytes  = 200,
-                   .handoff_active_bytes    = 0,
-                   .handoff_peak_bytes      = 150,
+                   .aggregate_prompt_tokens       = 32768,
+                   .max_item_tokens               = 16384,
+                   .general_capacity_bytes        = 300,
+                   .encode_peak_bytes             = 400,
+                   .handoff_offset_bytes          = 300,
+                   .handoff_capacity_bytes        = 200,
+                   .handoff_active_bytes          = 0,
+                   .handoff_peak_bytes            = 150,
+                   .weight_staging_offset_bytes   = 500,
+                   .weight_staging_slot_bytes     = 50,
+                   .weight_staging_capacity_bytes = 100,
     };
     memory.minimum_runtime_reservation_bytes = 1300;
     memory.kv_capacity_increment_bytes       = 100;
@@ -160,6 +165,9 @@ int main() {
         check(server.at("artifact").at("formats") == Json::array({"q4_g64_fp16", "q8_g32_fp16"}),
               "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
+    failures += check(server.at("artifact").at("pinned_host_bytes") == 64 &&
+                          server.at("artifact").at("pinned_host_object_count") == 3,
+                      "pinned Host weight accounting missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
     failures += check(server.at("engine").at("kv_capacity_mode") == "explicit" &&
@@ -220,12 +228,13 @@ int main() {
         "server sampling overrides lost omission state");
     failures += check(server.at("environment").at("gpu_name") == "NVIDIA GeForce RTX 5090",
                       "GPU name missing");
-    failures +=
-        check(server.at("memory").at("workspace").at("capacity_bytes") == 500 &&
-                  server.at("memory").at("vision_workspace").at("general_capacity_bytes") == 300 &&
-                  server.at("memory").at("vision_workspace").at("handoff_capacity_bytes") == 200 &&
-                  server.at("memory").at("vision_workspace").at("handoff_peak_bytes") == 150,
-              "Vision workspace layout missing");
+    failures += check(
+        server.at("memory").at("workspace").at("capacity_bytes") == 500 &&
+            server.at("memory").at("vision_workspace").at("general_capacity_bytes") == 300 &&
+            server.at("memory").at("vision_workspace").at("handoff_capacity_bytes") == 200 &&
+            server.at("memory").at("vision_workspace").at("handoff_peak_bytes") == 150 &&
+            server.at("memory").at("vision_workspace").at("weight_staging_capacity_bytes") == 100,
+        "Vision workspace layout missing");
     failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
                       "CUDA Graph allowance missing");
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&

@@ -68,6 +68,22 @@ void test_handoff_lifetime(ninfer::DeviceContext& device,
     plan.max_merged_count = 1;
     const auto workspace_plan =
         qwen::execution::VisionContext::plan_workspace(config, *parameters.vision, 1, 256);
+    if (parameters.vision->host_staged) {
+        require(
+            workspace_plan.weight_staging_slot_bytes != 0 &&
+                workspace_plan.weight_staging_capacity_bytes ==
+                    2 * workspace_plan.weight_staging_slot_bytes &&
+                workspace_plan.weight_staging_offset_bytes >=
+                    workspace_plan.handoff_offset_bytes + workspace_plan.handoff_capacity_bytes &&
+                workspace_plan.capacity_bytes == workspace_plan.weight_staging_offset_bytes +
+                                                     workspace_plan.weight_staging_capacity_bytes,
+            "Host-pinned Vision did not reserve two isolated staging slots");
+    } else {
+        require(workspace_plan.weight_staging_offset_bytes == 0 &&
+                    workspace_plan.weight_staging_slot_bytes == 0 &&
+                    workspace_plan.weight_staging_capacity_bytes == 0,
+                "Device-resident Vision unexpectedly reserved weight staging");
+    }
     ninfer::DeviceBuffer workspace(workspace_plan.capacity_bytes);
     const ninfer::DeviceSpan backing{workspace.p, workspace.bytes};
     qwen::detail::VisionHandoffState handoff;
@@ -130,9 +146,6 @@ int main() {
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (!artifact || !*artifact) { return 77; }
     static_assert(ninfer::models::qwen3_5::kMaximumVisionItemTokens == 16384);
-    // The current Vision route fits below 827 MiB, including arena alignment and empty-scratch
-    // backing. The context growth check below protects the single-item lifetime bound.
-    constexpr std::size_t kWorkspaceCeiling = 827ULL << 20;
     try {
         int devices       = 0;
         const auto status = cudaGetDeviceCount(&devices);
@@ -146,41 +159,50 @@ int main() {
         selected.vision        = true;
         selected.speculative   = ninfer::SpeculativeBackend::Mtp;
         selected.proposal_head = ninfer::ProposalHead::Optimized;
-        auto model             = qwen::load_model(artifact, selected, device);
-        const qwen::execution::Parameters parameters(*model);
-        const auto capacity = [&](std::uint32_t max_context,
-                                  std::uint32_t max_vision_item_tokens = 16'384) {
-            ninfer::EngineOptions options;
-            options.max_context         = max_context;
-            options.max_vision_item_tokens = max_vision_item_tokens;
-            options.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
-            options.prefill_chunk       = 1024;
-            options.kv_cache            = ninfer::KvCacheStorage::Fp8E4M3Row256;
-            options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
-            options.speculative.draft_tokens         = 3;
-            options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
-            options.enable_vision                    = true;
-            options.use_cuda_graph                   = false;
-            options.context_cache.device_state_slots = 1;
-            auto planner     = qwen::make_sequence_planner(parameters, device, options);
-            const auto pages = planner.capacity_curve().minimum_main_page_groups;
-            return std::move(planner).finalize(pages).workspace_capacity_bytes();
+        const auto exercise    = [&](ninfer::models::LoadOptions options) {
+            auto model = qwen::load_model(artifact, options, device);
+            const qwen::execution::Parameters parameters(*model);
+            const auto capacity = [&](std::uint32_t max_context,
+                                      std::uint32_t max_vision_item_tokens = 16'384) {
+                ninfer::EngineOptions engine;
+                engine.max_context            = max_context;
+                engine.max_vision_item_tokens = max_vision_item_tokens;
+                engine.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
+                engine.prefill_chunk = 1024;
+                engine.kv_cache      = ninfer::KvCacheStorage::Fp8E4M3Row256;
+                engine.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
+                engine.speculative.draft_tokens         = 3;
+                engine.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
+                engine.enable_vision                    = true;
+                engine.host_pinned_vision_weights       = options.host_pinned_vision_weights;
+                engine.use_cuda_graph                   = false;
+                engine.context_cache.device_state_slots = 1;
+                auto planner     = qwen::make_sequence_planner(parameters, device, engine);
+                const auto pages = planner.capacity_curve().minimum_main_page_groups;
+                return std::move(planner).finalize(pages).workspace_capacity_bytes();
+            };
+            const auto at_item_limit    = capacity(16384);
+            const auto above_item_limit = capacity(131072);
+            const auto at_4k_item_limit = capacity(131072, 4096);
+            const std::size_t ceiling =
+                options.host_pinned_vision_weights ? 1024ULL << 20 : 827ULL << 20;
+            if (at_item_limit == 0 || at_item_limit > ceiling ||
+                above_item_limit != at_item_limit || at_4k_item_limit == 0 ||
+                at_4k_item_limit >= at_item_limit) {
+                throw std::runtime_error("Vision workspace exceeded the single-item bound: at=" +
+                                            std::to_string(at_item_limit) +
+                                            " above=" + std::to_string(above_item_limit) +
+                                            " at_4k=" + std::to_string(at_4k_item_limit));
+            }
+            test_handoff_lifetime(device, parameters);
         };
-        // Increasing total context cannot exceed the single Vision item's 16K workspace.
-        const auto at_item_limit    = capacity(16384);
-        const auto above_item_limit = capacity(131072);
-        const auto at_4k_item_limit = capacity(131072, 4096);
-        if (at_item_limit == 0 || at_item_limit > kWorkspaceCeiling ||
-            above_item_limit != at_item_limit || at_4k_item_limit == 0 ||
-            at_4k_item_limit >= at_item_limit) {
-            throw std::runtime_error("Vision workspace exceeded the single-item bound: at=" +
-                                     std::to_string(at_item_limit) +
-                                     " above=" + std::to_string(above_item_limit) +
-                                     " at_4k=" + std::to_string(at_4k_item_limit));
-        }
-        test_handoff_lifetime(device, parameters);
+        exercise(selected);
+        device.synchronize();
+        selected.host_pinned_vision_weights = true;
+        exercise(selected);
         std::cout << "Vision workspace remains bounded for long text context\n";
-        std::cout << "Vision handoff survives request rotation and replay\n";
+        std::cout << "Vision handoff survives request rotation and replay for Device and staged "
+                     "Host weights\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

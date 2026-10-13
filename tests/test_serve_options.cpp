@@ -34,9 +34,11 @@ int main() {
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
-    failures += check(defaults.max_vision_item_tokens == 16'384 &&
-                          !defaults.host_mapped_embedding,
-                      "memory optimization defaults changed");
+    failures +=
+        check(defaults.max_vision_item_tokens == 16'384 && !defaults.host_mapped_embedding &&
+                  !defaults.host_mapped_dflash2_codebooks && !defaults.host_pinned_vision_weights &&
+                  !defaults.host_state_images,
+              "memory optimization defaults changed");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.context_cost_presets.empty(),
@@ -128,6 +130,26 @@ int main() {
                               options.speculative.proposal_head == ninfer::ProposalHead::Optimized,
                           "serve options did not preserve DFlash2 configuration");
     }
+    const auto memory_optimized =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+               "--vision", "--host-mapped-dflash2-codebooks", "--host-pinned-vision-weights",
+               "--host-state-images", "--device-state-slots", "0"});
+    failures += check(memory_optimized.host_mapped_dflash2_codebooks &&
+                          memory_optimized.host_pinned_vision_weights &&
+                          memory_optimized.host_state_images &&
+                          memory_optimized.context_cache.device_state_slots == 0,
+                      "serve memory optimization flags were not preserved");
+    for (const auto& arguments : std::vector<std::vector<std::string>>{
+             {"ninfer-serve", "model.ninfer", "--host-mapped-dflash2-codebooks"},
+             {"ninfer-serve", "model.ninfer", "--host-pinned-vision-weights"},
+             {"ninfer-serve", "model.ninfer", "--host-state-images", "--device-state-slots", "1"},
+         }) {
+        bool rejected = false;
+        try {
+            (void)parse(arguments);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "serve accepted an invalid Host memory option combination");
+    }
 
     const ServeOptions dflash_vision = parse(
         {"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15", "--vision"});
@@ -177,8 +199,7 @@ int main() {
                               defaults.context_cache.device_state_slots,
                       "--no-prefix-reuse changed context capacities or retained cache enablement");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
-    failures += check(configured.max_vision_item_tokens == 4096 &&
-                          configured.host_mapped_embedding,
+    failures += check(configured.max_vision_item_tokens == 4096 && configured.host_mapped_embedding,
                       "memory optimization options did not reach serving options");
     failures += check(configured.preserve_thinking == true,
                       "--preserve-thinking did not reach serving options");
