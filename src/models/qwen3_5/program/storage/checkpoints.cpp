@@ -145,6 +145,8 @@ PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
         out.capacity.backend_kv_pages = pool.capacity_pages();
     }
     out.host_state_slots = state_store ? state_store->host_occupied() : 0;
+    out.occupied.host_state_slots = out.host_state_slots;
+    out.capacity.host_state_slots = host_state_images ? host_state_images->capacity() : 0;
     out.host_kv_bytes    = host_kv_arena ? host_kv_arena->occupied_bytes() : 0;
     if (host_context_arena) {
         out.occupied.host_bytes      = host_context_arena->occupied_bytes();
@@ -200,6 +202,7 @@ ProgramImpl::checkpoint_footprint(std::span<const CheckpointHandle> handles) con
             usage.state_slots += state_store->device_resident(record.state) ? 1U : 0U;
             if (state_store->host_resident(record.state)) {
                 usage.host_bytes += state_images->host_layout().image_bytes;
+                ++usage.host_state_slots;
             }
         }
         auto& coverage   = histories[record.kv.get()];
@@ -237,6 +240,7 @@ CheckpointSummary ProgramImpl::checkpoint_summary(CheckpointHandle handle) const
     if (releasable && state_store->host_resident(record.state) &&
         state_evictable(*state_store, record.state)) {
         out.evictable_resources.host_bytes += state_images->host_layout().image_bytes;
+        ++out.evictable_resources.host_state_slots;
     }
     const auto scan = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
                           KVAddressSpaceHandle address, std::uint32_t frontier,
@@ -268,7 +272,8 @@ runtime::ContextResourceUsage ProgramImpl::snapshot_resources(const ResumeState&
     return checkpoint_summary(*paused.impl_->snapshot).evictable_resources;
 }
 
-std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> handles) const {
+runtime::ContextResourceUsage
+ProgramImpl::host_resources_released(std::span<const CheckpointHandle> handles) const {
     struct StateReferences {
         StateImageHandle state;
         std::uint32_t references = 0;
@@ -295,7 +300,7 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
         }
     };
     for (const auto handle : handles) {
-        if (!checkpoint_releasable(*this, handle)) { return 0; }
+        if (!checkpoint_releasable(*this, handle)) { return {}; }
         if (!records.insert(handle.index).second) { continue; }
         const auto& record = checkpoint(handle);
         auto& state        = states[state_store->descriptor_index(record.state)];
@@ -325,13 +330,14 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
                     backend);
         }
     }
-    std::size_t bytes = 0;
+    runtime::ContextResourceUsage released;
     for (const auto& [index, entry] : states) {
-        if (entry.references > state_store->checkpoint_references(entry.state)) { return 0; }
+        if (entry.references > state_store->checkpoint_references(entry.state)) { return {}; }
         if (entry.references == state_store->checkpoint_references(entry.state) &&
             state_store->can_release_after_checkpoint_references(entry.state, entry.references) &&
             state_store->host_resident(entry.state)) {
-            bytes += state_images->host_layout().image_bytes;
+            released.host_bytes += state_images->host_layout().image_bytes;
+            ++released.host_state_slots;
         }
     }
     const auto count = [&](const LogicalKVPageStore& pages, const auto& references) {
@@ -343,19 +349,20 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
                 return false;
             }
             if (pages.host_resident(entry.page)) {
-                bytes += (&pages == text_kv_pages.get() ? text_host_kv_page_stride
-                                                        : backend_host_kv_page_stride);
+                released.host_bytes += (&pages == text_kv_pages.get() ? text_host_kv_page_stride
+                                                                      : backend_host_kv_page_stride);
             }
         }
         return true;
     };
     if (!count(*text_kv_pages, main) || (backend_kv_pages && !count(*backend_kv_pages, backend))) {
-        return 0;
+        return {};
     }
-    return bytes;
+    return released;
 }
 
-std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) const {
+std::optional<runtime::ContextResourceUsage>
+ProgramImpl::pause_host_resources(SequenceHandle handle) const {
     if (context_transaction_ || pending_transaction_ || !valid_sequence(handle) ||
         !host_context_arena) {
         return std::nullopt;
@@ -375,9 +382,11 @@ std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) 
             if (item.token_begin < frontier && frontier < item.token_end) { return std::nullopt; }
         }
     }
-    std::size_t bytes = state_store->host_resident(sequence.state.read)
-                            ? 0
-                            : state_images->host_layout().image_bytes;
+    runtime::ContextResourceUsage resources;
+    if (!state_store->host_resident(sequence.state.read)) {
+        resources.host_bytes = state_images->host_layout().image_bytes;
+        resources.host_state_slots = 1;
+    }
     const auto count  = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
                            KVAddressSpaceHandle address, std::uint32_t target) {
         const auto mapped   = addresses.mapped_pages(address);
@@ -389,11 +398,13 @@ std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) 
             // Deactivation removes this request's active reference. Other resident readers
             // keep their Device replica, so those pages need no new Host allocation.
             if (!pages.host_resident(page) && pages.active_address_references(page) <= 1) {
-                bytes += stride;
+                resources.host_bytes += stride;
             }
         }
         // Masked-draft normalization can append accepted features before snapshot capture.
-        if (required > mapped) { bytes += static_cast<std::size_t>(required - mapped) * stride; }
+        if (required > mapped) {
+            resources.host_bytes += static_cast<std::size_t>(required - mapped) * stride;
+        }
     };
     count(*text_kv_addresses, *text_kv_pages, sequence.kv->text, sequence.text_kv_valid);
     if (sequence.kv->backend) {
@@ -402,7 +413,7 @@ std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) 
                                  : backend_kv_valid(sequence);
         count(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend, backend);
     }
-    return bytes;
+    return resources;
 }
 
 std::size_t ProgramImpl::release_redundant_host(std::span<const CheckpointHandle> excluded,

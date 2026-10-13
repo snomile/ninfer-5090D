@@ -647,13 +647,13 @@ public:
         require(static_cast<bool>(program_.start_binding(endpoint_base, {1}, *reader)),
                 "Host endpoint could not reserve an independent reader");
         const std::array<qwen::CheckpointHandle, 1> endpoint_set{endpoint};
-        require(program_.host_bytes_released(endpoint_set) == 0 &&
+        require(program_.host_resources_released(endpoint_set) == runtime::ContextResourceUsage{} &&
                     !program_.release_checkpoint(endpoint),
                 "pending reader allowed its complete Host suffix to be reclaimed");
         require(!settle(true).published, "Host suffix reader did not cancel");
         expect_usage(before_reader, "cancelled Host reader changed retained history ownership");
 
-        const auto expected_release = program_.host_bytes_released(endpoint_set);
+        const auto expected_release = program_.host_resources_released(endpoint_set).host_bytes;
         const auto before_release   = program_.physical_usage().occupied.host_bytes;
         require(expected_release > 0 && program_.release_checkpoint(endpoint),
                 "retiring E did not expose its unneeded Host suffix");
@@ -1436,7 +1436,7 @@ public:
         require(settle().published, "shared-prefix fact fixture lost its demotion");
         require(program_.physical_usage().occupied.host_bytes == main_bytes,
                 "demotion quote disagrees with its actual Host allocation");
-        require(program_.host_bytes_released(source_set) == main_bytes,
+        require(program_.host_resources_released(source_set).host_bytes == main_bytes,
                 "unique checkpoint Host bytes were not fully releasable");
 
         auto extension = request(128, true);
@@ -1456,7 +1456,7 @@ public:
                 "active borrowed content was exposed as a demotion candidate");
         require(program_.release_redundant_host(source_set) == 0,
                 "Host replica cleanup ignored an excluded source");
-        require(program_.host_bytes_released(source_set) == 0,
+        require(program_.host_resources_released(source_set).host_bytes == 0,
                 "deleting one shared prefix claimed the descendant's Host page");
 
         finish_prefill(sequence, 64, true);
@@ -1465,9 +1465,9 @@ public:
         const auto descendant = *finished.checkpoint;
         const std::array<qwen::CheckpointHandle, 2> family{source, descendant};
         const std::array<qwen::CheckpointHandle, 3> repeated{source, descendant, source};
-        require(program_.host_bytes_released(source_set) == 0 &&
-                    program_.host_bytes_released(family) == main_bytes &&
-                    program_.host_bytes_released(repeated) == main_bytes,
+        require(program_.host_resources_released(source_set).host_bytes == 0 &&
+                    program_.host_resources_released(family).host_bytes == main_bytes &&
+                    program_.host_resources_released(repeated).host_bytes == main_bytes,
                 "fixed-set Host accounting double-counted shared or duplicate references");
         const auto main_releases = program_.plan_releases(family, {}, {.main_kv_pages = 1});
         const auto expected_main =
@@ -1530,7 +1530,7 @@ public:
                     program_.plan_reclaim(family, {}, {.state_slots = 1}).demotions.empty() &&
                     program_.plan_releases(family, {}, {.main_kv_pages = 1}).empty() &&
                     program_.plan_releases(family, {}, {.backend_kv_pages = 1}).empty() &&
-                    program_.host_bytes_released(family) == 0,
+                    program_.host_resources_released(family) == runtime::ContextResourceUsage{},
                 "replica cleanup or fixed-set release ignored a pending reader's record pin");
         require(!settle(true).published, "pinned replica fixture did not cancel binding");
         expect_usage(baseline, "pinned replica checks changed physical ownership");
@@ -1597,7 +1597,7 @@ public:
         require(program_.physical_usage().occupied.host_bytes == main_bytes,
                 "releasing one ancestor prematurely freed shared Host storage");
         const std::array<qwen::CheckpointHandle, 1> remaining{descendant};
-        require(program_.host_bytes_released(remaining) == main_bytes,
+        require(program_.host_resources_released(remaining).host_bytes == main_bytes,
                 "last descendant did not account the uniquely retained Host page");
         release_and_check(descendant);
         expect_empty("fixed-set Host accounting fixture leaked physical resources");
@@ -1638,15 +1638,19 @@ public:
         auto pause_base     = request(2 * kChunk);
         const auto to_pause = bind(pause_base);
         prefill_prefix(to_pause, kChunk);
-        const auto pause_bytes = program_.pause_host_bytes(to_pause);
-        require(pause_bytes && *pause_bytes > 0 && program_.start_pause(to_pause, true),
+        const auto pause_resources = program_.pause_host_resources(to_pause);
+        require(pause_resources && pause_resources->host_bytes > 0 &&
+                    pause_resources->host_state_slots == 1 && program_.start_pause(to_pause, true),
                 "snapshot fact fixture could not reserve its Host demand");
         auto paused = settle();
         require(paused.paused && paused.paused->snapshot_handle(),
                 "snapshot fact fixture did not preserve its checkpoint identity");
         const auto resources = program_.snapshot_resources(*paused.paused);
         require(resources.state_slots == 0 && resources.main_kv_pages == 0 &&
-                    resources.backend_kv_pages == 0 && resources.host_bytes == *pause_bytes &&
+                    resources.backend_kv_pages == 0 &&
+                    resources.host_bytes == pause_resources->host_bytes &&
+                    resources.host_state_slots == pause_resources->host_state_slots &&
+                    program_.physical_usage().occupied.host_state_slots == resources.host_state_slots &&
                     resources.host_bytes == program_.physical_usage().occupied.host_bytes,
                 "paused snapshot typed resources disagree with the actual saved replicas");
         require(program_.revoke_snapshot(*paused.paused) && !paused.paused->snapshot_handle() &&

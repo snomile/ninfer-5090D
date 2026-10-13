@@ -61,6 +61,7 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         if (checkpoint(point).state == record.state) { --state_references; }
     }
     auto occupied_states = state_store->device_occupied();
+    auto occupied_images = state_store->occupied();
     for (std::size_t i = 0; i < candidate.retired_points.size(); ++i) {
         const auto state = checkpoint(candidate.retired_points[i]).state;
         if (std::any_of(candidate.retired_points.begin(), candidate.retired_points.begin() + i,
@@ -71,9 +72,9 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             std::count_if(candidate.retired_points.begin(), candidate.retired_points.end(),
                           [&](auto point) { return checkpoint(point).state == state; }));
         if (references == state_store->checkpoint_references(state) &&
-            state_store->device_resident(state) &&
             state_store->can_release_after_checkpoint_references(state, references)) {
-            --occupied_states;
+            --occupied_images;
+            if (state_store->device_resident(state)) { --occupied_states; }
         }
     }
     const auto& rewrite = prompt.identity.rewrite_checkpoint;
@@ -96,16 +97,17 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         candidate.private_points.end();
     candidate.move_state = consume_source && !keep_source && checkpoints[handle->index].pins == 0 &&
                            state_references == 1 && state_store->source_pins(record.state) == 0;
+    const bool logical_destination = occupied_images < state_store->capacity();
     candidate.split_state =
-        !candidate.move_state && occupied_states == state_store->device_capacity() &&
+        !candidate.move_state && logical_destination &&
+        occupied_states == state_store->device_capacity() &&
         state_store->device_resident(record.state) && state_store->host_resident(record.state) &&
         state_store->source_pins(record.state) == 0;
     if (!candidate.move_state && !candidate.split_state &&
         occupied_states == state_store->device_capacity() &&
         state_store->device_resident(record.state) && state_store->source_pins(record.state) == 0 &&
         checkpoints[handle->index].pins == 0) {
-        if (host_context_arena &&
-            host_context_arena->can_allocate(state_images->host_layout().image_bytes)) {
+        if (logical_destination && host_state_images && host_state_images->can_allocate()) {
             candidate.backup_state = candidate.split_state = true;
             candidate.transfers.push_back(state_transfer_requirement(
                 state_images->host_layout(), runtime::ContextTransferDirection::DeviceToHost));

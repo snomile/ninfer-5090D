@@ -325,12 +325,16 @@ def runtime_interval(*, schema=23, final=None, state_bytes=0, main_bytes=0,
     return event
 
 
-def test_global_intervals_include_unowned_demotion_and_shutdown_tail(tmp_path):
+@pytest.mark.parametrize("schema", [23, 26])
+def test_global_intervals_include_unowned_demotion_and_shutdown_tail(tmp_path, schema):
     measured = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
+    done = done_event(1, "req_wire", "response-a")
+    done["schema_version"] = schema
     summary = summarize_campaign(logged_campaign(tmp_path, [measured], [
-        done_event(1, "req_wire", "response-a"),
-        runtime_interval(final=False, main_bytes=100, host_seconds=0.1, occupied=800, peak=900),
-        runtime_interval(final=True, state_bytes=25, main_bytes=50,
+        done,
+        runtime_interval(schema=schema, final=False, main_bytes=100,
+                         host_seconds=0.1, occupied=800, peak=900),
+        runtime_interval(schema=schema, final=True, state_bytes=25, main_bytes=50,
                          host_seconds=0.02, occupied=200, peak=1000),
     ]))
     global_work = summary["global_runtime_observations"][0]
@@ -363,9 +367,111 @@ def test_missing_runtime_fields_remain_explicit(tmp_path):
     assert summary["stream_observations"][0]["preemptions"] is None
 
 
-def test_unsupported_runtime_schema_is_unavailable(tmp_path):
-    summary = summarize_campaign(logged_campaign(tmp_path, [], [runtime_interval(schema=22)]))
+@pytest.mark.parametrize("schema", [22, 27])
+def test_unsupported_runtime_schema_is_unavailable(tmp_path, schema):
+    summary = summarize_campaign(logged_campaign(tmp_path, [], [runtime_interval(schema=schema)]))
     assert summary["global_runtime_observations"][0]["reason"] == "unsupported_runtime_schema"
+
+
+@pytest.mark.parametrize("host_state_images", [False, True])
+def test_v26_startup_capacity_is_preserved(tmp_path, host_state_images):
+    startup = {
+        "artifact_type": "ninfer_serve_request_log", "schema_version": 26,
+        "event": "server_start", "server_instance_id": "serve-test",
+        "engine": {
+            "max_concurrency": 2, "host_state_images": host_state_images,
+            "context_cache": {
+                "enabled": True, "device_state_slots": 8,
+                "extra_state_placement": "host" if host_state_images else "device",
+                "total_device_state_slots": 2 if host_state_images else 10,
+                "host_capacity_bytes": 64 << 20,
+            },
+        },
+        "memory": {
+            "sequence": {"capacity_bytes": 200},
+            "host_context_capacity_bytes": 64 << 20,
+            "host_context_occupied_bytes": 12 << 20,
+            "host_context_reserved_bytes": 4 << 20,
+            "host_state_occupied_slots": 1, "host_kv_occupied_bytes": 8 << 20,
+        },
+        "environment": {"device": 0, "gpu_name": "NVIDIA GeForce RTX 5090"},
+    }
+    data = logged_campaign(tmp_path, [], [startup, runtime_interval(schema=26, final=True)])
+    assert data.artifact_errors == []
+    global_work = summarize_campaign(data)["global_runtime_observations"][0]
+    assert global_work["status"] == "available"
+    assert global_work["startup_engine"] == startup["engine"]
+    assert global_work["startup_memory"] == startup["memory"]
+    assert global_work["environment"] == startup["environment"]
+    assert global_work["startup_engine"]["context_cache"]["device_state_slots"] == 8
+    assert global_work["startup_engine"]["context_cache"]["total_device_state_slots"] == (
+        2 if host_state_images else 10
+    )
+
+
+@pytest.mark.parametrize("schema", [22, 27])
+@pytest.mark.parametrize("event_type", ["server_start", "request_start", "request_done",
+                                      "request_scheduling"])
+def test_unsupported_record_schema_cannot_supply_evidence(tmp_path, schema, event_type):
+    measured = record([output(101_000_000), ProtocolEvent("terminal", "done", 102_000_000)])
+    measured["response_id"] = "response-a"
+    done = first_output_event()
+    done["schema_version"] = 25
+    done["generation"]["scheduling"]["replay_restores"] = 1
+    start = {
+        "artifact_type": "ninfer_serve_request_log", "schema_version": 25,
+        "event": "request_start", "server_instance_id": "serve-test",
+        "request": done["request"], "preparation_seconds": {"total": 0.015},
+    }
+    startup = {
+        "artifact_type": "ninfer_serve_request_log", "schema_version": 25,
+        "event": "server_start", "server_instance_id": "serve-test",
+        "engine": {"max_concurrency": 2}, "memory": {"host_context_capacity_bytes": 64 << 20},
+        "environment": {"device": 0},
+    }
+    transition = {
+        "artifact_type": "ninfer_serve_request_log", "schema_version": 25,
+        "event": "request_scheduling", "server_instance_id": "serve-test",
+        "request": {"request_id": 1, "http_request_id": "req_wire"},
+        "engine_request_id": 11, "preemption_index": 1, "route": "replay",
+        "transition": "restored", "steady_ns": 100,
+        "progress": {"global_prefill_tokens": 500, "global_decode_tokens": 40,
+                     "global_replayed_tokens": 0, "request_prefill_tokens": 192,
+                     "request_decode_tokens": 4, "request_replayed_tokens": 0},
+    }
+    end = {
+        **transition, "transition": "replay_complete", "steady_ns": 200,
+        "progress": {**transition["progress"], "global_decode_tokens": 42,
+                     "global_replayed_tokens": 192, "request_replayed_tokens": 192},
+    }
+    events = [startup, start, end, done, transition, runtime_interval(schema=25, final=True)]
+    for event in events:
+        if event["event"] == event_type:
+            event["schema_version"] = schema
+    data = logged_campaign(tmp_path, [measured], events,
+                           required=("replay_with_other_progress",))
+    assert data.artifact_errors == []
+    summary = summarize_campaign(data)
+    diagnostics = data.runs[0]["requests"][0]["diagnostics"]
+    global_work = summary["global_runtime_observations"][0]
+    assert global_work["status"] == "available"
+    if event_type == "server_start":
+        assert global_work["startup_engine"] is None
+        assert global_work["startup_memory"] is None
+        assert global_work["environment"] is None
+    elif event_type == "request_start":
+        assert diagnostics["status"] == "available"
+        assert diagnostics["preparation_status"] == "unavailable"
+        assert diagnostics["preparation_seconds"] is None
+    elif event_type == "request_done":
+        assert diagnostics["status"] == "unavailable"
+        assert summary["stream_observations"][0]["preemptions"] is None
+        assert summary["request_timing_analysis"][0]["analysis_status"] == "unavailable"
+    else:
+        assert diagnostics["status"] == "available"
+        assert diagnostics["scheduling_transitions"] == []
+        assert data.runs[0]["scheduling_observations"]["status"] == "unavailable"
+        assert summary["workload_metrics"][0]["required_mechanism_status"] == "unavailable"
 
 
 def test_absent_or_mixed_server_runtime_data_is_unavailable(tmp_path):
@@ -448,18 +554,24 @@ def first_output_event():
     return event
 
 
-def test_first_output_partition_preserves_terminal_and_overlapping_work(tmp_path):
+@pytest.mark.parametrize("schema", [25, 26])
+def test_first_output_partition_preserves_terminal_and_overlapping_work(tmp_path, schema):
     measured = record([output(101_000_000), ProtocolEvent("terminal", "done", 102_000_000)])
     done = first_output_event()
-    done["schema_version"] = 25
+    done["schema_version"] = schema
     done["generation"]["admission"] = {
         "preferred_reused_tokens": 19057, "source_wait_seconds": 0.003,
         "revoked_checkpoints": 1, "fallback_reason": "source_revoked",
     }
-    start = {**done, "event": "request_start",
-             "preparation_seconds": {"total": 0.015, "acquisition": 0.003, "tokenize": 0.010}}
+    start = {key: done[key] for key in
+             ("artifact_type", "schema_version", "server_instance_id", "request")}
+    start.update(event="request_start",
+                 preparation_seconds={"total": 0.015, "acquisition": 0.003, "tokenize": 0.010})
     loaded = logged_campaign(tmp_path, [measured], [start, done])
+    assert loaded.artifact_errors == []
     diagnostics = loaded.runs[0]["requests"][0]["diagnostics"]
+    assert diagnostics["status"] == "available"
+    assert diagnostics["preparation_status"] == "available"
     assert diagnostics["result"]["generated_token_ids"] == [7, 8]
     assert diagnostics["terminal_timings_seconds"]["prefill"] == 9.0
     assert diagnostics["preparation_seconds"]["tokenize"] == 0.010
@@ -622,14 +734,17 @@ def test_changed_contract_refuses_same_name_cross_campaign_delta(tmp_path):
 
 @pytest.mark.parametrize("missing_request", [False, True])
 @pytest.mark.parametrize("other_decode", [0, 2])
-def test_replay_progress_uses_engine_interval_and_subtracts_self(tmp_path, other_decode, missing_request):
+@pytest.mark.parametrize("schema", [24, 26])
+def test_replay_progress_uses_engine_interval_and_subtracts_self(
+    tmp_path, other_decode, missing_request, schema,
+):
     measured = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
     measured["response_id"] = "response-a"
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
-    done["schema_version"] = 24
+    done["schema_version"] = schema
     def transition(name, at, replayed, decoded):
         return {
-            "artifact_type": "ninfer_serve_request_log", "schema_version": 24,
+            "artifact_type": "ninfer_serve_request_log", "schema_version": schema,
             "event": "request_scheduling", "server_instance_id": "serve-test",
             "request": {"request_id": 1, "http_request_id": "req_wire"},
             "engine_request_id": 11, "preemption_index": 1, "route": "replay",
@@ -648,9 +763,14 @@ def test_replay_progress_uses_engine_interval_and_subtracts_self(tmp_path, other
     expected = "observed" if other_decode else "unavailable" if missing_request else "not_observed"
     data = logged_campaign(tmp_path, requests, [end, done, start],
                            required=("replay_with_other_progress",))
+    assert data.artifact_errors == []
+    assert data.runs[0]["scheduling_observations"]["status"] == (
+        "unavailable" if missing_request else "available"
+    )
     workload = summarize_campaign(data)["workload_metrics"][0]
     assert workload["required_mechanism_status"] == expected
     interval = workload["replay_progress_intervals"][0]
+    assert interval["status"] == "available"
     assert interval["duration_ns"] == 100
     assert interval["other_decode_tokens"] == other_decode
     assert interval["other_replayed_tokens"] == 0

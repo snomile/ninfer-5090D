@@ -16,6 +16,7 @@ struct ContextResourceUsage {
     std::uint32_t main_kv_pages                                                 = 0;
     std::uint32_t backend_kv_pages                                              = 0;
     std::size_t host_bytes                                                      = 0;
+    std::uint32_t host_state_slots                                              = 0;
     friend bool operator==(ContextResourceUsage, ContextResourceUsage) noexcept = default;
 };
 

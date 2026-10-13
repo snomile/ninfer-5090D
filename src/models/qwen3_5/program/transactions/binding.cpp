@@ -123,6 +123,7 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
             state_store->checkpoint_references(checkpoint(*source).state) == 1 &&
             state_store->source_pins(checkpoint(*source).state) == 0;
         transaction.split_state = !transaction.borrow_state &&
+                                  state_store->occupied() < state_store->capacity() &&
                                   state_store->device_resident(checkpoint(*source).state) &&
                                   state_store->host_resident(checkpoint(*source).state) &&
                                   state_store->source_pins(checkpoint(*source).state) == 0 &&

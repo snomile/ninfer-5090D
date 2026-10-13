@@ -27,7 +27,7 @@ bool ProgramImpl::reclaim_capture_reservation(runtime::ContextResourceUsage shor
         if (!ticket) { continue; }
         const bool relevant =
             (shortage.state_slots && state_store->device_resident(ticket->state)) ||
-            (shortage.host_bytes && ticket->host) ||
+            ((shortage.host_bytes || shortage.host_state_slots) && ticket->host) ||
             (shortage.main_kv_pages && ticket->main_tail && ticket->main_tail->pages()) ||
             (shortage.backend_kv_pages && ticket->backend_tail && ticket->backend_tail->pages());
         if (relevant) {
@@ -132,6 +132,7 @@ std::optional<CapturePreparation> ProgramImpl::prepare_capture(SequenceHandle ha
         if (state_store->device_occupied() == state_store->device_capacity()) {
             result.shortage.state_slots = 1;
             result.host_bytes           = state_images->host_layout().image_bytes;
+            result.host_state_slots     = 1;
         }
         const auto& group = request.capture_groups[request.next_capture];
         const bool private_point =

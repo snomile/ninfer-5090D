@@ -183,12 +183,14 @@ runtime::ContextResourceUsage Program::snapshot_resources(const ResumeState& pau
     return impl_->snapshot_resources(paused);
 }
 
-std::size_t Program::host_bytes_released(std::span<const CheckpointHandle> checkpoints) const {
-    return impl_->host_bytes_released(checkpoints);
+runtime::ContextResourceUsage
+Program::host_resources_released(std::span<const CheckpointHandle> checkpoints) const {
+    return impl_->host_resources_released(checkpoints);
 }
 
-std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle sequence) const {
-    return impl_->pause_host_bytes(sequence);
+std::optional<runtime::ContextResourceUsage>
+Program::pause_host_resources(SequenceHandle sequence) const {
+    return impl_->pause_host_resources(sequence);
 }
 
 std::size_t Program::release_redundant_host(std::span<const CheckpointHandle> excluded,

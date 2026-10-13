@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
+RUNTIME_SCHEMA_VERSIONS = (23, 24, 25, 26)
+SCHEDULING_SCHEMA_VERSIONS = (24, 25, 26)
+
 SCHEDULING_FIELDS = (
     "preemptions", "snapshot_restores", "replay_restores", "replayed_tokens",
     "paused_ns", "device_to_host_bytes", "host_to_device_bytes",
@@ -165,7 +168,7 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
     servers = {event.get("server_instance_id") for event in events}
     if len(servers) != 1 or not all(isinstance(server, str) and server for server in servers):
         return {"status": "unavailable", "reason": "ambiguous_server_instance"}
-    if any(event.get("schema_version") not in (23, 24, 25) for event in intervals):
+    if any(event.get("schema_version") not in RUNTIME_SCHEMA_VERSIONS for event in intervals):
         return {"status": "unavailable", "reason": "unsupported_runtime_schema"}
 
     def values_at(path: Sequence[str]) -> list[int | float] | None:
@@ -219,7 +222,8 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
         "observed" if final_intervals == [len(intervals) - 1]
         else "invalid" if final_intervals else "unconfirmed"
     )
-    starts = [event for event in events if event.get("event") == "server_start"]
+    starts = [event for event in events if event.get("event") == "server_start"
+              and event.get("schema_version") in RUNTIME_SCHEMA_VERSIONS]
     startup = starts[0] if len(starts) == 1 else {}
     return {
         "status": "available", "server_instance_id": next(iter(servers)),
@@ -253,7 +257,7 @@ def _scheduling_observations(
     intervals = []
     incomplete_requests = []
     unavailable = False
-    supported = any(event.get("schema_version") in (24, 25) for event in events)
+    supported = any(event.get("schema_version") in SCHEDULING_SCHEMA_VERSIONS for event in events)
     for request in requests:
         diagnostic = request.get("diagnostics", {})
         engine_id = diagnostic.get("engine_request_id")
@@ -264,6 +268,7 @@ def _scheduling_observations(
             continue
         selected = [event for event in events
                     if event.get("event") == "request_scheduling"
+                    and event.get("schema_version") in SCHEDULING_SCHEMA_VERSIONS
                     and event.get("server_instance_id") == diagnostic.get("server_instance_id")
                     and event.get("engine_request_id") == engine_id
                     and event.get("request", {}).get("request_id") == diagnostic.get("service_request_id")]
@@ -402,7 +407,7 @@ def attach_generation_diagnostics(run: dict[str, Any], path: Path | None) -> str
             "matched_by": [field for field, value in wire.items() if value in identities[field]],
         }
         starts = [item for item in events if item.get("event") == "request_start"
-                  and item.get("schema_version") in (23, 24, 25)]
+                  and item.get("schema_version") in RUNTIME_SCHEMA_VERSIONS]
         preparation = starts[0].get("preparation_seconds") if len(starts) == 1 else None
         identity.update(
             preparation_seconds=preparation,
@@ -418,7 +423,7 @@ def attach_generation_diagnostics(run: dict[str, Any], path: Path | None) -> str
         scheduling = generation.get("scheduling") if isinstance(generation, dict) else None
         engine_id = generation.get("engine_request_id") if isinstance(generation, dict) else None
         if (
-            event.get("schema_version") not in (23, 24, 25)
+            event.get("schema_version") not in RUNTIME_SCHEMA_VERSIONS
             or type(engine_id) is not int or engine_id <= 0
             or not isinstance(scheduling, dict)
             or any(type(scheduling.get(field)) is not int or scheduling[field] < 0

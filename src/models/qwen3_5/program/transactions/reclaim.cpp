@@ -196,12 +196,12 @@ struct PhysicalFacts {
             histories[entry->second].checkpoints.push_back(index);
             checkpoint_history[index] = entry->second;
         }
-        const bool host        = shortage.host_bytes != 0;
+        const bool host        = shortage.host_bytes != 0 || shortage.host_state_slots != 0;
         const bool main_device = !host && !shortage.state_slots && shortage.main_kv_pages != 0;
         const bool backend_device =
             !host && !shortage.state_slots && !main_device && shortage.backend_kv_pages != 0;
-        prepare_pool(program, true, host && host_kv, main_device);
-        prepare_pool(program, false, host && host_kv, backend_device);
+        prepare_pool(program, true, shortage.host_bytes && host_kv, main_device);
+        prepare_pool(program, false, shortage.host_bytes && host_kv, backend_device);
     }
 
     std::vector<HistoryOwners> histories;
@@ -248,7 +248,7 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
         return std::all_of(references.begin(), references.end(),
                            [&](auto index) { return eligible[index]; });
     };
-    const bool host = shortage.host_bytes != 0;
+    const bool host = shortage.host_bytes != 0 || shortage.host_state_slots != 0;
     if (host || shortage.state_slots) {
         struct StateOwners {
             StateImageHandle handle;
@@ -275,7 +275,9 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
     }
     const auto collect_pages = [&](bool main_pool) {
         auto& pool = main_pool ? facts.main : facts.backend;
-        if (!pool.store || !pool.addresses || (host && !facts.host_kv)) { return; }
+        if (!pool.store || !pool.addresses || (host && (!shortage.host_bytes || !facts.host_kv))) {
+            return;
+        }
         struct PageOwners {
             std::uint32_t holders  = kNoPhysicalPage;
             std::uint32_t position = 0, last_owner = 0;
@@ -430,7 +432,7 @@ released_resources(const ProgramImpl& program, PhysicalFacts& facts,
                    std::span<const CheckpointHandle> handles,
                    runtime::ContextResourceUsage shortage, ReleaseScratch& scratch,
                    ReleasedPages& released_pages) {
-    const bool host    = shortage.host_bytes != 0;
+    const bool host    = shortage.host_bytes != 0 || shortage.host_state_slots != 0;
     const bool state   = !host && shortage.state_slots != 0;
     const bool main    = !host && !state && shortage.main_kv_pages != 0;
     const bool backend = !host && !state && !main && shortage.backend_kv_pages != 0;
@@ -477,11 +479,14 @@ released_resources(const ProgramImpl& program, PhysicalFacts& facts,
             }
             if (host && program.state_store->host_resident(reference.handle)) {
                 result.host_bytes += program.state_images->host_layout().image_bytes;
+                ++result.host_state_slots;
             }
         }
     }
     if (state && !result.state_slots) { return std::nullopt; }
-    if (host && !result.host_bytes && !facts.host_kv) { return std::nullopt; }
+    if (host && !result.host_bytes && (!shortage.host_bytes || !facts.host_kv)) {
+        return std::nullopt;
+    }
     for (const auto index : histories) {
         const auto& history = facts.histories[index];
         if (history.references != static_cast<long>(history.checkpoints.size())) { continue; }
@@ -554,7 +559,7 @@ released_resources(const ProgramImpl& program, PhysicalFacts& facts,
         if (!scan(false, true) || !result.backend_kv_pages || !scan(true, false)) {
             return std::nullopt;
         }
-    } else if (!scan(true, host) || !scan(false, host)) {
+    } else if (!scan(true, shortage.host_bytes != 0) || !scan(false, shortage.host_bytes != 0)) {
         return std::nullopt;
     }
     return result;
@@ -681,7 +686,7 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
                                               const PhysicalOwners& owners,
                                               std::span<const CheckpointHandle> excluded,
                                               runtime::ContextResourceUsage shortage) {
-    if (shortage.host_bytes ||
+    if (shortage.host_bytes || shortage.host_state_slots ||
         (!shortage.state_slots && !shortage.main_kv_pages && !shortage.backend_kv_pages)) {
         return std::nullopt;
     }
@@ -706,6 +711,7 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
                                         owners.sources};
             candidate.released.state_slots = 1;
             candidate.host_bytes = host ? 0 : program.state_images->host_layout().image_bytes;
+            candidate.host_state_slots = host ? 0 : 1;
             break;
         }
         if (!plan->state) { return std::nullopt; }
@@ -752,7 +758,9 @@ std::optional<ContextRelease> quote_release(const std::shared_ptr<ReclaimPlan>& 
                                              evaluation->shortage, scratch, plan->pages);
     if (!released) { return std::nullopt; }
     const auto shortage = evaluation->shortage;
-    const auto useful   = shortage.host_bytes         ? released->host_bytes
+    const auto useful   = shortage.host_state_slots && released->host_state_slots
+                              ? released->host_state_slots
+                          : shortage.host_bytes       ? released->host_bytes
                           : shortage.state_slots      ? released->state_slots
                           : shortage.main_kv_pages    ? released->main_kv_pages
                           : shortage.backend_kv_pages ? released->backend_kv_pages
@@ -834,6 +842,7 @@ struct DemotionBatch {
                   runtime::ContextResourceUsage requested)
         : evaluation(std::move(evaluation)), shortage(requested) {
         if (!this->evaluation || shortage.state_slots || shortage.host_bytes ||
+            shortage.host_state_slots ||
             (!shortage.main_kv_pages && !shortage.backend_kv_pages)) {
             valid = false;
             return;
@@ -842,6 +851,7 @@ struct DemotionBatch {
         resource            = shortage.main_kv_pages ? runtime::ContextResourceClass::MainKV
                                                      : runtime::ContextResourceClass::BackendKV;
         valid               = !original.state_slots && !original.host_bytes &&
+                              !original.host_state_slots &&
                 (resource == runtime::ContextResourceClass::MainKV
                      ? original.main_kv_pages != 0
                      : !original.main_kv_pages && original.backend_kv_pages != 0);
@@ -924,7 +934,7 @@ struct DemotionBatch {
             return false;
         }
         const auto requested = quote.impl->evaluation->shortage;
-        if (requested.state_slots || requested.host_bytes ||
+        if (requested.state_slots || requested.host_bytes || requested.host_state_slots ||
             (resource == runtime::ContextResourceClass::MainKV
                  ? !requested.main_kv_pages
                  : requested.main_kv_pages || !requested.backend_kv_pages)) {
@@ -1023,14 +1033,15 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
             !state_store->can_release_after_checkpoint_references(
                 expected.handle, state_store->checkpoint_references(expected.handle)) ||
             quote.host_bytes !=
-                (expected.host_resident ? 0 : state_images->host_layout().image_bytes)) {
+                (expected.host_resident ? 0 : state_images->host_layout().image_bytes) ||
+            quote.host_state_slots != (expected.host_resident ? 0U : 1U)) {
             return false;
         }
     } else {
         const bool main       = plan.resource == runtime::ContextResourceClass::MainKV;
         const auto* pages     = main ? text_kv_pages.get() : backend_kv_pages.get();
         const auto* addresses = main ? text_kv_addresses.get() : backend_kv_addresses.get();
-        if (!pages || !addresses || plan.pages.empty()) { return false; }
+        if (!pages || !addresses || plan.pages.empty() || quote.host_state_slots) { return false; }
         runtime::ContextResourceUsage released;
         (main ? released.main_kv_pages : released.backend_kv_pages) =
             static_cast<std::uint32_t>(plan.pages.size());
