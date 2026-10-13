@@ -11,6 +11,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <tuple>
@@ -115,10 +116,16 @@ const WeightParent& MaterializedArtifact::host_parent(ObjectHandle handle) const
 }
 
 std::span<const std::byte> MaterializedArtifact::host_bytes(ObjectHandle handle) const {
-    if (handle.index >= objects_.size() || objects_[handle.index].host_data.empty()) {
+    if (handle.index >= objects_.size()) {
         throw ArtifactError("object has no retained Host bytes");
     }
-    return objects_[handle.index].host_data;
+    const auto& storage = objects_[handle.index];
+    if (!storage.host_data.empty()) { return storage.host_data; }
+    if (storage.pinned_host_data) {
+        return {static_cast<const std::byte*>(storage.pinned_host_data->data()),
+                storage.pinned_host_data->size()};
+    }
+    throw ArtifactError("object has no retained Host bytes");
 }
 
 bool MaterializedArtifact::has_device(ObjectHandle handle) const noexcept {
@@ -140,12 +147,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                             total);
     MaterializedArtifact out;
     out.objects_.resize(plan.object_count);
-    out.stats_.file_bytes            = reader.file_bytes();
-    out.stats_.read_bytes            = plan.prior_read_bytes;
-    out.stats_.owned_value_bytes     = plan.owned_value_bytes;
-    out.stats_.device_capacity_bytes = plan.device_capacity_bytes;
-    out.stats_.device_object_count   = plan.device_objects.size();
-    out.stats_.host_object_count     = plan.host_objects.size();
+    out.stats_.file_bytes               = reader.file_bytes();
+    out.stats_.read_bytes               = plan.prior_read_bytes;
+    out.stats_.owned_value_bytes        = plan.owned_value_bytes;
+    out.stats_.device_capacity_bytes    = plan.device_capacity_bytes;
+    out.stats_.device_object_count      = plan.device_objects.size();
+    out.stats_.host_object_count        = plan.host_objects.size();
+    out.stats_.pinned_host_object_count = plan.pinned_host_objects.size();
     out.stats_.mapped_host_object_count = plan.mapped_host_objects.size();
     if (plan.device_capacity_bytes > std::numeric_limits<std::size_t>::max()) {
         throw ArtifactError("device backing exceeds size_t");
@@ -177,6 +185,42 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             storage.host = WeightParent{geometry, storage.host_data.data(), divisor};
         }
     }
+    for (auto& placement : plan.pinned_host_objects) {
+        reader.validate_object(placement.object);
+        auto& storage       = out.objects_.at(placement.object.index);
+        const auto& object  = reader.directory().object(placement.object);
+        const auto expected = object_bytes(object);
+        if (storage.device || storage.host || storage.pinned_host_data ||
+            storage.mapped_host_data || placement.bytes != expected) {
+            throw ArtifactError("invalid or duplicate pinned Host placement");
+        }
+        if (!std::holds_alternative<TensorObject>(object)) {
+            throw ArtifactError("pinned Host placement requires a tensor object");
+        }
+        if (placement.bytes > std::numeric_limits<std::size_t>::max()) {
+            throw ArtifactError("pinned Host placement exceeds size_t");
+        }
+        storage.pinned_host_data.emplace(static_cast<std::size_t>(placement.bytes));
+        auto bytes = std::span<std::byte>(static_cast<std::byte*>(storage.pinned_host_data->data()),
+                                          storage.pinned_host_data->size());
+        if (!placement.data.empty()) {
+            if (placement.data.size() != bytes.size()) {
+                throw ArtifactError("pinned Host placement size differs from object");
+            }
+            std::memcpy(bytes.data(), placement.data.data(), bytes.size());
+        } else {
+            reader.read_into(object_offset(object), bytes);
+            out.stats_.read_bytes =
+                checked_add(out.stats_.read_bytes, placement.bytes, "pinned Host read bytes");
+        }
+        out.stats_.retained_host_bytes = checked_add(out.stats_.retained_host_bytes,
+                                                     placement.bytes, "retained pinned Host bytes");
+        out.stats_.pinned_host_bytes =
+            checked_add(out.stats_.pinned_host_bytes, placement.bytes, "pinned Host bytes");
+        const auto& geometry = reader.geometry(placement.object);
+        const auto divisor   = read_divisor(reader, placement.object, geometry, bytes, out.stats_);
+        storage.host         = WeightParent{geometry, bytes.data(), divisor};
+    }
     for (const auto& placement : plan.mapped_host_objects) {
         reader.validate_object(placement.object);
         auto& storage       = out.objects_.at(placement.object.index);
@@ -199,17 +243,15 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         reader.read_into(object_offset(object), bytes);
         out.stats_.read_bytes =
             checked_add(out.stats_.read_bytes, placement.bytes, "mapped Host read bytes");
-        out.stats_.retained_host_bytes = checked_add(
-            out.stats_.retained_host_bytes, placement.bytes, "retained mapped Host bytes");
-        out.stats_.mapped_host_bytes = checked_add(
-            out.stats_.mapped_host_bytes, placement.bytes, "mapped Host bytes");
+        out.stats_.retained_host_bytes = checked_add(out.stats_.retained_host_bytes,
+                                                     placement.bytes, "retained mapped Host bytes");
+        out.stats_.mapped_host_bytes =
+            checked_add(out.stats_.mapped_host_bytes, placement.bytes, "mapped Host bytes");
         const auto& geometry = reader.geometry(placement.object);
-        const auto divisor =
-            read_divisor(reader, placement.object, geometry, bytes, out.stats_);
-        storage.device =
-            WeightParent{geometry,
-                         static_cast<const std::byte*>(storage.mapped_host_data->device_data()),
-                         divisor};
+        const auto divisor   = read_divisor(reader, placement.object, geometry, bytes, out.stats_);
+        storage.device       = WeightParent{
+            geometry, static_cast<const std::byte*>(storage.mapped_host_data->device_data()),
+            divisor};
     }
     std::vector<CopyRange> ranges;
     for (const auto& placement : plan.device_objects) {

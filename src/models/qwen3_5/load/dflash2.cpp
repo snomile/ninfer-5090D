@@ -3,7 +3,7 @@
 namespace ninfer::models::qwen3_5::loading {
 
 void bind_dflash2(Bindings& b, DraftWeights& weights, const DraftConfig& config,
-                  const TextConfig& target) {
+                  const TextConfig& target, const LoadOptions& options) {
     const auto& extra = config.dflash2.value();
     const auto h      = target.hidden_size;
     const auto rows =
@@ -19,13 +19,16 @@ void bind_dflash2(Bindings& b, DraftWeights& weights, const DraftConfig& config,
         weights.layers[i].attention_conv = convolution("attention_conv");
         weights.layers[i].mlp_conv       = convolution("mlp_conv");
     }
-    weights.selector =
-        SelectorWeights{b.parameter("dflash2/candidate_selector/hidden_projection",
-                                    {extra.selector_rank, h}, {"dflash2/final_hidden"}),
-                        b.direct("dflash2/candidate_selector/predecessor_codebook",
-                                 {target.vocab_size, extra.selector_rank}),
-                        b.direct("dflash2/candidate_selector/successor_codebook",
-                                 {target.vocab_size, extra.selector_rank})};
+    const auto codebook_residency = options.host_mapped_dflash2_codebooks
+                                        ? artifact::Residency::HostMapped
+                                        : artifact::Residency::Device;
+    weights.selector              = SelectorWeights{
+        b.parameter("dflash2/candidate_selector/hidden_projection", {extra.selector_rank, h},
+                                 {"dflash2/final_hidden"}),
+        b.direct("dflash2/candidate_selector/predecessor_codebook",
+                              {target.vocab_size, extra.selector_rank}, QType::BF16, codebook_residency),
+        b.direct("dflash2/candidate_selector/successor_codebook",
+                              {target.vocab_size, extra.selector_rank}, QType::BF16, codebook_residency)};
 }
 
 } // namespace ninfer::models::qwen3_5::loading

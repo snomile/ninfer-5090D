@@ -10,7 +10,7 @@
 
 namespace ninfer::artifact {
 
-enum class Residency { Device, Host, HostMapped, Values };
+enum class Residency { Device, Host, HostPinned, HostMapped, Values };
 
 struct ParameterReference {
     std::string name;
@@ -46,6 +46,7 @@ public:
     [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
 
     void require_device(ObjectHandle object, std::uint64_t alignment = 256);
+    void require_pinned_host(ObjectHandle object);
     void require_mapped_host(ObjectHandle object);
     [[nodiscard]] std::span<const std::byte> host_object(ObjectHandle object);
     [[nodiscard]] ObjectHandle resource(std::string_view component, std::string_view role);
@@ -56,6 +57,7 @@ private:
     struct Demand {
         bool device             = false;
         bool host               = false;
+        bool pinned_host        = false;
         bool mapped_host        = false;
         std::uint64_t alignment = 256;
         std::vector<std::byte> host_data;

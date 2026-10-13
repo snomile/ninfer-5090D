@@ -32,6 +32,12 @@ struct MappedHostPlacement {
     std::uint64_t bytes = 0;
 };
 
+struct PinnedHostPlacement {
+    ObjectHandle object;
+    std::uint64_t bytes = 0;
+    std::vector<std::byte> data;
+};
+
 struct MaterializationPlan {
     const Reader* source                = nullptr;
     std::size_t object_count            = 0;
@@ -40,6 +46,7 @@ struct MaterializationPlan {
     std::uint64_t owned_value_bytes     = 0;
     std::vector<DevicePlacement> device_objects;
     std::vector<HostPlacement> host_objects;
+    std::vector<PinnedHostPlacement> pinned_host_objects;
     std::vector<MappedHostPlacement> mapped_host_objects;
 };
 
@@ -47,15 +54,17 @@ struct MaterializationStats {
     std::uint64_t file_bytes = 0; // Declared container file set, including framing.
     std::uint64_t read_bytes = 0; // Actual payload reads, including direct-I/O alignment.
     std::uint64_t h2d_bytes  = 0;
-    std::uint64_t device_capacity_bytes = 0;
-    std::uint64_t retained_host_bytes   = 0;
-    std::uint64_t mapped_host_bytes     = 0;
-    std::uint64_t owned_value_bytes     = 0;
-    std::uint64_t peak_staging_bytes    = 0;
-    std::size_t device_object_count     = 0;
-    std::size_t host_object_count       = 0;
+    std::uint64_t device_capacity_bytes  = 0;
+    std::uint64_t retained_host_bytes    = 0;
+    std::uint64_t pinned_host_bytes      = 0;
+    std::uint64_t mapped_host_bytes      = 0;
+    std::uint64_t owned_value_bytes      = 0;
+    std::uint64_t peak_staging_bytes     = 0;
+    std::size_t device_object_count      = 0;
+    std::size_t host_object_count        = 0;
+    std::size_t pinned_host_object_count = 0;
     std::size_t mapped_host_object_count = 0;
-    double upload_seconds               = 0;
+    double upload_seconds                = 0;
 };
 
 class MaterializedArtifact {
@@ -82,6 +91,7 @@ private:
         std::optional<WeightParent> device;
         std::optional<WeightParent> host;
         std::vector<std::byte> host_data;
+        std::optional<PinnedHostBuffer> pinned_host_data;
         std::optional<MappedHostBuffer> mapped_host_data;
     };
 

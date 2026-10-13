@@ -64,8 +64,9 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
     return id;
 }
 
-WeightId Bindings::direct(std::string name, artifact::Shape shape, QType format) {
-    return parameter(std::move(name), std::move(shape), {}, format);
+WeightId Bindings::direct(std::string name, artifact::Shape shape, QType format,
+                          artifact::Residency residency) {
+    return parameter(std::move(name), std::move(shape), {}, format, residency);
 }
 
 std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,

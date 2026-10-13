@@ -42,6 +42,13 @@ std::span<const WeightUse> LoadPlan::uses(WeightId id) const {
 }
 
 LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
+    if (options.host_mapped_dflash2_codebooks && !options.dflash2()) {
+        throw artifact::ArtifactError(
+            "Host-mapped DFlash2 codebooks require the DFlash2 component");
+    }
+    if (options.host_pinned_vision_weights && !options.vision) {
+        throw artifact::ArtifactError("Host-pinned Vision weights require Vision");
+    }
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
@@ -51,7 +58,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     const auto& text  = out->config.text;
     out->weights.text = loading::bind_text(bindings, text, options);
     if (out->config.vision) {
-        out->weights.vision = loading::bind_vision(bindings, *out->config.vision, text);
+        out->weights.vision = loading::bind_vision(bindings, *out->config.vision, text, options);
     }
     if (out->config.mtp) {
         out->weights.mtp = loading::bind_mtp(bindings, text, out->weights.text);
@@ -59,7 +66,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     if (out->config.draft) {
         out->weights.draft =
             loading::bind_draft(bindings, *out->config.draft, text, out->weights.text,
-                                std::string(options.speculative_component()));
+                                std::string(options.speculative_component()), options);
     }
     if (options.proposal_enabled()) {
         const auto& proposal = reader.directory().component("text").proposal;

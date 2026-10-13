@@ -58,6 +58,8 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
             require_device(part.object);
         } else if (residency == Residency::Host) {
             (void)host_object(part.object);
+        } else if (residency == Residency::HostPinned) {
+            require_pinned_host(part.object);
         } else if (residency == Residency::HostMapped) {
             require_mapped_host(part.object);
         }
@@ -85,6 +87,11 @@ void Binder::require_device(ObjectHandle object, std::uint64_t alignment) {
     auto& demand     = demands_.at(object.index);
     demand.device    = true;
     demand.alignment = std::max({demand.alignment, alignment, geometry.alignment});
+}
+
+void Binder::require_pinned_host(ObjectHandle object) {
+    reader_.validate_object(object);
+    demands_.at(object.index).pinned_host = true;
 }
 
 void Binder::require_mapped_host(ObjectHandle object) {
@@ -169,10 +176,14 @@ MaterializationPlan Binder::finish() && {
     plan.owned_value_bytes = owned_value_bytes_;
     for (std::size_t i = 0; i < demands_.size(); ++i) {
         auto& demand = demands_[i];
-        if (demand.mapped_host && (demand.device || demand.host)) {
+        if (demand.mapped_host && (demand.device || demand.host || demand.pinned_host)) {
             throw ArtifactError(
                 object_id(reader_.directory().object(ObjectHandle{i})) +
                 ": mapped Host placement conflicts with another physical residency");
+        }
+        if (demand.pinned_host && demand.device) {
+            throw ArtifactError(object_id(reader_.directory().object(ObjectHandle{i})) +
+                                ": pinned Host placement conflicts with Device residency");
         }
         if (demand.device) {
             const ObjectHandle handle{i};
@@ -182,12 +193,19 @@ MaterializationPlan Binder::finish() && {
             plan.device_objects.push_back({handle, offset, geometry.bytes, demand.alignment});
             plan.device_capacity_bytes = checked_add(offset, geometry.bytes, "device capacity");
         }
-        if (demand.host) {
+        if (demand.host && !demand.pinned_host) {
             plan.host_objects.push_back({ObjectHandle{i}, std::move(demand.host_data)});
+        }
+        if (demand.pinned_host) {
+            const ObjectHandle handle{i};
+            plan.pinned_host_objects.push_back({handle,
+                                                object_bytes(reader_.directory().object(handle)),
+                                                std::move(demand.host_data)});
         }
         if (demand.mapped_host) {
             const ObjectHandle handle{i};
-            plan.mapped_host_objects.push_back({handle, object_bytes(reader_.directory().object(handle))});
+            plan.mapped_host_objects.push_back(
+                {handle, object_bytes(reader_.directory().object(handle))});
         }
     }
     return plan;

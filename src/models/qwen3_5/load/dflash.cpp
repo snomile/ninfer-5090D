@@ -3,7 +3,8 @@
 namespace ninfer::models::qwen3_5::loading {
 
 DraftWeights bind_draft(Bindings& b, const DraftConfig& config, const TextConfig& target,
-                        const TextWeights& weights, const std::string& component) {
+                        const TextWeights& weights, const std::string& component,
+                        const LoadOptions& options) {
     const auto h = target.hidden_size;
     const auto q = config.attention.query_width();
     const auto k = config.attention.key_width();
@@ -40,7 +41,7 @@ DraftWeights bind_draft(Bindings& b, const DraftConfig& config, const TextConfig
         layer.mlp = bind_dense(b, h, config.intermediate_size, p, true);
         out.layers.push_back(std::move(layer));
     }
-    if (config.dflash2) { bind_dflash2(b, out, config, target); }
+    if (config.dflash2) { bind_dflash2(b, out, config, target, options); }
     return out;
 }
 
