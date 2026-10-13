@@ -21,6 +21,14 @@ Grammar JSONStringPattern(const std::string& pattern);
 // Search semantics and ECMAScript character classes, before JSON string encoding.
 std::string SchemaStringPattern(const std::string& pattern);
 Grammar JSONStringLength(int minimum, int maximum);
+// Like JSONStringLength, but also consumes the closing quote so the counted repetition and its
+// disjoint follow byte stay in the same grammar rule.
+Grammar JSONStringLengthAndClose(int minimum, int maximum);
 Grammar JSONStringExcept(const std::vector<std::string>& excluded);
+
+// Recognize the exact one-scalar language emitted by JSONEncoder. This intentionally excludes
+// arbitrary choices so counted repetitions cannot change their unit of length.
+bool IsJSONEncodedUnicodeScalar(const Grammar& grammar, int32_t expr_id);
+
 }  // namespace xgrammar
 #endif

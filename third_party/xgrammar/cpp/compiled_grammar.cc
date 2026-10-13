@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "compiled_grammar_impl.h"
+#include "json_string_grammar.h"
 #include "support/int_set.h"
 #include "support/json_parse.h"
 #include "support/json_serializer.h"
@@ -46,25 +47,29 @@ Grammar::Impl::GrammarExpr UnwrapSingleElement(
   return expr;
 }
 
-/*!
- * \brief The next state after `byte` in an FSM whose outgoing character ranges do not overlap.
- * \return -1 when no edge accepts the byte.
- */
-int NextStateOnByte(const CompactFSM& fsm, int state, uint8_t byte) {
-  for (const auto& edge : fsm.GetEdges(state)) {
-    if (edge.min <= byte && byte <= edge.max) {
-      return edge.target;
+/*! \brief The active states after `byte`, including overlapping character-range edges. */
+std::vector<int> NextStatesOnByte(
+    const CompactFSM& fsm, const std::vector<int>& states, uint8_t byte
+) {
+  std::vector<int> result;
+  for (int state : states) {
+    for (const auto& edge : fsm.GetEdges(state)) {
+      if (edge.min <= byte && byte <= edge.max) {
+        result.push_back(edge.target);
+      }
     }
   }
-  return -1;
+  std::sort(result.begin(), result.end());
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return result;
 }
 
 /*!
- * \brief Whether rule `rule_id` matches exactly one codepoint of a character class through a
- * deterministic byte FSM, with no rule-level semantics attached. Sets `first_bytes` to the bytes
- * such a codepoint can start with.
+ * \brief Whether rule `rule_id` matches one counted atom through a deterministic, prefix-free byte
+ * FSM, with no rule-level semantics attached. The supported atoms are one character-class
+ * codepoint and the canonical JSON encoding of one Unicode scalar.
  */
-bool IsPlainCharacterClassRule(const Grammar& grammar, int32_t rule_id, ByteSet* first_bytes) {
+bool IsCountedAtomRule(const Grammar& grammar, int32_t rule_id, ByteSet* first_bytes) {
   const auto& rule = grammar->GetRule(rule_id);
   if (rule_id == grammar->GetRootRuleId() || rule.lookahead_assertion_id != -1 ||
       rule.max_tokens >= 0 || rule.max_chars >= 0 || !rule.capture_name.empty() || rule.is_lazy ||
@@ -73,7 +78,10 @@ bool IsPlainCharacterClassRule(const Grammar& grammar, int32_t rule_id, ByteSet*
   }
   const auto body = UnwrapSingleElement(grammar, grammar->GetGrammarExpr(rule.body_expr_id));
   const auto& rule_fsm = grammar->per_rule_fsms[rule_id];
-  if (body.type != Grammar::Impl::GrammarExprType::kCharacterClass || !rule_fsm.has_value()) {
+  const bool json_encoded_scalar = IsJSONEncodedUnicodeScalar(grammar, rule.body_expr_id);
+  const bool supported_atom =
+      body.type == Grammar::Impl::GrammarExprType::kCharacterClass || json_encoded_scalar;
+  if (!supported_atom || !rule_fsm.has_value()) {
     return false;
   }
   const auto& fsm = rule_fsm->GetFsm();
@@ -89,7 +97,10 @@ bool IsPlainCharacterClassRule(const Grammar& grammar, int32_t rule_id, ByteSet*
         return false;
       }
       for (int byte = edge.min; byte <= edge.max; ++byte) {
-        if (seen[byte]) {
+        // The JSON escape trie can retain overlapping NFA edges for common prefixes such as
+        // "\\u001". Its exact one-scalar language is prefix-free, and ClassifyRepetitionToken
+        // follows all active targets. Keep the original DFA requirement for arbitrary classes.
+        if (seen[byte] && !json_encoded_scalar) {
           return false;
         }
         seen.set(byte);
@@ -115,11 +126,10 @@ struct RepetitionFollowBytes {
 /*!
  * \brief The rules whose start state gets the counted-repetition fast path.
  *
- * A rule qualifies when it matches one codepoint of a character class (IsPlainCharacterClassRule)
- * and every reference to it is a repeat edge that is followed, in the referring rule, only by
- * character edges whose bytes no codepoint of the class starts with. Then a token that starts
- * inside the class stays in the repetition up to its first byte outside the class and cannot leave
- * it earlier, so its legality depends only on the repetition bounds and the repetitions done in
+ * A rule qualifies when it matches one supported counted atom (IsCountedAtomRule) and every
+ * reference to it is a repeat edge followed only by bytes that cannot start the atom. Then a token
+ * that starts inside the atom stays in the repetition up to its first byte outside it and cannot
+ * leave earlier, so its legality depends only on the repetition bounds and the repetitions done in
  * the parent: see PopulateRepeatInteriorBitsets.
  *
  * \return For each rule, the bytes that can follow its repetitions, or nullopt when the rule does
@@ -135,7 +145,7 @@ std::vector<std::optional<RepetitionFollowBytes>> FindCountedRepetitionBodies(co
       return std::vector<std::optional<RepetitionFollowBytes>>(num_rules);
     }
     ByteSet bytes;
-    if (IsPlainCharacterClassRule(grammar, rule_id, &bytes)) {
+    if (IsCountedAtomRule(grammar, rule_id, &bytes)) {
       first_bytes[rule_id] = bytes;
     }
   }
@@ -228,12 +238,10 @@ struct RepetitionTokenClass {
 /*!
  * \brief Classify `token` in the start state of a counted-repetition body rule whose FSM is `fsm`.
  *
- * A token stays inside the class until its first byte outside it. It cannot leave earlier because
- * no follow byte starts a codepoint of the class (FindCountedRepetitionBodies), and it cannot
- * leave inside a codepoint. So it is decided by the repetition bounds alone when it ends inside the
- * class, or when it leaves on its last byte and every reference accepts that byte. It is rejected
- * when the byte it stops at can neither continue the codepoint nor follow the repetition, or when
- * it needs more repetitions than any reference allows.
+ * A token stays inside the atom language until its first byte outside it. It cannot leave earlier
+ * because no follow byte starts an atom (FindCountedRepetitionBodies), and the atom language is
+ * prefix-free. So it is decided by the repetition bounds alone when it ends inside the repetition,
+ * or when it leaves on its last byte and every reference accepts that byte.
  */
 RepetitionTokenClass ClassifyRepetitionToken(
     const CompactFSMWithStartEnd& fsm,
@@ -241,12 +249,14 @@ RepetitionTokenClass ClassifyRepetitionToken(
     const std::string& token
 ) {
   int32_t num_repetitions = 0;
-  int state = fsm.GetStart();
+  const int start = fsm.GetStart();
+  std::vector<int> states{start};
   for (size_t i = 0; i < token.size(); ++i) {
     const auto byte = static_cast<uint8_t>(token[i]);
-    const int next_state = NextStateOnByte(fsm.GetFsm(), state, byte);
-    if (next_state == -1) {
-      if (state != fsm.GetStart() || num_repetitions == 0 || !follow_bytes.under_any[byte]) {
+    auto next_states = NextStatesOnByte(fsm.GetFsm(), states, byte);
+    if (next_states.empty()) {
+      const bool between_atoms = states.size() == 1 && states[0] == start;
+      if (!between_atoms || num_repetitions == 0 || !follow_bytes.under_any[byte]) {
         return {RepetitionTokenClass::kRejected};
       }
       if (i + 1 == token.size() && follow_bytes.under_all[byte]) {
@@ -255,17 +265,20 @@ RepetitionTokenClass ClassifyRepetitionToken(
       }
       return {RepetitionTokenClass::kUndecided};
     }
-    state = next_state;
-    if (fsm.IsEndState(state)) {
+    if (std::any_of(next_states.begin(), next_states.end(), [&](int state) {
+          return fsm.IsEndState(state);
+        })) {
       ++num_repetitions;
-      state = fsm.GetStart();
+      states.assign({start});
       if (num_repetitions > follow_bytes.max_upper) {
         return {RepetitionTokenClass::kRejected};
       }
+    } else {
+      states = std::move(next_states);
     }
   }
   // A token ending inside a codepoint uses one more repetition to complete it.
-  if (state != fsm.GetStart()) {
+  if (states.size() != 1 || states[0] != start) {
     ++num_repetitions;
   }
   if (num_repetitions > follow_bytes.max_upper) {

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -68,6 +69,51 @@ class JSONEncoder : public GrammarMutator {
   }
 };
 }  // namespace
+
+bool IsJSONEncodedUnicodeScalar(const Grammar& grammar, int32_t expr_id) {
+  using Type = Grammar::Impl::GrammarExprType;
+  const auto unwrap_singleton = [&](int32_t id) {
+    auto expr = grammar->GetGrammarExpr(id);
+    for (int depth = 0; depth < 8; ++depth) {
+      const bool is_container = expr.type == Type::kChoices || expr.type == Type::kSequence;
+      if (!is_container || expr.size() != 1) break;
+      expr = grammar->GetGrammarExpr(expr[0]);
+    }
+    return expr;
+  };
+
+  const auto body = unwrap_singleton(expr_id);
+  if (body.type != Type::kChoices) return false;
+
+  static const std::vector<int32_t> kRawScalarClass = {
+      0, 0x20, 0x21, 0x23, 0x5b, 0x5d, 0xd7ff, 0xe000, 0x10ffff};
+  std::set<std::string> expected_escapes;
+  for (int codepoint = 0; codepoint < 0x20; ++codepoint) {
+    expected_escapes.insert(encode(std::string(1, static_cast<char>(codepoint))));
+  }
+  expected_escapes.insert(encode("\""));
+  expected_escapes.insert(encode("\\"));
+
+  bool found_raw_class = false;
+  std::set<std::string> found_escapes;
+  for (int32_t choice_id : body) {
+    const auto choice = unwrap_singleton(choice_id);
+    if (choice.type == Type::kCharacterClass) {
+      if (found_raw_class ||
+          !std::equal(choice.begin(), choice.end(), kRawScalarClass.begin(), kRawScalarClass.end())) {
+        return false;
+      }
+      found_raw_class = true;
+      continue;
+    }
+    if (choice.type != Type::kByteString) return false;
+    std::string bytes;
+    bytes.reserve(choice.size());
+    for (int byte : choice) bytes.push_back(static_cast<char>(byte));
+    if (!found_escapes.insert(std::move(bytes)).second) return false;
+  }
+  return found_raw_class && found_escapes == expected_escapes;
+}
 
 int32_t AddScalarStringFSM(GrammarBuilder& builder, const FSMWithStartEnd& fsm,
                            const std::string& rule_name, bool close_json_string,
@@ -292,6 +338,23 @@ Grammar JSONStringLength(int minimum, int maximum) {
   count += "}";
   return GrammarNormalizer::Apply(JSONEncoder().Apply(Grammar::FromEBNF("root ::= [^]" + count)));
 }
+
+Grammar JSONStringLengthAndClose(int minimum, int maximum) {
+  auto grammar = JSONStringLength(minimum, maximum);
+  GrammarBuilder builder(grammar);
+  const int32_t root_id = grammar->GetRootRuleId();
+  const auto body = grammar->GetGrammarExpr(grammar->GetRule(root_id).body_expr_id);
+  XGRAMMAR_CHECK(body.type == Grammar::Impl::GrammarExprType::kChoices && body.size() == 1);
+  const auto sequence = grammar->GetGrammarExpr(body[0]);
+  XGRAMMAR_CHECK(sequence.type == Grammar::Impl::GrammarExprType::kSequence);
+  std::vector<int32_t> elements(sequence.begin(), sequence.end());
+  elements.push_back(builder.AddByteString("\""));
+  builder.UpdateRuleBody(
+      root_id, builder.AddChoices({builder.AddSequence(std::move(elements))})
+  );
+  return builder.Get(root_id);
+}
+
 Grammar JSONStringExcept(const std::vector<std::string>& excluded) {
   struct Node {
     bool terminal = false;

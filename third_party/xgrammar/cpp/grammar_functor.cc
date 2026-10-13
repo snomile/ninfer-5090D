@@ -26,6 +26,7 @@
 #include "fsm_builder.h"
 #include "grammar_builder.h"
 #include "grammar_impl.h"
+#include "json_string_grammar.h"
 #include "suffix_automata.h"
 #include "support/container.h"
 #include "support/encoding.h"
@@ -2383,18 +2384,26 @@ int32_t RepetitionRangeExpanderImpl::LegacyHandleRepetitionRange(
 int32_t RepetitionRangeExpanderImpl::HandleRepetitionRange(
     const std::string& cur_rule_name, int32_t rule_id, int64_t lower, int64_t upper
 ) {
-  // Check if the referred rule is only one single element. If so, we can directly use the element
-  // for further optimization.
   int32_t grammar_expr_id = builder_->AddRuleRef(rule_id);
   const auto& ref_rule = base_grammar_->GetRule(rule_id);
   const auto& ref_rule_body = base_grammar_->GetGrammarExpr(ref_rule.body_expr_id);
-  // Keep the reference to budgeted, suffix/stop, lazy, and temperature rules: replacing it with
-  // the rule's content would erase the rule that the runtime semantics apply to.
-  if (ref_rule.max_tokens < 0 && ref_rule.max_chars < 0 &&
-      base_grammar_->GetSuffixStopInfo(rule_id) == nullptr && !ref_rule.is_lazy &&
-      !ref_rule.temperature.has_value() &&
-      ref_rule_body.type == GrammarBuilder::GrammarExprType::kChoices &&
-      ref_rule_body.size() == 1) {
+  // Keep the reference to annotated rules: replacing it with the rule's content would erase the
+  // rule that the runtime semantics apply to.
+  const bool can_inline = ref_rule.lookahead_assertion_id == -1 && ref_rule.max_tokens < 0 &&
+                          ref_rule.max_chars < 0 && ref_rule.capture_name.empty() &&
+                          base_grammar_->GetSuffixStopInfo(rule_id) == nullptr &&
+                          !ref_rule.is_lazy && !ref_rule.temperature.has_value();
+  const bool json_encoded_scalar =
+      can_inline && IsJSONEncodedUnicodeScalar(base_grammar_, ref_rule.body_expr_id);
+  if (json_encoded_scalar) {
+    // JSONEncoder turns one Unicode scalar into a choice between raw safe characters and escape
+    // byte strings. Keep that complete choice as the unit of repetition.
+    const auto follow_byte = follow_byte_;
+    follow_byte_ = std::nullopt;
+    grammar_expr_id = VisitExpr(ref_rule.body_expr_id);
+    follow_byte_ = follow_byte;
+  } else if (can_inline && ref_rule_body.type == GrammarBuilder::GrammarExprType::kChoices &&
+             ref_rule_body.size() == 1) {
     const auto& ref_choice = base_grammar_->GetGrammarExpr(ref_rule_body[0]);
     if (ref_choice.size() == 1) {
       // Visit the element instead of copying it verbatim: a nested repetition such as
@@ -2407,25 +2416,26 @@ int32_t RepetitionRangeExpanderImpl::HandleRepetitionRange(
     }
   }
 
-  // A length-bounded JSON string body - a repetition of a negative character class - is kept as
-  // one counted repeat edge when the byte after it is one the class excludes: the matcher then
-  // decides most tokens in the body from the repetition bounds alone
-  // (PopulateRepeatInteriorBitsets). Anywhere else the counted edge would be slower than the
-  // expansion below, which keeps a separate mask per position; that includes grammars with
-  // character budgets, where the matcher never takes the fast path. In grammars with lazy rules
-  // a repetition with a lower bound or without an upper bound keeps the expansion too: the lazy
-  // body flattener flattens that expansion but not a counted edge.
+  // A length-bounded JSON string body is kept as one counted repeat edge. Before JSON encoding it
+  // is a negative character class; after encoding it is the exact one-scalar choice recognized
+  // above. The matcher can then decide most tokens from the repetition bounds alone
+  // (PopulateRepeatInteriorBitsets). Anywhere else the counted edge would be slower than explicit
+  // expansion. Character-budget and incompatible lazy grammars also keep the expansion because
+  // their runtime paths cannot use this optimization.
   const auto repeated_expr = builder_->GetGrammarExpr(grammar_expr_id);
   bool counted = false;
-  if (repeated_expr.type == GrammarBuilder::GrammarExprType::kCharacterClass &&
-      repeated_expr[0] != 0 && follow_byte_.has_value() && *follow_byte_ < 0x80 &&
-      !HasCharBudgetRules() && ((lower == 0 && upper != -1) || !HasLazyRules())) {
-    bool excluded = false;
-    for (int i = 1; i + 1 < repeated_expr.size(); i += 2) {
-      excluded =
-          excluded || (repeated_expr[i] <= *follow_byte_ && *follow_byte_ <= repeated_expr[i + 1]);
+  if (follow_byte_.has_value() && *follow_byte_ < 0x80 && !HasCharBudgetRules() &&
+      ((lower == 0 && upper != -1) || !HasLazyRules())) {
+    if (json_encoded_scalar) {
+      counted = *follow_byte_ == '"';
+    } else if (repeated_expr.type == GrammarBuilder::GrammarExprType::kCharacterClass &&
+               repeated_expr[0] != 0) {
+      for (int i = 1; i + 1 < repeated_expr.size(); i += 2) {
+        counted =
+            counted ||
+            (repeated_expr[i] <= *follow_byte_ && *follow_byte_ <= repeated_expr[i + 1]);
+      }
     }
-    counted = excluded;
   }
   counted_repetition_ = counted;
 
@@ -2468,7 +2478,8 @@ int32_t RepetitionRangeExpanderImpl::ExpandRepetitionRange(
   // repeat edge, so the token data of PopulateRepeatInteriorBitsets is built once.
   if (counted) {
     const auto repeated_expr = builder_->GetGrammarExpr(grammar_expr_id);
-    std::vector<int32_t> body_key(repeated_expr.begin(), repeated_expr.end());
+    std::vector<int32_t> body_key{static_cast<int32_t>(repeated_expr.type)};
+    body_key.insert(body_key.end(), repeated_expr.begin(), repeated_expr.end());
     body_key.push_back(*follow_byte_);
     auto [it, inserted] = counted_body_rule_ids_.try_emplace(std::move(body_key), -1);
     if (inserted) {
