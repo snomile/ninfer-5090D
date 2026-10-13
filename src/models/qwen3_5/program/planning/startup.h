@@ -48,13 +48,16 @@ struct PersistentLayout {
 };
 
 struct VisionWorkspacePlan {
-    std::int32_t output_hidden         = 0;
-    std::uint32_t max_merged_tokens    = 0;
-    std::size_t general_capacity_bytes = 0;
-    std::size_t encode_peak_bytes      = 0;
-    std::size_t handoff_offset_bytes   = 0;
-    std::size_t handoff_capacity_bytes = 0;
-    std::size_t capacity_bytes         = 0;
+    std::int32_t output_hidden                = 0;
+    std::uint32_t max_merged_tokens           = 0;
+    std::size_t general_capacity_bytes        = 0;
+    std::size_t encode_peak_bytes             = 0;
+    std::size_t handoff_offset_bytes          = 0;
+    std::size_t handoff_capacity_bytes        = 0;
+    std::size_t weight_staging_offset_bytes   = 0;
+    std::size_t weight_staging_slot_bytes     = 0;
+    std::size_t weight_staging_capacity_bytes = 0;
+    std::size_t capacity_bytes                = 0;
 };
 
 struct WorkspacePlan {

@@ -214,6 +214,211 @@ std::size_t merger_hidden_bytes(const VisionConfig& config, std::size_t merged_t
     return tensor.bytes();
 }
 
+std::size_t staged_linear_bytes(const LinearParameters& parameter, const char* label) {
+    const Weight& weight = parameter.weight;
+    if (weight.qtype != QType::BF16 || weight.layout != QuantLayout::Contiguous ||
+        weight.qdata == nullptr || weight.n <= 0 || weight.k <= 0) {
+        throw std::invalid_argument(std::string("Vision ") + label +
+                                    " must be a resident contiguous BF16 matrix");
+    }
+    return checked_mul(
+        checked_mul(static_cast<std::size_t>(weight.n), static_cast<std::size_t>(weight.k), label),
+        dtype_size(DType::BF16), label);
+}
+
+std::size_t staged_tensor_bytes(const Tensor& tensor, const char* label) {
+    if (tensor.dtype != DType::BF16 || tensor.data == nullptr || !tensor.is_contiguous() ||
+        tensor.bytes() == 0) {
+        throw std::invalid_argument(std::string("Vision ") + label +
+                                    " must be a resident contiguous BF16 tensor");
+    }
+    return tensor.bytes();
+}
+
+class StageLayout {
+public:
+    void linear(const LinearParameters& parameter, const char* label) {
+        add(staged_linear_bytes(parameter, label), label);
+    }
+
+    void tensor(const Tensor& tensor, const char* label) {
+        add(staged_tensor_bytes(tensor, label), label);
+    }
+
+    [[nodiscard]] std::size_t finish() const {
+        return align_up(bytes_, kWorkspaceAlignment, "weight staging phase");
+    }
+
+private:
+    void add(std::size_t bytes, const char* label) {
+        bytes_ = checked_add(align_up(bytes_, kWorkspaceAlignment, label), bytes, label);
+    }
+
+    std::size_t bytes_ = 0;
+};
+
+void add_norm(StageLayout& layout, const NormParameters& norm, const char* label) {
+    layout.tensor(norm.weight, label);
+    layout.tensor(norm.bias, label);
+}
+
+std::size_t patch_stage_bytes(const VisionParameters& parameters) {
+    StageLayout layout;
+    layout.linear(parameters.patch_embedding, "patch embedding");
+    layout.tensor(parameters.patch_embedding_bias, "patch embedding bias");
+    layout.tensor(parameters.position_embedding, "position embedding");
+    return layout.finish();
+}
+
+std::size_t layer_stage_bytes(const VisionBlockParameters& block) {
+    StageLayout layout;
+    add_norm(layout, block.norm1, "layer norm1");
+    add_norm(layout, block.norm2, "layer norm2");
+    layout.linear(block.qkv, "layer QKV");
+    layout.tensor(block.qkv_bias, "layer QKV bias");
+    layout.linear(block.output, "layer output");
+    layout.tensor(block.output_bias, "layer output bias");
+    layout.linear(block.fc1, "layer FC1");
+    layout.tensor(block.fc1_bias, "layer FC1 bias");
+    layout.linear(block.fc2, "layer FC2");
+    layout.tensor(block.fc2_bias, "layer FC2 bias");
+    return layout.finish();
+}
+
+std::size_t merger_first_stage_bytes(const VisionParameters& parameters) {
+    StageLayout layout;
+    add_norm(layout, parameters.merger_norm, "merger norm");
+    layout.linear(parameters.merger_fc1, "merger FC1");
+    layout.tensor(parameters.merger_fc1_bias, "merger FC1 bias");
+    return layout.finish();
+}
+
+std::size_t merger_second_stage_bytes(const VisionParameters& parameters) {
+    StageLayout layout;
+    layout.linear(parameters.merger_fc2, "merger FC2");
+    layout.tensor(parameters.merger_fc2_bias, "merger FC2 bias");
+    return layout.finish();
+}
+
+std::size_t vision_staging_slot_bytes(const VisionParameters& parameters) {
+    std::size_t bytes =
+        std::max(patch_stage_bytes(parameters), merger_first_stage_bytes(parameters));
+    bytes = std::max(bytes, merger_second_stage_bytes(parameters));
+    for (const auto& block : parameters.layers) {
+        bytes = std::max(bytes, layer_stage_bytes(block));
+    }
+    return bytes;
+}
+
+struct PatchStage {
+    LinearParameters embedding;
+    Tensor bias;
+    Tensor position;
+};
+
+struct MergerFirstStage {
+    NormParameters norm;
+    LinearParameters fc;
+    Tensor bias;
+};
+
+struct MergerSecondStage {
+    LinearParameters fc;
+    Tensor bias;
+};
+
+class StageWriter {
+public:
+    StageWriter(DeviceSpan slot, cudaStream_t stream) : slot_(slot), stream_(stream) {
+        if (slot_.data == nullptr || slot_.bytes == 0 || stream_ == nullptr) {
+            throw std::invalid_argument("Vision weight staging slot is invalid");
+        }
+    }
+
+    LinearParameters linear(const LinearParameters& source, const char* label) {
+        const auto bytes  = staged_linear_bytes(source, label);
+        auto* destination = allocate(bytes, label);
+        CUDA_CHECK(cudaMemcpyAsync(destination, source.weight.qdata, bytes, cudaMemcpyHostToDevice,
+                                   stream_));
+        LinearParameters out        = source;
+        out.weight.payload          = destination;
+        out.weight.payload_bytes    = bytes;
+        out.weight.high_plane_bytes = 0;
+        out.weight.qdata            = destination;
+        out.weight.qhigh            = nullptr;
+        out.weight.scales           = nullptr;
+        return out;
+    }
+
+    Tensor tensor(const Tensor& source, const char* label) {
+        const auto bytes  = staged_tensor_bytes(source, label);
+        auto* destination = allocate(bytes, label);
+        CUDA_CHECK(
+            cudaMemcpyAsync(destination, source.data, bytes, cudaMemcpyHostToDevice, stream_));
+        Tensor out = source;
+        out.data   = destination;
+        return out;
+    }
+
+private:
+    void* allocate(std::size_t bytes, const char* label) {
+        offset_        = align_up(offset_, kWorkspaceAlignment, label);
+        const auto end = checked_add(offset_, bytes, label);
+        if (end > slot_.bytes) {
+            throw std::logic_error(std::string("Vision ") + label +
+                                   " exceeds the planned staging slot");
+        }
+        auto* out = static_cast<std::byte*>(slot_.data) + offset_;
+        offset_   = end;
+        return out;
+    }
+
+    DeviceSpan slot_;
+    cudaStream_t stream_ = nullptr;
+    std::size_t offset_  = 0;
+};
+
+PatchStage stage_patch(const VisionParameters& parameters, DeviceSpan slot, cudaStream_t stream) {
+    StageWriter writer(slot, stream);
+    return {writer.linear(parameters.patch_embedding, "patch embedding"),
+            writer.tensor(parameters.patch_embedding_bias, "patch embedding bias"),
+            writer.tensor(parameters.position_embedding, "position embedding")};
+}
+
+VisionBlockParameters stage_layer(const VisionBlockParameters& source, DeviceSpan slot,
+                                  cudaStream_t stream) {
+    StageWriter writer(slot, stream);
+    const auto norm = [&](const NormParameters& value, const char* label) {
+        return NormParameters{writer.tensor(value.weight, label), writer.tensor(value.bias, label)};
+    };
+    return {norm(source.norm1, "layer norm1"),
+            norm(source.norm2, "layer norm2"),
+            writer.linear(source.qkv, "layer QKV"),
+            writer.tensor(source.qkv_bias, "layer QKV bias"),
+            writer.linear(source.output, "layer output"),
+            writer.linear(source.fc1, "layer FC1"),
+            writer.linear(source.fc2, "layer FC2"),
+            writer.tensor(source.output_bias, "layer output bias"),
+            writer.tensor(source.fc1_bias, "layer FC1 bias"),
+            writer.tensor(source.fc2_bias, "layer FC2 bias")};
+}
+
+MergerFirstStage stage_merger_first(const VisionParameters& parameters, DeviceSpan slot,
+                                    cudaStream_t stream) {
+    StageWriter writer(slot, stream);
+    return {{writer.tensor(parameters.merger_norm.weight, "merger norm"),
+             writer.tensor(parameters.merger_norm.bias, "merger norm")},
+            writer.linear(parameters.merger_fc1, "merger FC1"),
+            writer.tensor(parameters.merger_fc1_bias, "merger FC1 bias")};
+}
+
+MergerSecondStage stage_merger_second(const VisionParameters& parameters, DeviceSpan slot,
+                                      cudaStream_t stream) {
+    StageWriter writer(slot, stream);
+    return {writer.linear(parameters.merger_fc2, "merger FC2"),
+            writer.tensor(parameters.merger_fc2_bias, "merger FC2 bias")};
+}
+
 void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
     if (dst.bytes() == 0) { return; }
     CUDA_CHECK(cudaMemcpyAsync(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice, stream));
@@ -221,9 +426,20 @@ void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
 
 } // namespace
 
-VisionContext::VisionContext(DeviceContext& ctx, const Parameters& parameters)
+VisionContext::VisionContext(DeviceContext& ctx, const Parameters& parameters,
+                             VisionHandoffState& staging_state)
     : ctx_(ctx), config_(parameters.model.config().vision.value()),
-      parameters_(parameters.vision.value()) {}
+      parameters_(parameters.vision.value()), staging_state_(staging_state) {
+    if (parameters_.host_staged) {
+        for (std::size_t i = 0; i < staging_state_.staging_ready_.size(); ++i) {
+            if (!staging_state_.staging_ready_[i]) {
+                staging_state_.staging_ready_[i].emplace(ctx_);
+                staging_state_.staging_consumed_[i].emplace(ctx_);
+                staging_state_.staging_consumed_[i]->record(ctx_.stream);
+            }
+        }
+    }
+}
 
 std::size_t VisionContext::workspace_bytes(const VisionConfig& config,
                                            const VisionParameters& parameters, std::size_t patches,
@@ -260,6 +476,16 @@ VisionWorkspacePlan VisionContext::plan_workspace(const VisionConfig& config,
     out.capacity_bytes = std::max(
         out.encode_peak_bytes,
         checked_add(out.handoff_offset_bytes, out.handoff_capacity_bytes, "workspace capacity"));
+    if (parameters.host_staged) {
+        out.weight_staging_offset_bytes =
+            align_up(out.capacity_bytes, kWorkspaceAlignment, "weight staging offset");
+        out.weight_staging_slot_bytes = vision_staging_slot_bytes(parameters);
+        out.weight_staging_capacity_bytes =
+            checked_mul(2, out.weight_staging_slot_bytes, "weight staging capacity");
+        out.capacity_bytes =
+            checked_add(out.weight_staging_offset_bytes, out.weight_staging_capacity_bytes,
+                        "workspace plus weight staging capacity");
+    }
     return out;
 }
 
@@ -306,9 +532,38 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
     if (layout.bytes > plan.encode_peak_bytes || backing.bytes < plan.capacity_bytes) {
         throw std::invalid_argument("Vision workspace capacity is too small for request");
     }
-    const auto patches  = static_cast<std::int32_t>(patches64);
-    const auto tokens   = static_cast<std::int32_t>(tokens64);
-    cudaStream_t stream = ctx_.stream;
+    const auto patches        = static_cast<std::int32_t>(patches64);
+    const auto tokens         = static_cast<std::int32_t>(tokens64);
+    cudaStream_t stream       = ctx_.stream;
+    const bool staged_weights = parameters_.host_staged;
+    if (staged_weights &&
+        (plan.weight_staging_slot_bytes == 0 ||
+         plan.weight_staging_capacity_bytes != 2 * plan.weight_staging_slot_bytes ||
+         plan.weight_staging_offset_bytes > backing.bytes ||
+         plan.weight_staging_capacity_bytes > backing.bytes - plan.weight_staging_offset_bytes)) {
+        throw std::invalid_argument("Vision weight staging exceeds its workspace plan");
+    }
+    const auto staging_slot = [&](std::size_t index) {
+        if (!staged_weights || index >= staging_state_.staging_ready_.size()) {
+            throw std::logic_error("Vision weight staging slot is unavailable");
+        }
+        return DeviceSpan{static_cast<std::byte*>(backing.data) + plan.weight_staging_offset_bytes +
+                              index * plan.weight_staging_slot_bytes,
+                          plan.weight_staging_slot_bytes};
+    };
+    const auto begin_stage = [&](std::size_t index) {
+        staging_state_.staging_consumed_[index]->wait(ctx_.transfer_stream);
+        return staging_slot(index);
+    };
+    const auto complete_stage = [&](std::size_t index) {
+        staging_state_.staging_ready_[index]->record(ctx_.transfer_stream);
+    };
+    const auto wait_stage = [&](std::size_t index) {
+        staging_state_.staging_ready_[index]->wait(stream);
+    };
+    const auto consume_stage = [&](std::size_t index) {
+        staging_state_.staging_consumed_[index]->record(stream);
+    };
 
     const auto project = [&](const Tensor& x, const LinearParameters& p, Tensor& out,
                              const LayoutRegion& region) {
@@ -320,26 +575,59 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
     Tensor patch_bf16   = layout.patch_bf16.bind(backing);
     Tensor pos_indices  = layout.pos_indices.bind(backing);
     Tensor pos_weights  = layout.pos_weights.bind(backing);
+    PatchStage patch_parameters{parameters_.patch_embedding, parameters_.patch_embedding_bias,
+                                parameters_.position_embedding};
+    std::optional<VisionBlockParameters> next_layer;
+    std::optional<MergerFirstStage> next_merger_first;
+    if (staged_weights) {
+        patch_parameters = stage_patch(parameters_, begin_stage(0), ctx_.transfer_stream);
+        complete_stage(0);
+        wait_stage(0);
+        if (!parameters_.layers.empty()) {
+            next_layer =
+                stage_layer(parameters_.layers.front(), begin_stage(1), ctx_.transfer_stream);
+        } else {
+            next_merger_first =
+                stage_merger_first(parameters_, begin_stage(1), ctx_.transfer_stream);
+        }
+        complete_stage(1);
+    }
     {
         nvtx::ScopedRange patch_range(nvtx::Name::VisionPatchEmbedding, nvtx::Category::Vision,
                                       static_cast<std::uint64_t>(patches64));
         copy_host(control.position_ids.data(), position_ids, stream);
         copy_host(item.patches.data(), patch_bf16, stream);
-        project(patch_bf16, parameters_.patch_embedding, x, layout.patch_scratch);
-        ops::add_bias(parameters_.patch_embedding_bias, x, stream);
+        project(patch_bf16, patch_parameters.embedding, x, layout.patch_scratch);
+        ops::add_bias(patch_parameters.bias, x, stream);
         // The artifact records the source table shape [rows,hidden], while Tensor's
         // contiguous matrix convention is [inner,columns]. The payload is already
         // row-major, so this is a zero-copy [hidden,rows] view, not a transpose.
         copy_host(control.position_table_indices.data(), pos_indices, stream);
         copy_host(control.position_table_weights.data(), pos_weights, stream);
-        Tensor position_table = parameters_.position_embedding.reshape(
+        Tensor position_table = patch_parameters.position.reshape(
             {dimension(config_.hidden_size), dimension(config_.num_position_embeddings)});
         ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
     }
+    if (staged_weights) { consume_stage(0); }
     for (std::size_t layer = 0; layer < parameters_.layers.size(); ++layer) {
+        const std::size_t layer_slot = (layer + 1) % 2;
+        std::optional<VisionBlockParameters> staged_block;
+        if (staged_weights) {
+            wait_stage(layer_slot);
+            staged_block                = std::move(next_layer);
+            const std::size_t next_slot = 1 - layer_slot;
+            if (layer + 1 < parameters_.layers.size()) {
+                next_layer = stage_layer(parameters_.layers[layer + 1], begin_stage(next_slot),
+                                         ctx_.transfer_stream);
+            } else {
+                next_merger_first =
+                    stage_merger_first(parameters_, begin_stage(next_slot), ctx_.transfer_stream);
+            }
+            complete_stage(next_slot);
+        }
         nvtx::ScopedRange layer_range(nvtx::Name::VisionLayer, nvtx::Category::Vision,
                                       static_cast<std::uint64_t>(layer));
-        const auto& block = parameters_.layers[layer];
+        const auto& block = staged_weights ? *staged_block : parameters_.layers[layer];
         {
             nvtx::ScopedRange attention_range(nvtx::Name::VisionAttention,
                                               nvtx::Category::Attention,
@@ -401,21 +689,38 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
             ops::add_bias(block.fc2_bias, down, stream);
             ops::residual_add(down, x, stream);
         }
+        if (staged_weights) { consume_stage(layer_slot); }
     }
 
     {
         nvtx::ScopedRange merge_range(nvtx::Name::VisionMerge, nvtx::Category::Vision,
                                       static_cast<std::uint64_t>(tokens64));
+        const std::size_t first_slot = (parameters_.layers.size() + 1) % 2;
+        MergerFirstStage first{parameters_.merger_norm, parameters_.merger_fc1,
+                               parameters_.merger_fc1_bias};
+        MergerSecondStage second{parameters_.merger_fc2, parameters_.merger_fc2_bias};
+        if (staged_weights) {
+            wait_stage(first_slot);
+            first                         = std::move(*next_merger_first);
+            const std::size_t second_slot = 1 - first_slot;
+            second =
+                stage_merger_second(parameters_, begin_stage(second_slot), ctx_.transfer_stream);
+            complete_stage(second_slot);
+        }
         Tensor normalized = layout.normalized.bind(backing);
-        ops::layer_norm(x, parameters_.merger_norm.weight, parameters_.merger_norm.bias, 1.0e-6F,
-                        normalized, stream);
+        ops::layer_norm(x, first.norm.weight, first.norm.bias, 1.0e-6F, normalized, stream);
         Tensor merged = normalized.view({dimension(config_.merger_width()), tokens});
         Tensor hidden = layout.merger_hidden.bind(backing);
-        project(merged, parameters_.merger_fc1, hidden, layout.merger_first_scratch);
-        ops::add_bias(parameters_.merger_fc1_bias, hidden, stream);
+        project(merged, first.fc, hidden, layout.merger_first_scratch);
+        ops::add_bias(first.bias, hidden, stream);
         ops::gelu(hidden, ops::GeluMode::Exact, stream);
-        project(hidden, parameters_.merger_fc2, output, layout.merger_second_scratch);
-        ops::add_bias(parameters_.merger_fc2_bias, output, stream);
+        if (staged_weights) {
+            consume_stage(first_slot);
+            wait_stage(1 - first_slot);
+        }
+        project(hidden, second.fc, output, layout.merger_second_scratch);
+        ops::add_bias(second.bias, output, stream);
+        if (staged_weights) { consume_stage(1 - first_slot); }
     }
 }
 
@@ -425,7 +730,7 @@ VisionPrefillSession::VisionPrefillSession(
     const VisionPrefillPlan& plan, VisionHandoffState& handoff, std::size_t& handoff_peak_bytes)
     : device_(device), workspace_(workspace), workspace_plan_(workspace_plan), prompt_(prompt),
       plan_(plan), handoff_(handoff), handoff_peak_bytes_(handoff_peak_bytes),
-      context_(device, parameters) {
+      context_(device, parameters, handoff) {
     if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }

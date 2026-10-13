@@ -31,7 +31,8 @@ struct VisionItemView {
 
 class VisionContext {
 public:
-    VisionContext(DeviceContext& device, const execution::Parameters& parameters);
+    VisionContext(DeviceContext& device, const execution::Parameters& parameters,
+                  VisionHandoffState& staging_state);
 
     [[nodiscard]] static std::size_t workspace_bytes(const VisionConfig& config,
                                                      const VisionParameters& parameters,
@@ -53,6 +54,7 @@ private:
     DeviceContext& ctx_;
     const VisionConfig& config_;
     const VisionParameters& parameters_;
+    VisionHandoffState& staging_state_;
 };
 
 struct VisionChunk {

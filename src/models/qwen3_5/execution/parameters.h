@@ -86,6 +86,7 @@ struct VisionBlockParameters {
 };
 
 struct VisionParameters {
+    bool host_staged = false;
     LinearParameters patch_embedding;
     Tensor patch_embedding_bias, position_embedding;
     std::vector<VisionBlockParameters> layers;

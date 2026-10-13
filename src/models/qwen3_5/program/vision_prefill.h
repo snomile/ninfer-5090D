@@ -1,26 +1,33 @@
 #pragma once
 #include "models/qwen3_5/program/internal.h"
 
+#include "core/device.h"
 #include "models/qwen3_5/program/vision_control.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
+class VisionContext;
 class VisionPrefillSession;
-}
+} // namespace ninfer::models::qwen3_5::execution
 
 namespace ninfer::models::qwen3_5::detail {
 
-// One state per Program workspace. Only Vision encoding can replace the handoff;
-// Text and decode use the disjoint general workspace and preserve its owner.
+// One state per Program workspace. It owns handoff identity and, when enabled, the shared
+// weight-staging slot events used by every request session.
 class VisionHandoffState {
+    friend class execution::VisionContext;
     friend class execution::VisionPrefillSession;
 
     const execution::VisionPrefillSession* owner_ = nullptr;
     std::uint64_t generation_                     = 0;
+    std::array<std::optional<CudaCompletionEvent>, 2> staging_ready_;
+    std::array<std::optional<CudaCompletionEvent>, 2> staging_consumed_;
 };
 
 struct VisionUseSpan {

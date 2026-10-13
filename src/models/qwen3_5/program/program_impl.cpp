@@ -67,7 +67,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         causal_scoring != plan.persistent.score_hidden.has_value() ||
         causal_scoring != (workspace_plan.causal_score != 0) ||
         (workspace_plan.vision &&
-         workspace_plan.vision->general_capacity_bytes != workspace_plan.general_capacity)) {
+         (workspace_plan.vision->general_capacity_bytes != workspace_plan.general_capacity ||
+          (workspace_plan.vision->weight_staging_capacity_bytes != 0) !=
+              plan.features.host_pinned_vision_weights))) {
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
@@ -457,13 +459,16 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         out.vision_workspace = VisionWorkspaceMemorySummary{
             .aggregate_prompt_tokens = static_cast<std::uint32_t>(
                 std::min<std::uint64_t>(capacity, kMaximumPromptVisionTokens)),
-            .max_item_tokens        = workspace_plan.vision->max_merged_tokens,
-            .general_capacity_bytes = workspace_plan.vision->general_capacity_bytes,
-            .encode_peak_bytes      = workspace_plan.vision->encode_peak_bytes,
-            .handoff_offset_bytes   = workspace_plan.vision->handoff_offset_bytes,
-            .handoff_capacity_bytes = workspace_plan.vision->handoff_capacity_bytes,
-            .handoff_active_bytes   = active_handoff_bytes,
-            .handoff_peak_bytes     = vision_handoff_peak_bytes,
+            .max_item_tokens               = workspace_plan.vision->max_merged_tokens,
+            .general_capacity_bytes        = workspace_plan.vision->general_capacity_bytes,
+            .encode_peak_bytes             = workspace_plan.vision->encode_peak_bytes,
+            .handoff_offset_bytes          = workspace_plan.vision->handoff_offset_bytes,
+            .handoff_capacity_bytes        = workspace_plan.vision->handoff_capacity_bytes,
+            .handoff_active_bytes          = active_handoff_bytes,
+            .handoff_peak_bytes            = vision_handoff_peak_bytes,
+            .weight_staging_offset_bytes   = workspace_plan.vision->weight_staging_offset_bytes,
+            .weight_staging_slot_bytes     = workspace_plan.vision->weight_staging_slot_bytes,
+            .weight_staging_capacity_bytes = workspace_plan.vision->weight_staging_capacity_bytes,
         };
     }
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;

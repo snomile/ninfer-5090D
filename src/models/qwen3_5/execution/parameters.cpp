@@ -172,6 +172,7 @@ public:
 
     VisionParameters vision(const VisionWeights& w) const {
         VisionParameters out;
+        out.host_staged          = model_.options().host_pinned_vision_weights;
         out.patch_embedding      = linear(w.patch_embedding);
         out.patch_embedding_bias = tensor(w.patch_embedding_bias);
         out.position_embedding   = tensor(w.position_embedding);
