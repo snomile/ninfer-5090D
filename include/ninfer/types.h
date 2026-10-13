@@ -160,8 +160,11 @@ struct EngineOptions {
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
-    std::uint32_t max_vision_item_tokens    = 16'384;
-    bool host_mapped_embedding              = false;
+    std::uint32_t max_vision_item_tokens   = 16'384;
+    bool host_mapped_embedding             = false;
+    bool host_mapped_dflash2_codebooks     = false;
+    bool host_pinned_vision_weights        = false;
+    bool host_state_images                 = false;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
@@ -917,14 +920,17 @@ struct ArenaMemorySummary {
 // Logical regions within the one physical workspace allocation. These byte values describe
 // layout and live extents and must not be added to workspace.capacity_bytes.
 struct VisionWorkspaceMemorySummary {
-    std::uint32_t aggregate_prompt_tokens = 0;
-    std::uint32_t max_item_tokens         = 0;
-    std::size_t general_capacity_bytes    = 0;
-    std::size_t encode_peak_bytes         = 0;
-    std::size_t handoff_offset_bytes      = 0;
-    std::size_t handoff_capacity_bytes    = 0;
-    std::size_t handoff_active_bytes      = 0;
-    std::size_t handoff_peak_bytes        = 0;
+    std::uint32_t aggregate_prompt_tokens     = 0;
+    std::uint32_t max_item_tokens             = 0;
+    std::size_t general_capacity_bytes        = 0;
+    std::size_t encode_peak_bytes             = 0;
+    std::size_t handoff_offset_bytes          = 0;
+    std::size_t handoff_capacity_bytes        = 0;
+    std::size_t handoff_active_bytes          = 0;
+    std::size_t handoff_peak_bytes            = 0;
+    std::size_t weight_staging_offset_bytes   = 0;
+    std::size_t weight_staging_slot_bytes     = 0;
+    std::size_t weight_staging_capacity_bytes = 0;
 };
 
 struct MemorySummary {
@@ -1106,15 +1112,17 @@ struct LoadSummary {
     std::string cuda_sync_mode;
     std::vector<std::string> weight_formats;
     std::string prefill_signature;
-    double load_seconds                = 0.0;
-    double upload_seconds              = 0.0;
-    std::uint64_t artifact_bytes_read  = 0;
-    std::uint64_t host_to_device_bytes = 0;
-    std::uint64_t peak_staging_bytes   = 0;
-    std::uint64_t mapped_host_bytes    = 0;
-    std::size_t device_object_count    = 0;
-    std::size_t host_object_count      = 0;
+    double load_seconds                  = 0.0;
+    double upload_seconds                = 0.0;
+    std::uint64_t artifact_bytes_read    = 0;
+    std::uint64_t host_to_device_bytes   = 0;
+    std::uint64_t peak_staging_bytes     = 0;
+    std::uint64_t mapped_host_bytes      = 0;
+    std::uint64_t pinned_host_bytes      = 0;
+    std::size_t device_object_count      = 0;
+    std::size_t host_object_count        = 0;
     std::size_t mapped_host_object_count = 0;
+    std::size_t pinned_host_object_count = 0;
     ContextCostSummary context_cost;
 };
 

@@ -96,6 +96,8 @@ std::string usage_text(const char* argv0) {
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max] [--vision]\n"
            "       [--max-vision-item-tokens N] [--host-mapped-embedding]\n"
+           "       [--host-mapped-dflash2-codebooks] [--host-pinned-vision-weights]\n"
+           "       [--host-state-images]\n"
            "       [--no-cuda-graph]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "\n"
@@ -177,10 +179,15 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--max-vision-item-tokens") {
-            options.max_vision_item_tokens =
-                parse_u32(value(arg), "max-vision-item-tokens");
+            options.max_vision_item_tokens = parse_u32(value(arg), "max-vision-item-tokens");
         } else if (arg == "--host-mapped-embedding") {
             options.host_mapped_embedding = true;
+        } else if (arg == "--host-mapped-dflash2-codebooks") {
+            options.host_mapped_dflash2_codebooks = true;
+        } else if (arg == "--host-pinned-vision-weights") {
+            options.host_pinned_vision_weights = true;
+        } else if (arg == "--host-state-images") {
+            options.host_state_images = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--stop-token-id") {
@@ -251,6 +258,13 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.host_mapped_dflash2_codebooks &&
+        options.speculative.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument("--host-mapped-dflash2-codebooks requires --spec dflash2");
+    }
+    if (options.host_pinned_vision_weights && !options.enable_vision) {
+        throw std::invalid_argument("--host-pinned-vision-weights requires --vision");
+    }
     if (options.enable_thinking == false && options.reasoning_effort &&
         *options.reasoning_effort != ReasoningEffort::None) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");

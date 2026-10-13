@@ -288,13 +288,15 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
                         format_pretty_text(load.model_name), format_pretty_duration(total_seconds),
                         format_pretty_bytes(load.host_to_device_bytes), load.cuda_sync_mode);
     impl_->logger->debug(
-        "load detail | architecture {} | artifact read {} | H2D {} | mapped Host {} | staging "
-        "peak {} | device objects {} | host objects {} | mapped Host objects {}",
+        "load detail | architecture {} | artifact read {} | H2D {} | mapped Host {} | pinned Host "
+        "{} | staging peak {} | device objects {} | host objects {} | mapped Host objects {} | "
+        "pinned Host objects {}",
         format_pretty_text(load.architecture), format_pretty_bytes(load.artifact_bytes_read),
         format_pretty_bytes(load.host_to_device_bytes), format_pretty_bytes(load.mapped_host_bytes),
-        format_pretty_bytes(load.peak_staging_bytes), format_pretty_count(load.device_object_count),
-        format_pretty_count(load.host_object_count),
-        format_pretty_count(load.mapped_host_object_count));
+        format_pretty_bytes(load.pinned_host_bytes), format_pretty_bytes(load.peak_staging_bytes),
+        format_pretty_count(load.device_object_count), format_pretty_count(load.host_object_count),
+        format_pretty_count(load.mapped_host_object_count),
+        format_pretty_count(load.pinned_host_object_count));
     impl_->logger->debug("context cost | transfer {} | prefill {} | signature {}",
                          context_cost_preset_source_name(load.context_cost.transfer_source),
                          context_cost_preset_source_name(load.context_cost.prefill_source),

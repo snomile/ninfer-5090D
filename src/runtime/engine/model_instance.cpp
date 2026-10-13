@@ -60,6 +60,15 @@ void validate_options(const EngineOptions& options) {
     if (options.media_preprocess_threads > 64) {
         throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
     }
+    if (options.host_mapped_dflash2_codebooks &&
+        options.speculative.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument(
+            "Engine host_mapped_dflash2_codebooks requires the DFlash2 backend");
+    }
+    if (options.host_pinned_vision_weights && !options.enable_vision) {
+        throw std::invalid_argument(
+            "Engine host_pinned_vision_weights requires Vision to be enabled");
+    }
 }
 
 std::size_t current_free_device_bytes() {
@@ -82,9 +91,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
         options.speculative          = {};
         options.enable_vision        = false;
-        options.use_cuda_graph       = false;
-        options.context_cache        = ContextCacheOptions{
-                   .enabled = false, .device_state_slots = 0, .host_capacity_bytes = 0};
+        options.host_mapped_dflash2_codebooks = false;
+        options.host_pinned_vision_weights    = false;
+        options.host_state_images             = false;
+        options.use_cuda_graph                = false;
+        options.context_cache                 = ContextCacheOptions{
+                            .enabled = false, .device_state_slots = 0, .host_capacity_bytes = 0};
         break;
     default:
         throw std::invalid_argument("Engine purpose is invalid");
@@ -95,7 +107,15 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
-    cache.device_state_slots        = cache.device_state_slots.value_or(concurrency);
+    if (options.host_state_images) {
+        if (cache.device_state_slots.value_or(0) != 0) {
+            throw std::invalid_argument(
+                "Engine host_state_images conflicts with nonzero device_state_slots");
+        }
+        cache.device_state_slots = 0;
+    } else {
+        cache.device_state_slots = cache.device_state_slots.value_or(concurrency);
+    }
     const std::uint64_t total_device_state_slots =
         static_cast<std::uint64_t>(concurrency) + *cache.device_state_slots;
     if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
@@ -172,16 +192,18 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         }
     }
     summary.weight_formats.assign(formats.begin(), formats.end());
-    summary.load_seconds         = std::chrono::duration<double>(Clock::now() - start).count();
-    summary.upload_seconds       = stats.upload_seconds;
-    summary.artifact_bytes_read  = stats.read_bytes;
-    summary.host_to_device_bytes = stats.h2d_bytes;
-    summary.peak_staging_bytes   = stats.peak_staging_bytes;
-    summary.mapped_host_bytes    = stats.mapped_host_bytes;
-    summary.device_object_count  = stats.device_object_count;
-    summary.host_object_count    = stats.host_object_count;
+    summary.load_seconds             = std::chrono::duration<double>(Clock::now() - start).count();
+    summary.upload_seconds           = stats.upload_seconds;
+    summary.artifact_bytes_read      = stats.read_bytes;
+    summary.host_to_device_bytes     = stats.h2d_bytes;
+    summary.peak_staging_bytes       = stats.peak_staging_bytes;
+    summary.mapped_host_bytes        = stats.mapped_host_bytes;
+    summary.pinned_host_bytes        = stats.pinned_host_bytes;
+    summary.device_object_count      = stats.device_object_count;
+    summary.host_object_count        = stats.host_object_count;
     summary.mapped_host_object_count = stats.mapped_host_object_count;
-    summary.context_cost         = std::move(context_cost.summary);
+    summary.pinned_host_object_count = stats.pinned_host_object_count;
+    summary.context_cost             = std::move(context_cost.summary);
     return {std::move(instance), std::move(summary), std::move(context_cost.model)};
 }
 

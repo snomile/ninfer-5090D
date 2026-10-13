@@ -127,6 +127,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--max-vision-item-tokens N] [--host-mapped-embedding] "
+           "[--host-mapped-dflash2-codebooks] [--host-pinned-vision-weights] "
+           "[--host-state-images] "
            "[--no-cuda-graph] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
@@ -310,6 +312,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 require_value("--max-vision-item-tokens"), "max-vision-item-tokens"));
         } else if (arg == "--host-mapped-embedding") {
             options.host_mapped_embedding = true;
+        } else if (arg == "--host-mapped-dflash2-codebooks") {
+            options.host_mapped_dflash2_codebooks = true;
+        } else if (arg == "--host-pinned-vision-weights") {
+            options.host_pinned_vision_weights = true;
+        } else if (arg == "--host-state-images") {
+            options.host_state_images = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
@@ -384,6 +392,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.host_mapped_dflash2_codebooks &&
+        options.speculative.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument("--host-mapped-dflash2-codebooks requires --spec dflash2");
+    }
+    if (options.host_pinned_vision_weights && !options.enable_vision) {
+        throw std::invalid_argument("--host-pinned-vision-weights requires --vision");
+    }
+    if (options.host_state_images && options.context_cache.device_state_slots.value_or(0) != 0) {
+        throw std::invalid_argument(
+            "--host-state-images conflicts with nonzero --device-state-slots");
+    }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");

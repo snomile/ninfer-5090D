@@ -295,6 +295,9 @@ int main(int argc, char** argv) {
         engine_options.speculative        = cli.speculative;
         engine_options.max_vision_item_tokens = cli.max_vision_item_tokens;
         engine_options.host_mapped_embedding  = cli.host_mapped_embedding;
+        engine_options.host_mapped_dflash2_codebooks = cli.host_mapped_dflash2_codebooks;
+        engine_options.host_pinned_vision_weights    = cli.host_pinned_vision_weights;
+        engine_options.host_state_images             = cli.host_state_images;
         engine_options.enable_vision      = cli.enable_vision;
         engine_options.use_cuda_graph     = cli.use_cuda_graph;
         // One CLI invocation owns exactly one request and needs neither history nor pause

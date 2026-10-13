@@ -314,7 +314,10 @@ Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySumm
                 {"handoff_offset_bytes", vision->handoff_offset_bytes},
                 {"handoff_capacity_bytes", vision->handoff_capacity_bytes},
                 {"handoff_active_bytes", vision->handoff_active_bytes},
-                {"handoff_peak_bytes", vision->handoff_peak_bytes}};
+                {"handoff_peak_bytes", vision->handoff_peak_bytes},
+                {"weight_staging_offset_bytes", vision->weight_staging_offset_bytes},
+                {"weight_staging_slot_bytes", vision->weight_staging_slot_bytes},
+                {"weight_staging_capacity_bytes", vision->weight_staging_capacity_bytes}};
 }
 
 Json speculative_json(const GenerationMetrics& metrics) {
@@ -512,11 +515,12 @@ std::string format_server_start_json(
                                                           {"bytes_read", load.artifact_bytes_read},
                                                           {"host_to_device_bytes", load.host_to_device_bytes},
                                                           {"mapped_host_bytes", load.mapped_host_bytes},
+                                                          {"pinned_host_bytes", load.pinned_host_bytes},
                                                           {"peak_staging_bytes", load.peak_staging_bytes},
                                                           {"device_object_count", load.device_object_count},
                                                           {"host_object_count", load.host_object_count},
-                                                          {"mapped_host_object_count",
-                                                           load.mapped_host_object_count},
+                                                          {"mapped_host_object_count", load.mapped_host_object_count},
+                                                          {"pinned_host_object_count", load.pinned_host_object_count},
                                                           {"load_seconds", load.load_seconds},
                                                           {"upload_seconds", load.upload_seconds}};
     const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
@@ -540,6 +544,9 @@ std::string format_server_start_json(
              {"vision", engine_options.enable_vision},
              {"max_vision_item_tokens", engine_options.max_vision_item_tokens},
              {"host_mapped_embedding", engine_options.host_mapped_embedding},
+             {"host_mapped_dflash2_codebooks", engine_options.host_mapped_dflash2_codebooks},
+             {"host_pinned_vision_weights", engine_options.host_pinned_vision_weights},
+             {"host_state_images", engine_options.host_state_images},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"prefix_reuse", options.allow_prefix_reuse},
              {"speculative_backend",
