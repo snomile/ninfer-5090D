@@ -13,6 +13,7 @@ bool has_role(const CaptureGroup& group, runtime::CheckpointRole role) {
 } // namespace
 
 CaptureReservation::~CaptureReservation() {
+    if (host && !host_owner->release(*host)) { std::terminate(); }
     if (!owner) { return; }
     if (owner->state_store->valid(state) && !owner->state_store->release(state)) {
         std::terminate();
@@ -58,8 +59,9 @@ bool ProgramImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
         ticket->points.emplace_back(*point, role);
     }
     auto destination = state_store->reserve_destination();
-    if (!destination && host_context_arena) {
-        ticket->host = host_context_arena->allocate(state_images->host_layout().image_bytes);
+    if (!destination && host_state_images) {
+        ticket->host_owner = host_state_images.get();
+        ticket->host = host_state_images->allocate();
         if (ticket->host) { destination = state_store->reserve_logical_destination(); }
     }
     if (!destination) { return false; }
@@ -258,9 +260,9 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
         }
         state_store->freeze(state.state.read);
         if (host_state) {
-            ticket->host.reset();
-            auto transfer = state_store->reserve_device_to_host(state.state.read);
+            auto transfer = state_store->reserve_device_to_host(state.state.read, ticket->host);
             if (!transfer) { throw std::logic_error("capture lost its reserved Host state space"); }
+            ticket->host.reset();
             operation.state_transfer.emplace(std::move(*transfer));
         }
         context_source_ready_.record(device.stream);

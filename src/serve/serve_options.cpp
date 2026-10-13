@@ -158,6 +158,8 @@ std::string serve_usage_text(const char* argv0) {
            "8192 MiB plus eight native StateImages\n"
            "       --device-state-slots is extra capacity beyond active lanes; "
            "--host-context-mib bounds shared Host State/KV and in-flight storage in MiB\n"
+           "       --host-state-images places extra states on Host and caps Host snapshots "
+           "by --device-state-slots; active lanes remain on Device\n"
            "       --host-context-mib accepts decimal MiB values that resolve to whole bytes\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
@@ -399,9 +401,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.host_pinned_vision_weights && !options.enable_vision) {
         throw std::invalid_argument("--host-pinned-vision-weights requires --vision");
     }
-    if (options.host_state_images && options.context_cache.device_state_slots.value_or(0) != 0) {
+    if (options.host_state_images &&
+        options.context_cache.device_state_slots.value_or(options.max_concurrency) != 0 &&
+        options.context_cache.host_capacity_bytes == 0) {
         throw std::invalid_argument(
-            "--host-state-images conflicts with nonzero --device-state-slots");
+            "--host-state-images with nonzero slots requires nonzero --host-context-mib");
     }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {

@@ -29,9 +29,9 @@ int main() {
     host_states.host_state_images = true;
     const auto normalized_host_states =
         ninfer::runtime::normalize_engine_options(std::move(host_states));
-    failures += check(normalized_host_states.context_cache.device_state_slots == 0 &&
+    failures += check(normalized_host_states.context_cache.device_state_slots == 3 &&
                           normalized_host_states.host_state_images,
-                      "Host StateImage mode retained extra Device slots");
+                      "Host StateImage mode discarded default snapshot count");
 
     ninfer::EngineOptions explicit_zero;
     explicit_zero.host_state_images = true;
@@ -41,15 +41,26 @@ int main() {
     failures += check(normalized_zero.context_cache.device_state_slots == 0,
                       "explicit zero Device StateImage slots changed");
 
-    bool conflict_rejected = false;
+    ninfer::EngineOptions explicit_host;
+    explicit_host.max_concurrency = 2;
+    explicit_host.host_state_images = true;
+    explicit_host.context_cache.device_state_slots = 8;
+    explicit_host.context_cache.host_capacity_bytes = 16384ULL << 20;
+    const auto normalized_explicit =
+        ninfer::runtime::normalize_engine_options(std::move(explicit_host));
+    failures += check(normalized_explicit.context_cache.device_state_slots == 8 &&
+                          normalized_explicit.max_concurrency == 2,
+                      "Host snapshot limit changed active concurrency or explicit count");
+    bool disabled_host_rejected = false;
     try {
         ninfer::EngineOptions conflict;
         conflict.host_state_images = true;
-        conflict.context_cache.device_state_slots = 1;
+        conflict.context_cache.device_state_slots = 8;
+        conflict.context_cache.host_capacity_bytes = 0;
         (void)ninfer::runtime::normalize_engine_options(std::move(conflict));
-    } catch (const std::invalid_argument&) { conflict_rejected = true; }
+    } catch (const std::invalid_argument&) { disabled_host_rejected = true; }
     failures +=
-        check(conflict_rejected, "Host StateImage mode accepted nonzero extra Device slots");
+        check(disabled_host_rejected, "Host snapshots accepted disabled Host backing");
 
     ninfer::EngineOptions scoring;
     scoring.purpose = ninfer::EnginePurpose::CausalScoring;

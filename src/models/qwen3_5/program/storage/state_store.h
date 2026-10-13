@@ -423,14 +423,17 @@ public:
     }
 
     [[nodiscard]] std::optional<StateImageTransfer>
-    reserve_device_to_host(StateImageHandle source) {
+    reserve_device_to_host(StateImageHandle source,
+                          std::optional<qwen3_5::HostStateSlotHandle> reservation = std::nullopt) {
         Object& object = require(source);
         if (host_ == nullptr || object.role != StateImageRole::CheckpointImmutable ||
             !object.device_slot || object.host_slot || has_pending_replica(object) ||
             object.source_pins == std::numeric_limits<std::uint32_t>::max()) {
             return std::nullopt;
         }
-        std::optional<qwen3_5::HostStateSlotHandle> target = host_->allocate();
+        if (reservation) { (void)host_->writable_view(*reservation); }
+        std::optional<qwen3_5::HostStateSlotHandle> target =
+            reservation ? reservation : host_->allocate();
         if (!target) { return std::nullopt; }
         const std::uint64_t transfer = next_transfer();
         object.pending_host_slot     = *target;

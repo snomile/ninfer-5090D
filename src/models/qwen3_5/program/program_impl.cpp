@@ -105,8 +105,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
         return static_cast<std::uint32_t>(value);
     };
-    const auto logical_states = checked_count(state_images->slot_count() +
-                                              host_bytes / state_images->host_layout().image_bytes);
+    const auto host_slots = std::min<std::uint64_t>(
+        host_bytes / state_images->host_layout().image_bytes,
+        plan.host_state_images ? *plan.context_cache.device_state_slots
+                               : std::numeric_limits<std::uint64_t>::max());
+    const auto logical_states = checked_count(state_images->slot_count() + host_slots);
     // One immutable image can serve private replay, an explicit anchor, a public view and an
     // exact-hit endpoint. Alias descriptors are bounded separately from physical state slots.
     checkpoints.resize(checked_count(4ULL * logical_states + 2ULL * max_concurrency));
@@ -116,7 +119,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                 StartupProgressUnit::Bytes, host_bytes);
         host_context_arena = std::make_unique<HostContextArena>(host_bytes, minimum_stride);
         host_state_images =
-            std::make_unique<HostStatePool>(*host_context_arena, state_images->host_layout());
+            std::make_unique<HostStatePool>(*host_context_arena, state_images->host_layout(),
+                                            checked_count(host_slots));
         host_kv_arena      = std::make_unique<HostKVArena>(*host_context_arena, layouts);
         const auto extents = checked_count(host_bytes / minimum_kv_stride);
         if (extents) {

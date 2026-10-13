@@ -192,6 +192,25 @@ void test_shared_host_capacity() {
     ninfer::HostKVArena kv(backing, layouts);
     q36::HostStatePool state(backing, planned.layout.host);
     q36::HostStatePool other_state(backing, planned.layout.host);
+    q36::HostStatePool disabled(backing, planned.layout.host, 0);
+    expect(disabled.capacity() == 0 && !disabled.can_allocate() && !disabled.allocate(),
+           "zero Host snapshot limit disables snapshots without consuming shared bytes");
+    q36::HostStatePool capped(backing, planned.layout.host, 1);
+    auto capped_slot = capped.allocate();
+    expect(capped.capacity() == 1 && capped_slot && !capped.can_allocate() &&
+               !capped.allocate() && backing.occupied_bytes() == image_bytes,
+           "snapshot limit must exhaust descriptors while leaving shared bytes available");
+    const auto capped_stale = *capped_slot;
+    expect(capped.release(capped_stale), "capped snapshot releases its shared extent");
+    capped_slot = capped.allocate();
+    expect(capped_slot && capped_slot->index == capped_stale.index &&
+               capped_slot->generation != capped_stale.generation &&
+               !capped.release(capped_stale),
+           "capped snapshot descriptor reuse rejects stale ownership");
+    expect(capped.release(*capped_slot), "capped snapshot releases reused extent");
+    q36::HostStatePool byte_bounded(backing, planned.layout.host, 8);
+    expect(byte_bounded.capacity() == 2 && backing.occupied_bytes() == 0,
+           "shared bytes remain an independent bound and descriptors reserve no bytes");
     auto source                     = state.allocate();
     const std::byte* original_bytes = state.view(*source).data;
     expect(state.publish(*source), "shared Host source publication");

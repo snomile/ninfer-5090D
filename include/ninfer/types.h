@@ -126,7 +126,9 @@ struct ContextCacheOptions {
     // Controls cross-request history reads and writes. Request pause/replay resources remain
     // available when history is disabled.
     bool enabled = true;
-    // Extra Device StateImage slots beyond max_concurrency. Defaults to max_concurrency.
+    // Extra StateImage slots beyond max_concurrency. Defaults to max_concurrency.
+    // With EngineOptions::host_state_images these bound Host snapshots instead of Device slots.
+    // Active Device lanes are always retained; zero disables Host StateImage storage in that mode.
     std::optional<std::uint32_t> device_state_slots;
     // Shared Host quota for StateImages, KV, pause snapshots and in-flight destinations. Native
     // startup defaults to 8 GiB plus eight Host StateImages using the model's actual layout.

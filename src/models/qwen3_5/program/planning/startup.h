@@ -86,6 +86,7 @@ struct SequencePlanningInputs {
     models::LoadOptions features;
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
+    bool host_state_images            = false;
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
@@ -106,6 +107,7 @@ struct SequencePlanImpl {
     models::LoadOptions features;
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
+    bool host_state_images            = false;
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;

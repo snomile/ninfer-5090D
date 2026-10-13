@@ -51,6 +51,16 @@ int main() {
     check(metrics.render(running, true) == live, "scrapes must not consume or reset counters");
     check(live.find("ninfer_host_context_used_bytes 4096\n") != std::string::npos,
           "reserved bytes must not be added to occupancy twice");
+    check(live.find("ninfer_device_state_capacity_slots 3\n") != std::string::npos,
+          "Device mode must include extra Device states");
+    EngineOptions host_options = options;
+    host_options.host_state_images = true;
+    host_options.context_cache.device_state_slots = 8;
+    Metrics host_metrics;
+    host_metrics.configure("host", host_options, memory, baseline);
+    check(host_metrics.render(running, true).find("ninfer_device_state_capacity_slots 2\n") !=
+              std::string::npos,
+          "Host snapshot limit must not enlarge reported Device capacity");
 
     GenerationOutcome outcome;
     outcome.finish_reason                            = FinishReason::OutputLimit;

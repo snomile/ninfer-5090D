@@ -209,13 +209,18 @@ void test_state_store(ninfer::DeviceContext& device) {
     device.synchronize();
     images.freeze(*host_source);
     {
-        auto cancelled = images.reserve_device_to_host(*host_source);
+        const auto reserved_host = host.allocate();
+        expect(reserved_host && host.occupied() == 1,
+               "capture reserves a typed Host descriptor before transfer");
+        auto cancelled = images.reserve_device_to_host(*host_source, reserved_host);
         expect(cancelled && host_backing.reserved_bytes() == layout.host.image_bytes &&
-                   host_backing.live_bytes() == 0 && images.source_pins(*host_source) == 1 &&
+                   host_backing.live_bytes() == 0 && host.occupied() == 1 &&
+                   images.source_pins(*host_source) == 1 &&
                    !images.release(*host_source),
-               "State transfer reservation charges destination while its source is pinned");
+               "State transfer adopts its pre-reserved Host descriptor without double allocation");
     }
-    expect(host_backing.occupied_bytes() == 0 && images.source_pins(*host_source) == 0 &&
+    expect(host.occupied() == 0 && host_backing.occupied_bytes() == 0 &&
+               images.source_pins(*host_source) == 0 &&
                images.residency(*host_source) == store::StateReplicaResidency::DeviceOnly,
            "cancelled State transfer releases its actual Host extent and retains source state");
     auto d2h = images.begin_device_to_host(*host_source, device.transfer_stream);

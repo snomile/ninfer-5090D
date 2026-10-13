@@ -179,7 +179,8 @@ struct CaptureReservation {
     ProgramImpl* owner = nullptr;
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
     StateImageHandle state;
-    std::optional<HostContextAllocation> host;
+    qwen3_5::HostStatePool* host_owner = nullptr;
+    std::optional<qwen3_5::HostStateSlotHandle> host;
     std::optional<DeviceKVPageReservation> main_tail;
     std::optional<DeviceKVPageReservation> backend_tail;
     std::uint32_t frontier = 0;

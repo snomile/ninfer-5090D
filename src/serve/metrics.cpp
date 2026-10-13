@@ -201,7 +201,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     GAUGE(device_state_occupied_slots, "device_state_used_slots",
           "Occupied device StateImage slots.");
     gauge("device_state_capacity_slots",
-          options_.max_concurrency + options_.context_cache.device_state_slots.value(),
+          static_cast<std::uint64_t>(options_.max_concurrency) +
+              (options_.host_state_images ? 0U : options_.context_cache.device_state_slots.value()),
           "Total device StateImage slots, including resident lanes.");
     GAUGE(device_main_kv_occupied_pages, "device_kv_used_pages",
           "Occupied physical Main KV pages, including retained history.");

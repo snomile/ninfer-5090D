@@ -905,7 +905,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
-| `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
+| `--device-state-slots N` | extra StateImages; Device slots normally, Host snapshot limit with `--host-state-images` | `max-concurrency` |
+| `--host-state-images` | allocate only active Device lanes; bound Host snapshots by `--device-state-slots` | off |
 | `--host-context-mib N` | shared pinned Host budget for StateImages, KV and pause snapshots, including in-flight destinations | `8192 MiB + 8 native StateImages` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
@@ -934,6 +935,11 @@ Frequency penalty is `0` for all registered presets. Process flags override regi
 request fields override process flags, and `--greedy` finally forces temperature `0`.
 
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`.
+With `--host-state-images`, Device capacity is `C`, and Host StateImage capacity is at most `H`
+(also bounded by available shared Host bytes). Zero disables Host StateImage storage in this mode.
+This is a snapshot count, not a session limit; immutable states can temporarily occupy a basic
+Device slot until existing capture/reclaim scheduling moves or releases them. Nonzero Host slots
+require a Host budget large enough for at least one model-specific StateImage.
 Host state and Main/Backend KV share one startup-fixed byte budget; this is context storage, not a
 limit on total process RAM. `--host-context-mib 0` disables Host context backing.
 `--no-prefix-reuse` disables cross-request history reads and writes; pause/replay recovery remains
@@ -1004,7 +1010,8 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v25 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v26 JSON object. Startup context-cache records
+include `extra_state_placement` so the configured extra slot count is unambiguous. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;

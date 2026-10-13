@@ -107,19 +107,15 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
-    if (options.host_state_images) {
-        if (cache.device_state_slots.value_or(0) != 0) {
-            throw std::invalid_argument(
-                "Engine host_state_images conflicts with nonzero device_state_slots");
-        }
-        cache.device_state_slots = 0;
-    } else {
-        cache.device_state_slots = cache.device_state_slots.value_or(concurrency);
+    cache.device_state_slots = cache.device_state_slots.value_or(concurrency);
+    if (options.host_state_images && *cache.device_state_slots != 0 &&
+        cache.host_capacity_bytes == 0) {
+        throw std::invalid_argument("Host StateImage slots require nonzero Host context capacity");
     }
     const std::uint64_t total_device_state_slots =
         static_cast<std::uint64_t>(concurrency) + *cache.device_state_slots;
     if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("context cache Device state capacity exceeds uint32");
+        throw std::overflow_error("context cache logical state capacity exceeds uint32");
     }
     return options;
 }

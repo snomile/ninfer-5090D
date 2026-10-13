@@ -162,6 +162,35 @@ int main() {
         const auto exercise    = [&](ninfer::models::LoadOptions options) {
             auto model = qwen::load_model(artifact, options, device);
             const qwen::execution::Parameters parameters(*model);
+            const auto state_reservation = [&](bool host, std::uint32_t extra,
+                                                std::size_t host_bytes = 16384ULL << 20) {
+                ninfer::EngineOptions engine;
+                engine.max_context = 16384;
+                engine.max_concurrency = 2;
+                engine.prefill_chunk = 1024;
+                engine.enable_vision = true;
+                engine.speculative.backend = options.speculative;
+                engine.speculative.draft_tokens = 3;
+                engine.speculative.proposal_head = options.proposal_head;
+                engine.host_pinned_vision_weights = options.host_pinned_vision_weights;
+                engine.host_state_images = host;
+                engine.use_cuda_graph = false;
+                engine.context_cache.device_state_slots = extra;
+                engine.context_cache.host_capacity_bytes = host_bytes;
+                auto planner = qwen::make_sequence_planner(parameters, device, engine);
+                const auto pages = planner.capacity_curve().minimum_main_page_groups;
+                return std::move(planner).finalize(pages).device_reservation_bytes();
+            };
+            const auto active_only = state_reservation(false, 0);
+            require(state_reservation(true, 8) == active_only &&
+                        state_reservation(true, 0) == active_only &&
+                        state_reservation(false, 8) > active_only,
+                    "Host snapshots must retain two Device lanes without extra Device allocation");
+            bool undersized_host_rejected = false;
+            try {
+                (void)state_reservation(true, 8, 1);
+            } catch (const std::invalid_argument&) { undersized_host_rejected = true; }
+            require(undersized_host_rejected, "Host planning accepted less than one StateImage");
             const auto capacity = [&](std::uint32_t max_context,
                                       std::uint32_t max_vision_item_tokens = 16'384) {
                 ninfer::EngineOptions engine;

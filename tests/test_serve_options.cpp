@@ -133,16 +133,20 @@ int main() {
     const auto memory_optimized =
         parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
                "--vision", "--host-mapped-dflash2-codebooks", "--host-pinned-vision-weights",
-               "--host-state-images", "--device-state-slots", "0"});
+               "--host-state-images", "--device-state-slots", "8", "--host-context-mib", "16384",
+               "--max-concurrency", "2"});
     failures += check(memory_optimized.host_mapped_dflash2_codebooks &&
                           memory_optimized.host_pinned_vision_weights &&
                           memory_optimized.host_state_images &&
-                          memory_optimized.context_cache.device_state_slots == 0,
+                          memory_optimized.context_cache.device_state_slots == 8 &&
+                          memory_optimized.max_concurrency == 2 &&
+                          memory_optimized.context_cache.host_capacity_bytes == (16384ULL << 20),
                       "serve memory optimization flags were not preserved");
     for (const auto& arguments : std::vector<std::vector<std::string>>{
              {"ninfer-serve", "model.ninfer", "--host-mapped-dflash2-codebooks"},
              {"ninfer-serve", "model.ninfer", "--host-pinned-vision-weights"},
-             {"ninfer-serve", "model.ninfer", "--host-state-images", "--device-state-slots", "1"},
+             {"ninfer-serve", "model.ninfer", "--host-state-images", "--device-state-slots", "1",
+              "--host-context-mib", "0"},
          }) {
         bool rejected = false;
         try {
@@ -150,6 +154,11 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "serve accepted an invalid Host memory option combination");
     }
+    const auto no_host_states = parse(
+        {"ninfer-serve", "model.ninfer", "--host-state-images", "--device-state-slots", "0",
+         "--host-context-mib", "0"});
+    failures += check(no_host_states.context_cache.device_state_slots == 0,
+                      "zero Host snapshots with disabled backing should remain valid");
 
     const ServeOptions dflash_vision = parse(
         {"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15", "--vision"});

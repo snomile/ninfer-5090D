@@ -527,7 +527,7 @@ std::string format_server_start_json(
     const ninfer::ContextCostSummary& context_cost = load.context_cost;
     const std::uint64_t total_device_state_slots =
         static_cast<std::uint64_t>(engine_options.max_concurrency) +
-        cache.device_state_slots.value();
+        (engine_options.host_state_images ? 0U : cache.device_state_slots.value());
     record["engine"] =
         Json{{"device", engine_options.device},
              {"max_context", engine_options.max_context},
@@ -562,6 +562,8 @@ std::string format_server_start_json(
                                    {"preset_path", context_cost.preset_path.string()}}},
              {"context_cache", Json{{"enabled", cache.enabled},
                                     {"device_state_slots", cache.device_state_slots.value()},
+                                    {"extra_state_placement", engine_options.host_state_images
+                                                                  ? "host" : "device"},
                                     {"total_device_state_slots", total_device_state_slots},
                                     {"host_capacity_bytes", cache.host_capacity_bytes.value()}}}};
     record["sampling_defaults"] =

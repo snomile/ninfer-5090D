@@ -78,7 +78,8 @@ struct HostStateSlotHandle {
  */
 class HostStatePool {
 public:
-    HostStatePool(HostContextArena& arena, StateImageHostLayout layout);
+    HostStatePool(HostContextArena& arena, StateImageHostLayout layout,
+                  std::optional<std::uint32_t> maximum_slots = std::nullopt);
 
     HostStatePool(const HostStatePool&)            = delete;
     HostStatePool& operator=(const HostStatePool&) = delete;

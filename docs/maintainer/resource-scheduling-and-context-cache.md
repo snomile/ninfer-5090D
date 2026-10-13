@@ -67,8 +67,13 @@ Main KV 页为 64 token；每种 KV 的物理字节数由其层数、几何和�
 | `max_context` | 一个请求的逻辑上下文上限 |
 | `kv_capacity` | Main KV 物理池的 token 等价容量，按页舍入；也可由启动显存预算自动求解 |
 | `max_concurrency` | 同时占用执行绑定的上限 C，范围 1–8 |
-| `context_cache.device_state_slots` | C 个基本 Device StateImage 之外的额外槽数，缺省为 C |
+| `context_cache.device_state_slots` | 额外 StateImage 槽数，缺省为 C；默认扩充 Device 池，`host_state_images` 开启时改为 Host 快照数量上限 |
+| `host_state_images` | Device 池只分配 C 个基本槽，Host 快照数受额外槽数与共享 Host 字节预算双重限制 |
 | `context_cache.host_capacity_bytes` | StateImage、Main/backend KV、暂停快照及传输目的共用的 pinned Host 字节容量 |
+
+Host 模式的额外槽为 0 时禁用 Host StateImage 存储，但非零 Host 字节预算仍可用于 KV。
+Host 槽数不是会话数；基本 Device 槽可能暂存 immutable 状态，迁移仍由既有 capture/reclaim
+调度触发。非零 Host 槽要求字节预算至少容纳一份实际模型 StateImage，分配描述符不预占共享字节。
 
 Main KV 容量曲线的页数下界为 `max(ceil(max_context / 64), C)`，上界为
 `C × ceil(max_context / 64)`。下界分别满足单请求独占最大上下文和 C 个最小页的几何要求。Native 同时

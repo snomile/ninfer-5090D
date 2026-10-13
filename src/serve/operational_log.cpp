@@ -449,8 +449,9 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_bytes(memory.runtime_reservation_bytes),
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
 
-    logger_->info("context | history {} | {} active + {} extra device states | host {}",
+    logger_->info("context | history {} | {} active + {} extra {} states | host {}",
                   cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
+                  engine.host_state_images ? "host" : "device",
                   product::format_pretty_bytes(*cache.host_capacity_bytes));
 
     if (service.options().enable_vision) {

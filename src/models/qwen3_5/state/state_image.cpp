@@ -209,7 +209,8 @@ TransferWork dflash_local_transfer_work(const StateImageHostLayout& layout) {
                         .copy_operations = static_cast<std::uint32_t>(operations)};
 }
 
-HostStatePool::HostStatePool(HostContextArena& arena, StateImageHostLayout layout)
+HostStatePool::HostStatePool(HostContextArena& arena, StateImageHostLayout layout,
+                             std::optional<std::uint32_t> slot_limit)
     : layout_(std::move(layout)), arena_(&arena) {
     if (!same_host_layout(layout_, plan_host_state_image(layout_.spec))) {
         throw std::invalid_argument("HostStatePool image layout is invalid");
@@ -217,7 +218,10 @@ HostStatePool::HostStatePool(HostContextArena& arena, StateImageHostLayout layou
     if (layout_.image_bytes < arena_->minimum_allocation_bytes()) {
         throw std::invalid_argument("Host state geometry is below the shared arena minimum");
     }
-    const std::size_t maximum_slots = arena_->capacity_bytes() / layout_.image_bytes;
+    const std::size_t maximum_slots =
+        std::min(arena_->capacity_bytes() / layout_.image_bytes,
+                 slot_limit ? static_cast<std::size_t>(*slot_limit)
+                            : std::numeric_limits<std::size_t>::max());
     if (maximum_slots > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("Host state descriptor capacity exceeds uint32");
     }

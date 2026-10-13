@@ -215,6 +215,17 @@ int main() {
             server.at("engine").at("context_cache").at("total_device_state_slots") == 4 &&
             server.at("engine").at("context_cache").at("host_capacity_bytes") == (64ULL << 20),
         "resolved context-cache configuration missing");
+    auto host_engine_options = engine_options;
+    host_engine_options.host_state_images = true;
+    host_engine_options.context_cache.device_state_slots = 8;
+    const Json host_server = Json::parse(format_server_start_json(
+        "serve-test", 1000, options, host_engine_options, sampling_defaults, "deployment-alias",
+        load, memory, environment, std::uint64_t{123456}));
+    const auto& host_cache = host_server.at("engine").at("context_cache");
+    failures += check(host_cache.at("device_state_slots") == 8 &&
+                          host_cache.at("extra_state_placement") == "host" &&
+                          host_cache.at("total_device_state_slots") == 2,
+                      "Host startup metadata overcounted Device capacity or lost snapshot limit");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");
     failures +=
