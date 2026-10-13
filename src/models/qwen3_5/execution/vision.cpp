@@ -216,14 +216,30 @@ std::size_t merger_hidden_bytes(const VisionConfig& config, std::size_t merged_t
 
 std::size_t staged_linear_bytes(const LinearParameters& parameter, const char* label) {
     const Weight& weight = parameter.weight;
-    if (weight.qtype != QType::BF16 || weight.layout != QuantLayout::Contiguous ||
+    if (weight.payload == nullptr || weight.payload_bytes == 0 ||
+        weight.payload_bytes > std::numeric_limits<std::size_t>::max() ||
         weight.qdata == nullptr || weight.n <= 0 || weight.k <= 0) {
         throw std::invalid_argument(std::string("Vision ") + label +
-                                    " must be a resident contiguous BF16 matrix");
+                                    " must be a resident encoded matrix");
     }
-    return checked_mul(
-        checked_mul(static_cast<std::size_t>(weight.n), static_cast<std::size_t>(weight.k), label),
-        dtype_size(DType::BF16), label);
+    const auto begin = reinterpret_cast<std::uintptr_t>(weight.payload);
+    if (weight.payload_bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
+        throw std::invalid_argument(std::string("Vision ") + label +
+                                    " encoded matrix address range overflows");
+    }
+    const auto end = begin + static_cast<std::uintptr_t>(weight.payload_bytes);
+    const auto require_plane = [&](const void* plane, const char* name) {
+        if (plane == nullptr) { return; }
+        const auto address = reinterpret_cast<std::uintptr_t>(plane);
+        if (address < begin || address >= end) {
+            throw std::invalid_argument(std::string("Vision ") + label + " " + name +
+                                        " is outside its encoded payload");
+        }
+    };
+    require_plane(weight.qdata, "codes");
+    require_plane(weight.qhigh, "high plane");
+    require_plane(weight.scales, "scales");
+    return static_cast<std::size_t>(weight.payload_bytes);
 }
 
 std::size_t staged_tensor_bytes(const Tensor& tensor, const char* label) {
@@ -338,15 +354,20 @@ public:
     LinearParameters linear(const LinearParameters& source, const char* label) {
         const auto bytes  = staged_linear_bytes(source, label);
         auto* destination = allocate(bytes, label);
-        CUDA_CHECK(cudaMemcpyAsync(destination, source.weight.qdata, bytes, cudaMemcpyHostToDevice,
-                                   stream_));
-        LinearParameters out        = source;
-        out.weight.payload          = destination;
-        out.weight.payload_bytes    = bytes;
-        out.weight.high_plane_bytes = 0;
-        out.weight.qdata            = destination;
-        out.weight.qhigh            = nullptr;
-        out.weight.scales           = nullptr;
+        CUDA_CHECK(cudaMemcpyAsync(destination, source.weight.payload, bytes,
+                                   cudaMemcpyHostToDevice, stream_));
+        const auto* source_payload = static_cast<const std::byte*>(source.weight.payload);
+        auto* staged_payload       = static_cast<std::byte*>(destination);
+        const auto rebase = [&](const void* pointer) -> const void* {
+            if (pointer == nullptr) { return nullptr; }
+            const auto* source_pointer = static_cast<const std::byte*>(pointer);
+            return staged_payload + (source_pointer - source_payload);
+        };
+        LinearParameters out = source;
+        out.weight.payload    = destination;
+        out.weight.qdata      = rebase(source.weight.qdata);
+        out.weight.qhigh      = rebase(source.weight.qhigh);
+        out.weight.scales     = rebase(source.weight.scales);
         return out;
     }
 
