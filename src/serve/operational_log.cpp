@@ -468,23 +468,6 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                    product::format_pretty_bytes(memory.kv_capacity_headroom_bytes),
                    product::format_pretty_bytes(memory.planned_slack_bytes),
                    product::format_pretty_bytes(memory.cuda_graph_allowance_bytes));
-    if (memory.cuda_graph_memory) {
-        const auto& graph = *memory.cuda_graph_memory;
-        logger_->info("CUDA graphs | observed peak {} | steady {} | allowance {} | free {} -> {}",
-                      product::format_pretty_bytes(graph.observed_peak_bytes),
-                      product::format_pretty_bytes(graph.observed_steady_bytes),
-                      product::format_pretty_bytes(memory.cuda_graph_allowance_bytes),
-                      product::format_pretty_bytes(graph.free_before_bytes),
-                      product::format_pretty_bytes(graph.free_after_bytes));
-        logger_->debug(
-            "CUDA graph phases | setup {} | capture {} | instantiate {} | update/upload {} | "
-            "warmup {}",
-            product::format_pretty_bytes(graph.setup_observed_peak_bytes),
-            product::format_pretty_bytes(graph.capture_observed_peak_bytes),
-            product::format_pretty_bytes(graph.instantiate_observed_peak_bytes),
-            product::format_pretty_bytes(graph.update_upload_observed_peak_bytes),
-            product::format_pretty_bytes(graph.warmup_observed_peak_bytes));
-    }
     logger_->debug("context cost | transfer {} | prefill {} | hardware {} | prefill signature {}",
                    ninfer::context_cost_preset_source_name(context_cost.transfer_source),
                    ninfer::context_cost_preset_source_name(context_cost.prefill_source),

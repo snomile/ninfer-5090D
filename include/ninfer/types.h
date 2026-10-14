@@ -935,22 +935,6 @@ struct VisionWorkspaceMemorySummary {
     std::size_t weight_staging_capacity_bytes = 0;
 };
 
-// cudaMemGetInfo samples taken at synchronized CUDA Graph preparation boundaries. Phase peaks are
-// baseline-to-low-water deltas and are not additive. CUDA-internal transient allocations that are
-// created and released entirely within one API call may not be visible.
-struct CudaGraphMemorySummary {
-    std::size_t free_before_bytes                 = 0;
-    std::size_t minimum_free_bytes                = 0;
-    std::size_t free_after_bytes                  = 0;
-    std::size_t observed_peak_bytes               = 0;
-    std::size_t observed_steady_bytes             = 0;
-    std::size_t setup_observed_peak_bytes         = 0;
-    std::size_t capture_observed_peak_bytes       = 0;
-    std::size_t instantiate_observed_peak_bytes   = 0;
-    std::size_t update_upload_observed_peak_bytes = 0;
-    std::size_t warmup_observed_peak_bytes        = 0;
-};
-
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
@@ -963,7 +947,6 @@ struct MemorySummary {
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;
     std::optional<VisionWorkspaceMemorySummary> vision_workspace;
-    std::optional<CudaGraphMemorySummary> cuda_graph_memory;
     std::size_t minimum_runtime_reservation_bytes = 0;
     std::size_t kv_capacity_increment_bytes       = 0;
     std::size_t runtime_reservation_bytes         = 0;

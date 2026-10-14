@@ -476,7 +476,6 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         };
     }
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
-    out.cuda_graph_memory            = cuda_graph_memory;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
     if (host_state_images) { out.host_state_occupied_slots = host_state_images->occupied(); }

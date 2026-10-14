@@ -37,6 +37,7 @@ namespace workspace = execution::workspace;
 
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
 constexpr std::size_t kArenaAlign = 256ULL;
+constexpr std::size_t kDFlash2GraphAllowancePerBatch = 256ULL * kMiB;
 
 enum class GdnWorkspacePath : std::uint8_t {
     Prefill,
@@ -880,6 +881,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 "MTP graph allowance");
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
                                                       "MTP exact-b graph allowance");
+        } else if (impl->speculative_backend == SpeculativeBackend::DFlash2) {
+            // sm_120a/CUDA 13.4 calibration observed 15 MiB per exact batch across repeated
+            // 200K-context cold starts. This fixed bound leaves more than 16x total headroom at
+            // C2, including CUDA-internal transients that boundary sampling cannot observe.
+            impl->graph_allowance_bytes =
+                checked_mul(kDFlash2GraphAllowancePerBatch, impl->max_concurrency,
+                            "DFlash2 exact-b graph allowance");
         } else {
             const auto profiles = dflash_graph_profiles(impl->speculative_backend, impl->capacity,
                                                         impl->draft_window);

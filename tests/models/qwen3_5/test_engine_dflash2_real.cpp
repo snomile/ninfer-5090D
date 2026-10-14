@@ -92,6 +92,10 @@ int main(int argc, char** argv) {
         options.speculative.proposal_head =
             optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
         ninfer::Engine engine(options);
+        const std::size_t expected_graph_allowance =
+            graph ? static_cast<std::size_t>(batch) * 256ULL * 1024ULL * 1024ULL : 0;
+        require(engine.memory_summary().cuda_graph_allowance_bytes == expected_graph_allowance,
+                "Engine did not apply the calibrated DFlash2 graph allowance");
         require(engine.memory_summary().kv_cache == options.kv_cache,
                 "Engine did not select the requested KV dtype");
         const auto prompt = engine.tokenize_text("Count from one to twenty: one, two, three,");
