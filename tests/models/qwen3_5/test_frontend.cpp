@@ -2021,6 +2021,75 @@ int test_tools_and_json_output() {
     return failures;
 }
 
+int test_tool_result_json_without_continuation() {
+    const Frontend frontend = make_frontend(resources());
+    ninfer::PromptInput input;
+    input.messages.push_back(
+        {.role = ninfer::ChatRole::User,
+         .parts = {{.kind = ninfer::MessagePartKind::Text,
+                    .text = "Record ready, then return the final JSON."}}});
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"record","parameters":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"],"additionalProperties":false}}})");
+    input.messages.push_back(
+        {.role = ninfer::ChatRole::Assistant,
+         .tool_calls = {{"call_record", "record", R"({"x":"ready"})"}}});
+    input.messages.push_back(
+        {.role = ninfer::ChatRole::Tool,
+         .parts = {{.kind = ninfer::MessagePartKind::Text, .text = R"({"recorded":true})"}},
+         .tool_call_id = "call_record"});
+    const auto body = ninfer::OutputConstraint::json_schema(
+        R"({"type":"object","properties":{"text":{"type":"string","const":"<tool_call>"}},"required":["text"],"additionalProperties":false})");
+    const std::string json = R"({"text":"<tool_call>"})";
+    const auto eos = frontend.default_stop_policy().token_ids.front();
+    int failures = 0;
+    for (bool thinking : {false, true}) {
+        input.options.enable_thinking = thinking;
+        const auto prompt = frontend.prepare(input);
+        for (auto mode : {ninfer::ToolConstraintMode::Basic,
+                          ninfer::ToolConstraintMode::Automatic}) {
+            ninfer::ToolChoice choice;
+            choice.mode = ninfer::ToolChoiceMode::None;
+            choice.constraints = mode;
+            auto session = frontend.make_output_session(prompt, {}, {}, {}, body, choice);
+            if (thinking) {
+                const auto thought = frontend.tokenize_text("x");
+                (void)session.preview_model(thought, 1000, ninfer::FinishReason::OutputLimit);
+                (void)session.commit_preview();
+                const auto close = fixture_tokenizer().encode("\n</think>\n\n");
+                (void)session.preview_model(close, 1000, ninfer::FinishReason::OutputLimit);
+                (void)session.commit_preview();
+            }
+            // No assistant prefix selects a branch: the initial content mask must permit
+            // JSON, reject raw tool framing and forbid EOS before the object is complete.
+            std::vector<std::uint32_t> words((fixture_tokenizer().vocab_size() + 31) / 32);
+            failures += check(session.grammar_masks({}, words) == 0,
+                              "tool-result JSON lost its initial mask");
+            const auto allowed = [&](ninfer::TokenId token) {
+                return (words[token / 32] & (1u << (token % 32))) != 0;
+            };
+            failures += check(allowed(fixture_byte_token('{')) &&
+                                  !allowed(fixture_byte_token('<')) && !allowed(eos),
+                              "none allowed tool framing or early EOS instead of JSON");
+            session.discard_preview();
+            std::string visible;
+            for (auto token : fixture_tokenizer().encode(json)) {
+                (void)session.preview_model(std::span(&token, 1), 1000,
+                                            ninfer::FinishReason::OutputLimit);
+                visible += channel_text(session.commit_preview(), ninfer::OutputChannel::Content);
+            }
+            (void)session.preview_model(std::span(&eos, 1), 1,
+                                        ninfer::FinishReason::OutputLimit);
+            visible += channel_text(session.commit_preview(), ninfer::OutputChannel::Content);
+            const auto observed = session.constraint_observation();
+            failures += check(visible == json && session.take_tool_calls().empty() &&
+                                  observed && observed->complete && observed->terminated &&
+                                  observed->branch == ninfer::ConstraintOutputBranch::Content,
+                              "tool-result JSON changed literal marker, completion or output branch");
+        }
+    }
+    return failures;
+}
+
 int test_structured_tool_output() {
     const Frontend frontend = make_frontend(resources());
 
@@ -2656,6 +2725,7 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
     failures += test_tools_and_json_output();
+    failures += test_tool_result_json_without_continuation();
     failures += test_reasoning_split(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_constrained_thinking_control(frontend);

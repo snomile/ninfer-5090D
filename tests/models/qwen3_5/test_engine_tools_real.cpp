@@ -188,6 +188,34 @@ void composed_output(ninfer::Engine& engine) {
                               .parts        = {{.kind = ninfer::MessagePartKind::Text,
                                                 .text = "Recorded. Give the final JSON answer."}},
                               .tool_call_id = "composed_call"});
+    // Start a normal new assistant turn with complete tool history. None must constrain the
+    // result to JSON even though the declarations remain in the prompt.
+    for (bool thinking : {false, true}) {
+        auto final_input = input;
+        final_input.context_cache.session_key.reset();
+        final_input.options.enable_thinking = thinking;
+        auto final_options = options;
+        final_options.tool_choice.mode = ninfer::ToolChoiceMode::None;
+        final_options.execution.allow_prefix_reuse = false;
+        if (thinking) final_options.execution.thinking.budget = 32;
+        for (auto mode : {ninfer::ToolConstraintMode::Basic,
+                          ninfer::ToolConstraintMode::Automatic}) {
+            final_options.tool_choice.constraints = mode;
+            Sink final_sink;
+            const auto final = engine.generate(engine.prepare(final_input), final_options,
+                                               &final_sink);
+            require(final.finish_reason == ninfer::FinishReason::StopToken,
+                    "unprefixed tool-result JSON did not terminate normally");
+            require(final.tool_calls.empty() && final_sink.content == final.content &&
+                        Json::parse(final.content) == Json{{"answer", "ok <tool_call>"}} &&
+                        final.constraint && final.constraint->complete &&
+                        final.constraint->terminated &&
+                        final.constraint->branch == ninfer::ConstraintOutputBranch::Content,
+                    "none lost unprefixed JSON, literal marker, stream bytes or constraint state");
+            record(thinking ? "tool_result_json_none_thinking" : "tool_result_json_none",
+                   final, Json::parse(final_options.constraint->source));
+        }
+    }
     // Prefix fixes the legal output branch; correctness does not depend on a probabilistic
     // decision to use another tool when both branches are available.
     input.options.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
