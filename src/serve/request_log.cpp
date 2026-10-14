@@ -320,6 +320,20 @@ Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySumm
                 {"weight_staging_capacity_bytes", vision->weight_staging_capacity_bytes}};
 }
 
+Json cuda_graph_memory_json(const std::optional<ninfer::CudaGraphMemorySummary>& memory) {
+    if (!memory) { return nullptr; }
+    return Json{{"free_before_bytes", memory->free_before_bytes},
+                {"minimum_free_bytes", memory->minimum_free_bytes},
+                {"free_after_bytes", memory->free_after_bytes},
+                {"observed_peak_bytes", memory->observed_peak_bytes},
+                {"observed_steady_bytes", memory->observed_steady_bytes},
+                {"setup_observed_peak_bytes", memory->setup_observed_peak_bytes},
+                {"capture_observed_peak_bytes", memory->capture_observed_peak_bytes},
+                {"instantiate_observed_peak_bytes", memory->instantiate_observed_peak_bytes},
+                {"update_upload_observed_peak_bytes", memory->update_upload_observed_peak_bytes},
+                {"warmup_observed_peak_bytes", memory->warmup_observed_peak_bytes}};
+}
+
 Json speculative_json(const GenerationMetrics& metrics) {
     return Json{{"backend", product::speculative_backend_name(metrics.speculative_backend)},
                 {"draft_window", metrics.speculative_draft_window},
@@ -577,6 +591,7 @@ std::string format_server_start_json(
              {"sequence", arena_json(memory.sequence)},
              {"workspace", arena_json(memory.workspace)},
              {"vision_workspace", vision_workspace_json(memory.vision_workspace)},
+             {"cuda_graph_memory", cuda_graph_memory_json(memory.cuda_graph_memory)},
              {"minimum_runtime_reservation_bytes", memory.minimum_runtime_reservation_bytes},
              {"kv_capacity_increment_bytes", memory.kv_capacity_increment_bytes},
              {"runtime_reservation_bytes", memory.runtime_reservation_bytes},

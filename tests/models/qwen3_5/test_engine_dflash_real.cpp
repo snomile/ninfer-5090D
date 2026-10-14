@@ -164,6 +164,7 @@ int verify_dflash_load(const ninfer::Engine& engine) {
         return 1;
     }
     const ninfer::MemorySummary memory = engine.memory_summary();
+    const auto* graph = memory.cuda_graph_memory ? &*memory.cuda_graph_memory : nullptr;
     if (memory.max_context != 4352 || memory.kv_cache != ninfer::KvCacheStorage::BFloat16 ||
         memory.kv_payload_bytes == 0 || memory.weights.capacity_bytes == 0 ||
         memory.weights.used_bytes == 0 ||
@@ -171,7 +172,17 @@ int verify_dflash_load(const ninfer::Engine& engine) {
         memory.sequence.capacity_bytes == 0 || memory.sequence.used_bytes == 0 ||
         memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
         memory.workspace.capacity_bytes == 0 || memory.vision_workspace.has_value() ||
-        memory.workspace_logical_peak_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
+        memory.workspace_logical_peak_bytes != 0 || memory.cuda_graph_allowance_bytes == 0 ||
+        graph == nullptr || graph->free_before_bytes == 0 || graph->minimum_free_bytes == 0 ||
+        graph->free_after_bytes == 0 || graph->minimum_free_bytes > graph->free_before_bytes ||
+        graph->minimum_free_bytes > graph->free_after_bytes ||
+        graph->observed_peak_bytes != graph->free_before_bytes - graph->minimum_free_bytes ||
+        graph->observed_steady_bytes > graph->observed_peak_bytes ||
+        graph->setup_observed_peak_bytes > graph->observed_peak_bytes ||
+        graph->capture_observed_peak_bytes > graph->observed_peak_bytes ||
+        graph->instantiate_observed_peak_bytes > graph->observed_peak_bytes ||
+        graph->update_upload_observed_peak_bytes > graph->observed_peak_bytes ||
+        graph->warmup_observed_peak_bytes > graph->observed_peak_bytes) {
         std::cerr << "DFlash Engine has an invalid frozen memory layout\n";
         return 1;
     }

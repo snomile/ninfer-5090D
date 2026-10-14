@@ -18,6 +18,70 @@ namespace ninfer::models::qwen3_5::detail {
 
 namespace {
 
+enum class GraphMemoryPhase : std::uint8_t {
+    Setup,
+    Capture,
+    Instantiate,
+    UpdateUpload,
+    Warmup,
+};
+
+class GraphMemoryTracker {
+public:
+    GraphMemoryTracker() {
+        summary_.free_before_bytes  = current_free_bytes();
+        summary_.minimum_free_bytes = summary_.free_before_bytes;
+    }
+
+    void sample(GraphMemoryPhase phase) {
+        const std::size_t free_bytes = current_free_bytes();
+        summary_.minimum_free_bytes  = std::min(summary_.minimum_free_bytes, free_bytes);
+        const std::size_t observed   = delta_from_baseline(free_bytes);
+        std::size_t& phase_peak      = peak_for(phase);
+        phase_peak                   = std::max(phase_peak, observed);
+    }
+
+    CudaGraphMemorySummary finish() {
+        summary_.free_after_bytes = current_free_bytes();
+        summary_.minimum_free_bytes =
+            std::min(summary_.minimum_free_bytes, summary_.free_after_bytes);
+        summary_.observed_peak_bytes   = delta_from_baseline(summary_.minimum_free_bytes);
+        summary_.observed_steady_bytes = delta_from_baseline(summary_.free_after_bytes);
+        return summary_;
+    }
+
+private:
+    std::size_t& peak_for(GraphMemoryPhase phase) {
+        switch (phase) {
+        case GraphMemoryPhase::Setup:
+            return summary_.setup_observed_peak_bytes;
+        case GraphMemoryPhase::Capture:
+            return summary_.capture_observed_peak_bytes;
+        case GraphMemoryPhase::Instantiate:
+            return summary_.instantiate_observed_peak_bytes;
+        case GraphMemoryPhase::UpdateUpload:
+            return summary_.update_upload_observed_peak_bytes;
+        case GraphMemoryPhase::Warmup:
+            return summary_.warmup_observed_peak_bytes;
+        }
+        throw std::logic_error("invalid CUDA Graph memory phase");
+    }
+
+    static std::size_t current_free_bytes() {
+        std::size_t free_bytes  = 0;
+        std::size_t total_bytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        return free_bytes;
+    }
+
+    [[nodiscard]] std::size_t delta_from_baseline(std::size_t free_bytes) const noexcept {
+        return summary_.free_before_bytes > free_bytes ? summary_.free_before_bytes - free_bytes
+                                                       : 0;
+    }
+
+    CudaGraphMemorySummary summary_;
+};
+
 void validate_graph_profiles(const std::vector<GraphExecutionProfile>& profiles,
                              std::uint32_t max_frontier, const char* label);
 
@@ -34,7 +98,8 @@ void validate_graph_profiles(const std::vector<GraphExecutionProfile>& profiles,
     }
 }
 
-void instantiate_graph_family(DecodeGraphFamily& family, const char* label, DeviceContext& device) {
+void instantiate_graph_family(DecodeGraphFamily& family, const char* label, DeviceContext& device,
+                              GraphMemoryTracker& memory) {
     if (family.profiles.empty()) {
         throw std::logic_error(std::string(label) + " CUDA Graph family has no profiles");
     }
@@ -55,6 +120,7 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
         DecodeGraphTopology& topology = family.topologies.back();
         topology.topology_class       = profile.topology_class;
         topology.executable.instantiate(profile.definition);
+        memory.sample(GraphMemoryPhase::Instantiate);
         topology.installed_profile = i;
     }
 
@@ -62,10 +128,12 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
         DecodeGraphProfile& profile = family.profiles[profile_index];
         if (topology.installed_profile != profile_index) {
             topology.executable.update(profile.definition);
+            memory.sample(GraphMemoryPhase::UpdateUpload);
             topology.installed_profile = profile_index;
         }
         topology.executable.upload(device.stream);
         device.synchronize();
+        memory.sample(GraphMemoryPhase::UpdateUpload);
     };
 
     for (DecodeGraphTopology& topology : family.topologies) {
@@ -121,6 +189,7 @@ DecodeGraphExecutable& DecodeGraphFamily::install(DecodeGraphProfile& profile) {
 void ProgramImpl::prepare_graphs() {
     if (!use_cuda_graph) { return; }
     nvtx::ScopedRange prepare_range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
+    GraphMemoryTracker graph_memory;
 
     std::array<StateImageHandle, kMaximumConcurrency> capture_states{};
     for (std::uint32_t row = 0; row < max_concurrency; ++row) {
@@ -171,6 +240,7 @@ void ProgramImpl::prepare_graphs() {
                              "DFlash Full KV cache");
     }
     device.synchronize();
+    graph_memory.sample(GraphMemoryPhase::Setup);
 
     const auto clear_stable_controls = [&] {
         std::vector<Tensor> controls{
@@ -330,6 +400,7 @@ void ProgramImpl::prepare_graphs() {
         execution::ordinary_decode_batch(ordinary_state, 1, {code_warm.min + 1, code_warm.max + 1},
                                          nullptr);
         device.synchronize();
+        graph_memory.sample(GraphMemoryPhase::Setup);
 
         ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
         for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
@@ -346,18 +417,20 @@ void ProgramImpl::prepare_graphs() {
                 execution::capture_ordinary_decode_batch(ordinary_state,
                                                          static_cast<std::int32_t>(batch_size),
                                                          envelope, profile.definition);
+                graph_memory.sample(GraphMemoryPhase::Capture);
             }
         }
     }
 
     if (!ordinary_graphs.profiles.empty()) {
-        instantiate_graph_family(ordinary_graphs, "ordinary", device);
+        instantiate_graph_family(ordinary_graphs, "ordinary", device, graph_memory);
         for (auto& topology : ordinary_graphs.topologies) {
             const auto& profile = ordinary_graphs.profiles[*topology.installed_profile];
             prepare_representative(profile.min_execution_frontier, profile.batch_size);
             device.synchronize();
             topology.executable.launch(device.stream);
             device.synchronize();
+            graph_memory.sample(GraphMemoryPhase::Warmup);
         }
     }
     if (speculative_backend != SpeculativeBackend::None) {
@@ -426,6 +499,7 @@ void ProgramImpl::prepare_graphs() {
                     state, batch, draft_window, dflash_envelopes(frontier, draft_window),
                     target_envelope(frontier), profile.definition, phase);
             }
+            graph_memory.sample(GraphMemoryPhase::Capture);
         };
 
         const auto code_warm = forward_profiles.front();
@@ -434,6 +508,7 @@ void ProgramImpl::prepare_graphs() {
         run(SpeculativePhase::Forward, 1, code_warm.max, nullptr);
         run(SpeculativePhase::Finish, 1, code_warm.max, nullptr);
         device.synchronize();
+        graph_memory.sample(GraphMemoryPhase::Setup);
 
         for (const auto phase : {SpeculativePhase::Forward, SpeculativePhase::Finish}) {
             const bool forward = phase == SpeculativePhase::Forward;
@@ -452,7 +527,7 @@ void ProgramImpl::prepare_graphs() {
                 }
             }
             instantiate_graph_family(family, forward ? "speculative forward" : "speculative finish",
-                                     device);
+                                     device, graph_memory);
         }
 
         // Warm complete transactions: finish consumes persistent outputs of its paired forward.
@@ -461,11 +536,13 @@ void ProgramImpl::prepare_graphs() {
             auto& finish      = speculative_finish_graphs.select(forward.batch_size,
                                                                  forward.min_execution_frontier);
             auto& finish_exec = speculative_finish_graphs.install(finish);
+            graph_memory.sample(GraphMemoryPhase::UpdateUpload);
             prepare_representative(forward.min_execution_frontier, forward.batch_size);
             device.synchronize();
             topology.executable.launch(device.stream);
             finish_exec.launch(device.stream);
             device.synchronize();
+            graph_memory.sample(GraphMemoryPhase::Warmup);
         }
     }
 
@@ -504,6 +581,7 @@ void ProgramImpl::prepare_graphs() {
         release_capture_rows(*backend_kv_addresses, mtp_capture_allocations);
     }
     release_capture_rows(*text_kv_addresses, text_capture_allocations);
+    cuda_graph_memory = graph_memory.finish();
 }
 
 

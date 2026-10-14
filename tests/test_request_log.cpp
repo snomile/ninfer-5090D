@@ -131,12 +131,24 @@ int main() {
     memory.available_after_startup_bytes     = 180;
     memory.planned_slack_bytes               = 100;
     memory.cuda_graph_allowance_bytes        = 600;
-    memory.kv_payload_bytes                  = 400;
-    memory.host_context_capacity_bytes       = 64ULL << 20;
-    memory.host_context_occupied_bytes       = 12ULL << 20;
-    memory.host_context_reserved_bytes       = 4ULL << 20;
-    memory.host_state_occupied_slots         = 1;
-    memory.host_kv_occupied_bytes            = 8ULL << 20;
+    ninfer::CudaGraphMemorySummary graph_sample;
+    graph_sample.free_before_bytes                 = 1000;
+    graph_sample.minimum_free_bytes                = 700;
+    graph_sample.free_after_bytes                  = 800;
+    graph_sample.observed_peak_bytes               = 300;
+    graph_sample.observed_steady_bytes             = 200;
+    graph_sample.setup_observed_peak_bytes         = 20;
+    graph_sample.capture_observed_peak_bytes       = 80;
+    graph_sample.instantiate_observed_peak_bytes   = 220;
+    graph_sample.update_upload_observed_peak_bytes = 280;
+    graph_sample.warmup_observed_peak_bytes        = 300;
+    memory.cuda_graph_memory                       = graph_sample;
+    memory.kv_payload_bytes                        = 400;
+    memory.host_context_capacity_bytes             = 64ULL << 20;
+    memory.host_context_occupied_bytes             = 12ULL << 20;
+    memory.host_context_reserved_bytes             = 4ULL << 20;
+    memory.host_state_occupied_slots               = 1;
+    memory.host_kv_occupied_bytes                  = 8ULL << 20;
 
     ServerLogEnvironment environment;
     environment.device                    = 0;
@@ -248,6 +260,18 @@ int main() {
         "Vision workspace layout missing");
     failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
                       "CUDA Graph allowance missing");
+    const auto& graph_memory = server.at("memory").at("cuda_graph_memory");
+    failures += check(graph_memory.at("free_before_bytes") == 1000 &&
+                          graph_memory.at("minimum_free_bytes") == 700 &&
+                          graph_memory.at("free_after_bytes") == 800 &&
+                          graph_memory.at("observed_peak_bytes") == 300 &&
+                          graph_memory.at("observed_steady_bytes") == 200 &&
+                          graph_memory.at("setup_observed_peak_bytes") == 20 &&
+                          graph_memory.at("capture_observed_peak_bytes") == 80 &&
+                          graph_memory.at("instantiate_observed_peak_bytes") == 220 &&
+                          graph_memory.at("update_upload_observed_peak_bytes") == 280 &&
+                          graph_memory.at("warmup_observed_peak_bytes") == 300,
+                      "CUDA Graph memory observation missing");
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&
                           server.at("memory").at("available_after_weights_bytes") == 1700 &&
                           server.at("memory").at("available_after_startup_bytes") == 180 &&
