@@ -286,6 +286,7 @@ private:
     enum class HostWorkClass : std::uint8_t {
         Decode,
         Prefill,
+        Replay,
         Control,
     };
 
@@ -2331,8 +2332,8 @@ private:
                 }
                 if (const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_)) {
                     const auto request = slots_[*lane];
-                    set_host_work_class(HostWorkClass::Prefill);
                     if (request->is_replaying()) {
+                        set_host_work_class(HostWorkClass::Replay);
                         ProgramCallScope call(*this);
                         auto progress = instance_.program->advance_replay(*request->sequence,
                                                                           &call.failed_timing());
@@ -2353,6 +2354,7 @@ private:
                                                GenerationSchedulingTransition::ReplayComplete);
                         }
                     } else {
+                        set_host_work_class(HostWorkClass::Prefill);
                         run_prefill_step(*lane, snapshot_cancellations());
                     }
                     scheduler_.prefill_executed(*lane, max_concurrency_);

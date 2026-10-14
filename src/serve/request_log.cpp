@@ -450,6 +450,9 @@ ninfer::RuntimeHostWorkStats host_work_delta(const ninfer::RuntimeHostWorkStats&
         .prefill_host_ns = monotonic_delta(previous.prefill_host_ns, current.prefill_host_ns),
         .prefill_device_wait_ns =
             monotonic_delta(previous.prefill_device_wait_ns, current.prefill_device_wait_ns),
+        .replay_host_ns = monotonic_delta(previous.replay_host_ns, current.replay_host_ns),
+        .replay_device_wait_ns =
+            monotonic_delta(previous.replay_device_wait_ns, current.replay_device_wait_ns),
         .control_host_ns = monotonic_delta(previous.control_host_ns, current.control_host_ns),
         .control_device_wait_ns =
             monotonic_delta(previous.control_device_wait_ns, current.control_device_wait_ns),
@@ -754,6 +757,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"decode_device_wait", nanoseconds_to_seconds(host.decode_device_wait_ns)},
                  {"prefill_host", nanoseconds_to_seconds(host.prefill_host_ns)},
                  {"prefill_device_wait", nanoseconds_to_seconds(host.prefill_device_wait_ns)},
+                 {"replay_host", nanoseconds_to_seconds(host.replay_host_ns)},
+                 {"replay_device_wait", nanoseconds_to_seconds(host.replay_device_wait_ns)},
                  {"control_host", nanoseconds_to_seconds(host.control_host_ns)},
                  {"control_device_wait", nanoseconds_to_seconds(host.control_device_wait_ns)}}},
            {"detail_subset_seconds",

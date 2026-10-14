@@ -31,15 +31,31 @@ int main() {
     running.generated_tokens += 5;
     running.speculative_draft_tokens += 6;
     running.speculative_accepted_tokens = 3;
+    running.computed_prefill_tokens      = 600;
+    running.committed_decode_tokens      = 120;
     running.running_requests            = 1;
     running.host_context_occupied_bytes = 4096;
     running.host_context_reserved_bytes = 1024;
+    running.host_work.prefill_host_ns        = 1'000'000'000;
+    running.host_work.prefill_device_wait_ns = 2'000'000'000;
+    running.host_work.replay_host_ns         = 9'000'000'000;
+    running.host_work.replay_device_wait_ns  = 9'000'000'000;
+    running.host_work.decode_host_ns         = 500'000'000;
+    running.host_work.decode_device_wait_ns  = 1'500'000'000;
+    running.host_work.control_host_ns        = 250'000'000;
+    running.host_work.control_device_wait_ns = 750'000'000;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
     const auto live = metrics.render(running, true);
     check(live.find("ninfer_generation_tokens_total 5\n") != std::string::npos,
           "live generated count must exclude startup warmup");
     check(live.find("ninfer_spec_decode_draft_tokens_total 6\n") != std::string::npos,
           "speculative work must be observable before request completion");
+    check(live.find("ninfer_prefill_tokens_total 600\n") != std::string::npos &&
+              live.find("ninfer_prefill_active_seconds_total 3\n") != std::string::npos,
+          "Prefill token and active-time counters must share initial-compute semantics");
+    check(live.find("ninfer_decode_tokens_total 120\n") != std::string::npos &&
+              live.find("ninfer_decode_active_seconds_total 3\n") != std::string::npos,
+          "Decode token and active-time counters must include matching Control work");
     check(live.find("ninfer_time_to_first_token_seconds_count 1\n") != std::string::npos &&
               live.find("ninfer_requests_total{outcome=\"completed\"} 0\n") != std::string::npos,
           "TTFT must be visible before completion");

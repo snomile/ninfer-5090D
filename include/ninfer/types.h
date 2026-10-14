@@ -982,6 +982,8 @@ struct RuntimeHostWorkStats {
     std::uint64_t decode_device_wait_ns  = 0;
     std::uint64_t prefill_host_ns        = 0;
     std::uint64_t prefill_device_wait_ns = 0;
+    std::uint64_t replay_host_ns         = 0;
+    std::uint64_t replay_device_wait_ns  = 0;
     std::uint64_t control_host_ns        = 0;
     std::uint64_t control_device_wait_ns = 0;
     std::uint64_t prefill_units          = 0;

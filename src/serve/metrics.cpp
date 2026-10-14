@@ -180,6 +180,22 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
             "Committed output tokens, including first and control tokens.");
     COUNTER(committed_decode_tokens, "decode_tokens_total",
             "Committed decode/control tokens, excluding the first token.");
+    counter("prefill_active_seconds_total",
+            (stats.host_work.prefill_host_ns + stats.host_work.prefill_device_wait_ns) * 1e-9,
+            (baseline_.host_work.prefill_host_ns +
+             baseline_.host_work.prefill_device_wait_ns) *
+                1e-9,
+            "Engine-active Prefill wall time, excluding Replay.");
+    counter("decode_active_seconds_total",
+            (stats.host_work.decode_host_ns + stats.host_work.decode_device_wait_ns +
+             stats.host_work.control_host_ns + stats.host_work.control_device_wait_ns) *
+                1e-9,
+            (baseline_.host_work.decode_host_ns +
+             baseline_.host_work.decode_device_wait_ns +
+             baseline_.host_work.control_host_ns +
+             baseline_.host_work.control_device_wait_ns) *
+                1e-9,
+            "Engine-active Decode and Control wall time.");
     COUNTER(replayed_tokens, "replayed_tokens_total", "History tokens recomputed during recovery.");
     COUNTER(decode_rounds, "decode_rounds_total", "Decode batch executions.");
     COUNTER(decode_row_rounds, "decode_row_rounds_total", "Sum of decode batch sizes.");

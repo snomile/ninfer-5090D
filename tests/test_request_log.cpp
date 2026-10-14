@@ -757,6 +757,8 @@ int main() {
                                .decode_device_wait_ns         = 200000000,
                                .prefill_host_ns               = 3000000,
                                .prefill_device_wait_ns        = 50000000,
+                               .replay_host_ns                = 6000000,
+                               .replay_device_wait_ns         = 70000000,
                                .control_host_ns               = 2000000,
                                .control_device_wait_ns        = 50000000,
                                .prefill_units                 = 4,
@@ -837,6 +839,16 @@ int main() {
                          .at("decode_device_wait_microseconds_per_round")
                          .get<double>() -
                      20000.0) < 1.0e-12 &&
+            std::abs(throughput_json.at("host_work")
+                         .at("work_class_seconds")
+                         .at("replay_host")
+                         .get<double>() -
+                     0.006) < 1.0e-15 &&
+            std::abs(throughput_json.at("host_work")
+                         .at("work_class_seconds")
+                         .at("replay_device_wait")
+                         .get<double>() -
+                     0.07) < 1.0e-15 &&
             std::abs(throughput_json.at("host_work")
                          .at("detail_microseconds_per_invocation")
                          .at("stats_publication")

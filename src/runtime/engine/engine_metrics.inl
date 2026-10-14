@@ -74,6 +74,10 @@ void EngineCore<Instance>::add_class_host_time(std::uint64_t host_ns,
         stats.prefill_host_ns += host_ns;
         stats.prefill_device_wait_ns += device_wait_ns;
         break;
+    case HostWorkClass::Replay:
+        stats.replay_host_ns += host_ns;
+        stats.replay_device_wait_ns += device_wait_ns;
+        break;
     case HostWorkClass::Control:
         stats.control_host_ns += host_ns;
         stats.control_device_wait_ns += device_wait_ns;
