@@ -2060,6 +2060,22 @@ private:
         publish_runtime_stats();
     }
 
+    void fail_control_request(std::uint32_t lane, std::exception_ptr error) {
+        const auto& request = slots_[lane];
+        if (request == nullptr || !request->sequence || !request->lane ||
+            request->lane->value != lane) {
+            throw std::logic_error("recoverable control failure lost its active request");
+        }
+        auto aborted = instance_.program->abort(*request->sequence);
+        if (aborted.status != ConsumeStatus::Consumed) {
+            throw std::logic_error("recoverable control failure could not abort its sequence");
+        }
+        request->generation_timings = aborted.timings;
+        request->speculative_stats  = std::move(aborted.speculative);
+        complete_error(request, std::move(error));
+        remove_completed_slot(lane);
+    }
+
     void run_control_batch(const ControlMembership& membership) {
         nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
                                         static_cast<std::uint64_t>(membership.size));
@@ -2085,6 +2101,8 @@ private:
             generated_staged = false;
         };
 
+        std::optional<std::uint32_t> recoverable_lane;
+        std::exception_ptr recoverable_error;
         for (std::size_t row = 0; row < membership.size; ++row) {
             const auto& request = slots_[membership.lanes[row]];
             if (request == nullptr) {
@@ -2105,8 +2123,15 @@ private:
                 const std::span<const TokenId> tokens =
                     std::span<const TokenId>(membership.tokens)
                         .subspan(row * membership.row_stride, membership.row_stride);
-                const OutputDecision decision =
-                    request->output.preview_control(tokens, request->budget->remaining());
+                OutputDecision decision;
+                try {
+                    decision =
+                        request->output.preview_control(tokens, request->budget->remaining());
+                } catch (const OutputControlError&) {
+                    recoverable_lane  = lane;
+                    recoverable_error = std::current_exception();
+                    break;
+                }
                 if (decision.accepted_tokens != membership.row_stride || decision.finished() ||
                     decision.continuation != ContinuationAction::Decode ||
                     (decision.prefix_execution_split_after &&
@@ -2121,6 +2146,12 @@ private:
                         "admission did not reserve thinking-control token capacity");
                 }
                 request->generated.insert(request->generated.end(), tokens.begin(), tokens.end());
+            }
+            if (recoverable_error) {
+                rollback_generated();
+                fail_control_request(*recoverable_lane, std::move(recoverable_error));
+                publish_runtime_stats();
+                return;
             }
             phase.pause_range();
             ProgramCallScope program_call(*this);

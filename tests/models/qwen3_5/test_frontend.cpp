@@ -65,10 +65,10 @@ using PublishedOutput = ninfer::models::qwen3_5::PublishedOutput;
 namespace fi          = ninfer::models::qwen3_5::frontend;
 
 constexpr std::string_view kThinkingControlGuidance =
-    "\n\n Considering the limited time by the user, I have to give the solution based on the "
+    " \n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n";
 constexpr std::string_view kThinkingControl =
-    "\n\n Considering the limited time by the user, I have to give the solution based on the "
+    " \n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n</think>\n\n";
 constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
 
@@ -2213,6 +2213,30 @@ int test_constrained_thinking_control(const Frontend& frontend) {
     failures +=
         check(channel_text(session.commit_preview(), ninfer::OutputChannel::Content) == " yes",
               "constrained content lost its leading space after thinking");
+
+    const auto partial_close = frontend.tokenize_text("\n</think>\n");
+    auto partial_session     = frontend.make_output_session(
+        prompt, {}, {}, {.budget = static_cast<std::uint32_t>(partial_close.size())},
+        ninfer::OutputConstraint::grammar("root ::= \" yes\""));
+    const auto partial_decision =
+        partial_session.preview_model(partial_close, 512, ninfer::FinishReason::OutputLimit);
+    failures += check(
+        partial_decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+        "partial canonical close did not request constrained thinking control");
+    (void)partial_session.commit_preview();
+    const auto partial_control = partial_session.pending_control_tokens();
+    if (partial_control.empty()) {
+        return failures + check(false, "partial canonical close lost thinking control");
+    }
+    (void)partial_session.preview_control(partial_control, 512);
+    auto partial_closed = partial_session.commit_preview();
+    failures += check(channel_text(partial_closed, ninfer::OutputChannel::Content).empty(),
+                      "repaired thinking control leaked into constrained content");
+    (void)partial_session.preview_model(frontend.tokenize_text(" yes"), 512,
+                                        ninfer::FinishReason::OutputLimit);
+    failures += check(
+        channel_text(partial_session.commit_preview(), ninfer::OutputChannel::Content) == " yes",
+        "content generation did not recover after a partial canonical close");
     return failures;
 }
 

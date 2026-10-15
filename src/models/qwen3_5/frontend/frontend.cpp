@@ -42,8 +42,10 @@ namespace fi = frontend;
 
 constexpr std::string_view kThinkClose = "</think>";
 constexpr std::string_view kThinkingControl =
-    "\n\n Considering the limited time by the user, I have to give the solution based on the "
+    " \n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n</think>\n\n";
+// The leading space breaks any proper prefix of the canonical close left at the model budget.
+// Without it, a trailing "\n</think>\n" consumes the control's first newline as an early close.
 static_assert(kThinkingControl.ends_with(fi::kCanonicalReasoningCloseSerialization));
 constexpr double kRescaleFactor = 1.0 / 255.0;
 constexpr double kVideoFps      = 2.0;
