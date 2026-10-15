@@ -731,6 +731,91 @@ int test_reasoning_and_extensions() {
     return failures;
 }
 
+int test_thinking_budget() {
+    int failures = 0;
+
+    Json body                          = base_request();
+    body["max_tokens"]                 = 16384;
+    body["thinking_budget"]            = 8192;
+    const GenerationRequest configured = parse(body).generation;
+    failures += check(configured.thinking_budget == 8192,
+                      "request thinking budget did not reach GenerationRequest");
+    ServeOptions server;
+    server.default_thinking_budget = 4096;
+    failures += check(to_request_options(configured, server, semantics(configured), true)
+                              .execution.thinking.budget == 8192,
+                      "request thinking budget did not override the server default");
+
+    const GenerationRequest omitted = parse(base_request()).generation;
+    failures += check(!omitted.thinking_budget, "omitted thinking budget did not remain unset");
+    body["thinking_budget"] = nullptr;
+    failures +=
+        check(!parse(body).generation.thinking_budget, "null thinking budget did not remain unset");
+
+    auto rejected = [&](Json value, int max_tokens, const std::string& label) {
+        Json invalid               = base_request();
+        invalid["max_tokens"]      = max_tokens;
+        invalid["thinking_budget"] = std::move(value);
+        const ApiError error       = api_error([&] { (void)parse(invalid); });
+        failures += check(error.status == 400 && error.param == "thinking_budget", label);
+    };
+    rejected(512, 16384, "thinking budget below 1024 was accepted");
+    rejected(20000, 15000, "thinking budget above max_tokens was accepted");
+    rejected(8192, 8192, "thinking budget equal to max_tokens was accepted");
+    rejected("8192", 16384, "string thinking budget was accepted");
+    rejected(8192.5, 16384, "fractional thinking budget was accepted");
+    rejected(true, 16384, "boolean thinking budget was accepted");
+
+    Json inherited_limit               = base_request();
+    inherited_limit["thinking_budget"] = 8192;
+    const ApiError inherited_error =
+        api_error([&] { (void)parse_chat_completion_request(inherited_limit, RequestLimits{}); });
+    failures += check(inherited_error.param == "thinking_budget",
+                      "thinking budget ignored the server default output limit");
+
+    body                          = base_request();
+    body["max_completion_tokens"] = 8192;
+    body["max_tokens"]            = 16384;
+    body["thinking_budget"]       = 8192;
+    failures += check(api_error([&] { (void)parse(body); }).param == "thinking_budget",
+                      "thinking budget ignored max_completion_tokens precedence");
+
+    body                             = base_request();
+    body["max_tokens"]               = 16384;
+    body["thinking_budget"]          = 8192;
+    body["reasoning_effort"]         = "none";
+    const GenerationRequest disabled = parse(body).generation;
+    failures +=
+        check(disabled.thinking_budget == 8192 && !options(disabled).execution.thinking.budget,
+              "non-thinking request did not quietly ignore a valid thinking budget");
+    body["thinking_budget"] = 512;
+    failures += check(api_error([&] { (void)parse(body); }).param == "thinking_budget",
+                      "non-thinking request bypassed thinking budget validation");
+
+    const GenerationRequest defaulted = parse(base_request()).generation;
+    const ninfer::RequestOptions translated =
+        to_request_options(defaulted, server, semantics(defaulted), true);
+    failures += check(!defaulted.thinking_budget && translated.execution.thinking.budget == 4096,
+                      "omitted request budget did not preserve the server default");
+
+    body                    = base_request();
+    body["max_tokens"]      = 16384;
+    body["thinking_budget"] = 8192;
+    body["response_format"] =
+        Json{{"type", "json_schema"},
+             {"json_schema",
+              Json{{"name", "answer"},
+                   {"strict", true},
+                   {"schema", Json{{"type", "object"},
+                                   {"properties", Json{{"answer", Json{{"type", "string"}}}}},
+                                   {"required", Json::array({"answer"})},
+                                   {"additionalProperties", false}}}}}};
+    const GenerationRequest structured = parse(body).generation;
+    failures += check(structured.thinking_budget == 8192 && structured.constraint.has_value(),
+                      "thinking budget disrupted JSON Schema parsing");
+    return failures;
+}
+
 int test_stops_and_ranges() {
     int failures                            = 0;
     Json body                               = base_request();
@@ -980,6 +1065,7 @@ int main() {
     failures += test_tools();
     failures += test_messages_and_media();
     failures += test_reasoning_and_extensions();
+    failures += test_thinking_budget();
     failures += test_stops_and_ranges();
     failures += test_aggregate_response();
     failures += test_stream_response();

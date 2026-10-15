@@ -120,6 +120,7 @@ The endpoint supports:
   named selection, `allowed_tools`, and `parallel_tool_calls`; assistant tool-call history,
   tool-result messages, and legacy function-call history;
 - the top-level `reasoning_effort` field;
+- the top-level `thinking_budget` extension for a per-request thinking-token cap;
 - `enable_thinking` and `preserve_thinking`, either at top level or in
   `chat_template_kwargs`;
 - Assistant `reasoning_content` and `reasoning` history aliases.
@@ -321,8 +322,11 @@ special tokens cannot be overridden through kwargs.
 
 `--default-thinking-budget N` sets a positive default thinking-token cap for requests that start
 in thinking mode. Non-thinking requests receive no cap. It may coexist with `--no-thinking`
-because requests can explicitly enable thinking. Anthropic
-`thinking:{"type":"enabled","budget_tokens":N}` overrides this default for that request.
+because requests can explicitly enable thinking. Chat Completions `thinking_budget:N` and Anthropic
+`thinking:{"type":"enabled","budget_tokens":N}` override this default for that request. A Chat
+Completions request budget must be an integer of at least 1024 and less than the effective output
+limit selected from `max_completion_tokens`, `max_tokens`, or the server default. Omitted or `null`
+uses the server default. A valid budget on a request that resolves to non-thinking mode is ignored.
 
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
