@@ -1,5 +1,6 @@
 #pragma once
 
+#include "serve/engine_failure_monitor.h"
 #include "serve/generation_service.h"
 #include "serve/metrics.h"
 #include "serve/operational_log.h"
@@ -98,8 +99,6 @@ private:
     void record_request_failure(const RequestLogContext& context, const RequestFailure& failure);
     void record_response_failure(std::uint64_t request_id, const RequestFailure& failure);
     void record_throughput(const ThroughputReport& report);
-    void run_engine_monitor();
-    void stop_engine_monitor();
     void run_stats_reporter();
     void stop_stats_reporter();
 
@@ -116,11 +115,7 @@ private:
     std::condition_variable stats_cv_;
     std::thread stats_thread_;
     bool stats_stopping_ = false;
-    std::mutex engine_monitor_mutex_;
-    std::condition_variable engine_monitor_cv_;
-    std::thread engine_monitor_thread_;
-    bool engine_monitor_stopping_ = false;
-    std::atomic<bool> engine_failure_detected_{false};
+    EngineFailureMonitor engine_monitor_;
 };
 
 } // namespace ninfer::serve

@@ -59,3 +59,10 @@ ninfer_add_test(ninfer_http_error_handler_test
 ninfer_add_test(ninfer_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
   LIBRARIES ninfer_serve)
+
+if(UNIX)
+  ninfer_add_test(ninfer_engine_failure_shutdown_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_engine_failure_shutdown.cpp"
+    LIBRARIES Threads::Threads ninfer::httplib)
+  set_tests_properties(ninfer_engine_failure_shutdown_test PROPERTIES TIMEOUT 15)
+endif()

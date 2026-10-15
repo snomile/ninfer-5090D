@@ -69,8 +69,17 @@ selected for this process.
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
 
 `GET /health` returns HTTP 200 with `{"status":"ok"}` while the Engine can accept work. After an
-Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}`. Temporary queue
-saturation does not make the Engine unavailable. The endpoint remains unauthenticated.
+Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}` until the serving monitor
+closes the listener. Temporary queue saturation does not make the Engine unavailable. The endpoint
+remains unauthenticated.
+
+The monitor checks Engine availability every 100 ms. On Engine-wide failure, Serve closes the
+listener and exits with status 1 after existing HTTP workers finish. They have a five-second grace
+period from failure detection; if a slow upload or another worker prevents shutdown, Serve forces
+process exit without running destructors or flushing buffered I/O. A process supervisor can then
+restart it. This deadline is only armed by Engine-wide failure; ordinary signal-driven shutdown
+remains graceful. Request-local output-control failures return an error without restarting the
+Engine or interrupting other requests.
 
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
@@ -966,8 +975,9 @@ Serve emits one warning with only the failure classification, never the generate
 
 `GET /metrics` serves Prometheus text format 0.0.4 on the same port. It follows the server's
 API-key authentication and works independently of `--request-log-jsonl` and
-`--log-stats-interval-ms`. Engine failure leaves the endpoint readable with
-`ninfer_engine_ready 0`. Counters start after startup warmup and reset when the server restarts.
+`--log-stats-interval-ms`. Engine failure reports `ninfer_engine_ready 0` until the serving monitor
+closes the listener as described above. Counters start after startup warmup and reset when the
+server restarts.
 
 ```bash
 curl http://127.0.0.1:8080/metrics

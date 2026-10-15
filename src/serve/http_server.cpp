@@ -292,31 +292,6 @@ void HttpServer::record_throughput(const ThroughputReport& report) {
     operational_log_.throughput(report);
 }
 
-void HttpServer::run_engine_monitor() {
-    for (;;) {
-        if (!service_->is_available()) {
-            engine_failure_detected_.store(true, std::memory_order_release);
-            server_.stop();
-            return;
-        }
-        std::unique_lock lock(engine_monitor_mutex_);
-        if (engine_monitor_cv_.wait_for(lock, std::chrono::milliseconds(100),
-                                        [this] { return engine_monitor_stopping_; })) {
-            return;
-        }
-    }
-}
-
-void HttpServer::stop_engine_monitor() {
-    if (!engine_monitor_thread_.joinable()) { return; }
-    {
-        std::lock_guard lock(engine_monitor_mutex_);
-        engine_monitor_stopping_ = true;
-    }
-    engine_monitor_cv_.notify_one();
-    engine_monitor_thread_.join();
-}
-
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
     ninfer::RuntimeStats previous   = service_->runtime_stats();
@@ -565,21 +540,17 @@ bool HttpServer::listen() {
             stats_stopping_ = false;
             stats_thread_   = std::thread([this] { run_stats_reporter(); });
         }
-        {
-            std::lock_guard lock(engine_monitor_mutex_);
-            engine_monitor_stopping_ = false;
-        }
-        engine_failure_detected_.store(false, std::memory_order_release);
-        engine_monitor_thread_ = std::thread([this] { run_engine_monitor(); });
+        engine_monitor_.start([this] { return service_->is_available(); },
+                              [this] { server_.stop(); });
         const bool result = server_.listen_after_bind();
-        stop_engine_monitor();
+        engine_monitor_.stop();
         stop_stats_reporter();
-        if (engine_failure_detected_.load(std::memory_order_acquire)) {
+        if (engine_monitor_.failed()) {
             throw std::runtime_error("inference engine became unavailable while serving");
         }
         return result;
     } catch (...) {
-        stop_engine_monitor();
+        engine_monitor_.stop();
         stop_stats_reporter();
         throw;
     }
