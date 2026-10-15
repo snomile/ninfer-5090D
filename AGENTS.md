@@ -39,6 +39,20 @@ and serving documentation together.
 Update stable requirements in their existing authoritative document; maintain one current authority.
 Use Conventional Commit subjects with concise lowercase types when a commit is requested.
 
+## Fork branch policy
+
+This fork has one development, integration, and deployment branch:
+`feature/memory-opt-5090d`. Commit and push all retained fork changes to that branch. Before editing
+or committing, verify the target with `git branch --show-current` and
+`git rev-parse --abbrev-ref --symbolic-full-name @{upstream}`. Do not infer the target branch from
+the current checkout, and do not commit retained work to `master`, `dev`, `experiment/*`, any other
+`feature/*`, `fix/*`, or `verify/*` branch.
+
+Detached worktrees based on `origin/feature/memory-opt-5090d` may be used for builds and tests. Do
+not create a topic branch unless the user explicitly requests one. If work is accidentally committed
+elsewhere, first verify that every commit is reachable from `feature/memory-opt-5090d`, then delete
+the accidental local and remote branch.
+
 ## Verification and reporting
 
 Before changing Ops, numerical or state semantics, read
