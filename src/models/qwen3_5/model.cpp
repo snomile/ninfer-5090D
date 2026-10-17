@@ -17,6 +17,10 @@ Model::~Model() = default;
 
 ops::WeightInput Model::input(WeightUseId id) const { return weight_input(bound_, id); }
 
-ops::WeightInput Model::input(WeightId id) const { return weight_input(bound_, id); }
+ops::WeightInput Model::input(WeightId id) const {
+    const auto& parameter = bound_.at(id.index);
+    if (parameter.uses.empty()) return {parameter.view, ops::LinearPolicy::A16Only, {}};
+    return weight_input(bound_, id);
+}
 
 } // namespace ninfer::models::qwen3_5

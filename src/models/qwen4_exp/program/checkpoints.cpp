@@ -65,13 +65,12 @@ std::optional<CapturePreparation> Program::prepare_capture(SequenceHandle h) {
     }
     auto destination = ticket->states->reserve_destination();
     if (!destination && p.resources.host_context) {
-        ticket->host =
-            p.resources.host_context->allocate(p.resources.states->storage().image_bytes());
+        ticket->host = ticket->states->reserve_host_destination();
         if (ticket->host) destination = ticket->states->reserve_logical_destination();
     }
     if (!destination)
         return CapturePreparation{
-            point.frontier, false, {.state_slots = 1}, p.resources.states->storage().image_bytes()};
+            point.frontier, false, {.state_slots = 1}, p.resources.states->storage().image_bytes(), 1};
     ticket->destination = *destination;
     s.capture           = std::move(ticket);
     return CapturePreparation{point.frontier, true};
@@ -98,7 +97,7 @@ bool Program::reclaim_capture_reservation(ContextResources shortage) {
         if (!s || !s->capture || s->capture_pending) continue;
         if ((shortage.state_slots &&
              impl_->resources.state_store->device_resident(s->capture->destination)) ||
-            (shortage.host_bytes && s->capture->host)) {
+            ((shortage.host_bytes || shortage.host_state_slots) && s->capture->host)) {
             s->capture.reset();
             return true;
         }
@@ -144,15 +143,17 @@ bool Program::start_capture(SequenceHandle h) {
     return true;
 }
 
-std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle h) const {
+std::optional<ContextResources> Program::pause_host_resources(SequenceHandle h) const {
     const auto& p = *impl_;
     const auto& s = p.sequence(h);
     if (!s.request->can_checkpoint(s.continuation.metadata.main_frontier) ||
         !p.resources.host_context)
         return {};
-    std::size_t bytes = p.resources.state_store->host_resident(s.continuation.image)
-                            ? 0
-                            : p.resources.states->storage().image_bytes();
+    ContextResources resources;
+    if (!p.resources.state_store->host_resident(s.continuation.image)) {
+        resources.host_bytes = p.resources.states->storage().image_bytes();
+        resources.host_state_slots = 1;
+    }
     for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool) {
         const auto& storage = p.resources.pool(pool);
         const auto frontier = pool == 0 ? s.continuation.metadata.main_frontier
@@ -161,10 +162,15 @@ std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle h) const {
             const auto page = storage.histories.logical_page(s.histories[pool].handle(), i);
             if (storage.pages.active_history_references(page) <= 1 &&
                 !storage.pages.host_replica_current(page))
-                bytes += p.pools[pool].host_page_stride;
+                resources.host_bytes += p.pools[pool].host_page_stride;
         }
     }
-    return bytes;
+    return resources;
+}
+
+std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle h) const {
+    const auto resources = pause_host_resources(h);
+    return resources ? std::optional<std::size_t>(resources->host_bytes) : std::nullopt;
 }
 
 bool Program::start_pause(SequenceHandle h, bool save, runtime::ExecutionTiming* observation) {
@@ -175,8 +181,10 @@ bool Program::start_pause(SequenceHandle h, bool save, runtime::ExecutionTiming*
         s.phase != detail::Phase::Active)
         throw std::logic_error("pause requires a committed boundary");
     if (save) {
-        const auto bytes = pause_host_bytes(h);
-        if (!bytes || *bytes > p.resources.host_context->free_bytes()) return false;
+        const auto needed = pause_host_resources(h);
+        const auto& states = *p.resources.state_store;
+        if (!needed || needed->host_bytes > p.resources.host_context->free_bytes() ||
+            needed->host_state_slots > states.host_capacity() - states.host_occupied()) return false;
     }
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, observation);
     timing.begin_wait();

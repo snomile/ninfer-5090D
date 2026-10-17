@@ -24,6 +24,11 @@ ninfer_add_test(ninfer_cli_options_test
 
 target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
 
+ninfer_add_test(ninfer_memory_options_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_memory_options.cpp" ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
+  LIBRARIES ninfer_serve)
+target_include_directories(ninfer_memory_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
+
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_openai_schema.cpp"
   LIBRARIES ninfer_serve)
@@ -51,6 +56,11 @@ ninfer_add_test(ninfer_request_log_test
 ninfer_add_test(ninfer_metrics_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_metrics.cpp"
   LIBRARIES ninfer_serve)
+
+ninfer_add_test(ninfer_engine_failure_monitor_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_engine_failure_monitor.cpp"
+  LIBRARIES Threads::Threads ninfer::httplib)
+set_tests_properties(ninfer_engine_failure_monitor_test PROPERTIES TIMEOUT 30)
 
 ninfer_add_test(ninfer_http_error_handler_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_error_handler.cpp"

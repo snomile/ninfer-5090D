@@ -34,6 +34,8 @@ add_test(NAME ninfer_regex_choice_oracle_test
 ninfer_add_test(ninfer_json_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_json_schema.cpp"
   LIBRARIES ninfer_grammar ninfer::json)
+target_include_directories(ninfer_json_schema_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/third_party/xgrammar/3rdparty/picojson)
 
 add_test(NAME ninfer_json_schema_oracle_test
   COMMAND ${CMAKE_COMMAND} -E env

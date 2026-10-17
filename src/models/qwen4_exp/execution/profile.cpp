@@ -102,7 +102,8 @@ std::shared_ptr<const ModelProfile> describe(const Source& source) {
     }
     if (w.vision)
         out->vision =
-            qwen::describe_vision(*w.vision, [&](WeightId id) { return source.input(id); });
+            qwen::describe_vision(*w.vision, [&](WeightId id) { return source.input(id); },
+                                  source.options().host_pinned_vision_weights);
     for (const auto& b : source.expert_banks())
         out->banks.push_back({b.gate_up.layout, b.down.layout, true});
     for (const auto& layer : out->text.layers) out->banks[layer.moe.bank.index].resident = false;

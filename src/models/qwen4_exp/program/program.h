@@ -86,6 +86,7 @@ struct ContextDemotion {
     std::size_t host_bytes = 0;
     ContextResources released;
     std::shared_ptr<const detail::Demotion> impl;
+    std::uint32_t host_state_slots = 0;
 };
 
 struct ContextRelease {
@@ -224,6 +225,7 @@ struct CapturePreparation {
     bool reserved          = false;
     ContextResources shortage;
     std::size_t host_bytes = 0;
+    std::uint32_t host_state_slots = 0;
 };
 enum class ContextOperationKind : std::uint8_t { Bind, Capture, Demote, Pause };
 
@@ -276,6 +278,8 @@ public:
     [[nodiscard]] bool release_checkpoint(CheckpointHandle) noexcept;
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
     [[nodiscard]] ContextResources snapshot_resources(const ResumeState&) const;
+    [[nodiscard]] ContextResources host_resources_released(std::span<const CheckpointHandle>) const;
+    [[nodiscard]] std::optional<ContextResources> pause_host_resources(SequenceHandle) const;
     [[nodiscard]] std::size_t host_bytes_released(std::span<const CheckpointHandle>) const;
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle) const;
     [[nodiscard]] std::size_t release_redundant_host(std::span<const CheckpointHandle>,

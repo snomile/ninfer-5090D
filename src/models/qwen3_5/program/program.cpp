@@ -187,11 +187,20 @@ ContextResources Program::snapshot_resources(const ResumeState& paused) const {
 }
 
 std::size_t Program::host_bytes_released(std::span<const CheckpointHandle> checkpoints) const {
-    return impl_->host_bytes_released(checkpoints);
+    return host_resources_released(checkpoints).host_bytes;
 }
 
 std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle sequence) const {
-    return impl_->pause_host_bytes(sequence);
+    const auto resources = pause_host_resources(sequence);
+    return resources ? std::optional<std::size_t>(resources->host_bytes) : std::nullopt;
+}
+
+ContextResources Program::host_resources_released(std::span<const CheckpointHandle> points) const {
+    return impl_->host_resources_released(points);
+}
+
+std::optional<ContextResources> Program::pause_host_resources(SequenceHandle sequence) const {
+    return impl_->pause_host_resources(sequence);
 }
 
 std::size_t Program::release_redundant_host(std::span<const CheckpointHandle> excluded,

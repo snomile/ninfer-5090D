@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/program/internal.h"
+#include "models/qwen4_exp/program/release_resources.h"
 
 #include <algorithm>
 #include <unordered_set>
@@ -62,8 +63,10 @@ ContextResources ProgramImpl::footprint(std::span<const CheckpointHandle> input,
             (references != states.checkpoint_references(image) || states.source_pins(image)))
             continue;
         out.state_slots += states.device_resident(image);
-        if (states.host_resident(image))
+        if (states.host_resident(image)) {
             out.host_bytes += resources.states->storage().image_bytes();
+            ++out.host_state_slots;
+        }
     }
     for (std::uint16_t pool = 0; pool < resources.pool_count(); ++pool) {
         const auto& storage = resources.pool(pool);
@@ -149,8 +152,10 @@ ContextDemotion ProgramImpl::describe_demotion(std::shared_ptr<const Demotion> p
     out.sources              = plan->records;
     out.released.state_slots = plan->images.size();
     for (const auto image : plan->images)
-        if (!resources.state_store->host_resident(image))
+        if (!resources.state_store->host_resident(image)) {
             out.host_bytes += resources.states->storage().image_bytes();
+            ++out.host_state_slots;
+        }
     for (std::uint16_t pool = 0; pool < resources.pool_count(); ++pool) {
         out.released.kv_page_groups[pool] = plan->pages[pool].size();
         for (const auto page : plan->pages[pool])
@@ -216,6 +221,12 @@ std::size_t Program::host_bytes_released(std::span<const CheckpointHandle> h) co
     return impl_->host_released(h);
 }
 
+ContextResources Program::host_resources_released(std::span<const CheckpointHandle> h) const {
+    for (auto handle : h)
+        if (!impl_->checkpoints.erasable(handle)) return {};
+    return impl_->footprint(h, true);
+}
+
 std::uint64_t Program::checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
                                                 std::span<const CheckpointHandle> kept) const {
     return impl_->recovery_loss(removed, kept);
@@ -245,10 +256,11 @@ std::vector<ContextRelease> Program::plan_releases(std::span<const CheckpointHan
             std::any_of(out.begin(), out.end(), [&](const auto& a) { return a.sources == owners; }))
             return;
         auto released = p.footprint(owners, true);
-        if (released.useful(shortage)) out.push_back({std::move(owners), released});
+        if (detail::release_resources_useful(released, shortage))
+            out.push_back({std::move(owners), released});
     };
     for (const auto h : records) add({h});
-    if (shortage.state_slots || shortage.host_bytes) {
+    if (shortage.state_slots || shortage.host_bytes || shortage.host_state_slots) {
         for (const auto image : p.checkpoint_images(records)) {
             std::vector<CheckpointHandle> owners;
             for (auto h : records)
@@ -357,7 +369,9 @@ std::optional<ContextDemotion> ContextDemotionBatch::finish() const {
 bool Program::start_demote(const ContextDemotion& quote) {
     auto& p = *impl_;
     if (p.operation || p.pending_transaction || !quote.impl || quote.impl->owner != &p ||
-        !p.resources.host_context || quote.host_bytes > p.resources.host_context->free_bytes())
+        !p.resources.host_context || quote.host_bytes > p.resources.host_context->free_bytes() ||
+        quote.host_state_slots >
+            p.resources.state_store->host_capacity() - p.resources.state_store->host_occupied())
         return false;
     p.operation = std::make_unique<detail::ContextOperation>(p.resources,
                                                              detail::DemoteOperation{quote.impl});

@@ -12,6 +12,7 @@ target_link_libraries(ninfer_runtime_support PUBLIC ninfer_core PRIVATE ninfer::
 add_library(ninfer_engine STATIC
   engine/model_construction.cpp
   contract/sampling.cpp
+  engine/generation_handle.cpp
   engine/engine.cpp
 )
 ninfer_internal_includes(ninfer_engine)

@@ -5,15 +5,12 @@
 
 #include <spdlog/logger.h>
 
-#include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <filesystem>
-#include <iomanip>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -51,21 +48,6 @@ std::filesystem::path normalized_absolute_path(const std::string& value) {
     error.clear();
     path = std::filesystem::absolute(value, error);
     return error ? std::filesystem::path(value).lexically_normal() : path.lexically_normal();
-}
-
-std::string cuda_version_string(int version) {
-    if (version <= 0) { return {}; }
-    return std::to_string(version / 1000) + '.' + std::to_string((version % 1000) / 10);
-}
-
-std::string cuda_uuid_string(const cudaUUID_t& uuid) {
-    std::ostringstream out;
-    out << "GPU-" << std::hex << std::setfill('0');
-    for (int i = 0; i < 16; ++i) {
-        if (i == 4 || i == 6 || i == 8 || i == 10) { out << '-'; }
-        out << std::setw(2) << static_cast<unsigned int>(static_cast<unsigned char>(uuid.bytes[i]));
-    }
-    return out.str();
 }
 
 const char* finish_reason_name(ninfer::FinishReason reason) {
@@ -314,7 +296,10 @@ Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySumm
                 {"handoff_offset_bytes", vision->handoff_offset_bytes},
                 {"handoff_capacity_bytes", vision->handoff_capacity_bytes},
                 {"handoff_active_bytes", vision->handoff_active_bytes},
-                {"handoff_peak_bytes", vision->handoff_peak_bytes}};
+                {"handoff_peak_bytes", vision->handoff_peak_bytes},
+                {"weight_staging_offset_bytes", vision->weight_staging_offset_bytes},
+                {"weight_staging_slot_bytes", vision->weight_staging_slot_bytes},
+                {"weight_staging_capacity_bytes", vision->weight_staging_capacity_bytes}};
 }
 
 Json moe_memory_json(const std::optional<ninfer::MoeMemorySummary>& moe) {
@@ -483,6 +468,9 @@ ninfer::RuntimeHostWorkStats host_work_delta(const ninfer::RuntimeHostWorkStats&
         .prefill_host_ns = monotonic_delta(previous.prefill_host_ns, current.prefill_host_ns),
         .prefill_device_wait_ns =
             monotonic_delta(previous.prefill_device_wait_ns, current.prefill_device_wait_ns),
+        .replay_host_ns = monotonic_delta(previous.replay_host_ns, current.replay_host_ns),
+        .replay_device_wait_ns =
+            monotonic_delta(previous.replay_device_wait_ns, current.replay_device_wait_ns),
         .control_host_ns = monotonic_delta(previous.control_host_ns, current.control_host_ns),
         .control_device_wait_ns =
             monotonic_delta(previous.control_device_wait_ns, current.control_device_wait_ns),
@@ -550,13 +538,17 @@ std::string format_server_start_json(
                                                           {"peak_staging_bytes", load.peak_staging_bytes},
                                                           {"device_object_count", load.device_object_count},
                                                           {"host_object_count", load.host_object_count},
+                                                          {"mapped_host_bytes", load.mapped_host_bytes},
+                                                          {"pinned_host_bytes", load.pinned_host_bytes},
+                                                          {"mapped_host_object_count", load.mapped_host_object_count},
+                                                          {"pinned_host_object_count", load.pinned_host_object_count},
                                                           {"load_seconds", load.load_seconds},
                                                           {"upload_seconds", load.upload_seconds}};
     const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
     const ninfer::ContextCostSummary& context_cost = load.context_cost;
     const std::uint64_t total_device_state_slots =
         static_cast<std::uint64_t>(engine_options.max_concurrency) +
-        cache.device_state_slots.value();
+        (engine_options.host_state_images ? 0U : cache.device_state_slots.value());
     record["engine"] =
         Json{{"device", engine_options.device},
              {"max_context", engine_options.max_context},
@@ -571,6 +563,11 @@ std::string format_server_start_json(
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
              {"vision", engine_options.enable_vision},
+             {"max_vision_item_tokens", engine_options.max_vision_item_tokens},
+             {"host_mapped_embedding", engine_options.host_mapped_embedding},
+             {"host_mapped_dflash2_codebooks", engine_options.host_mapped_dflash2_codebooks},
+             {"host_pinned_vision_weights", engine_options.host_pinned_vision_weights},
+             {"host_state_images", engine_options.host_state_images},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"prefix_reuse", options.allow_prefix_reuse},
              {"speculative_backend",
@@ -587,6 +584,8 @@ std::string format_server_start_json(
              {"context_cache", Json{{"enabled", cache.enabled},
                                     {"device_state_slots", cache.device_state_slots.value()},
                                     {"total_device_state_slots", total_device_state_slots},
+                                    {"extra_state_placement",
+                                     engine_options.host_state_images ? "host" : "device"},
                                     {"host_capacity_bytes", cache.host_capacity_bytes.value()}}}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
@@ -783,6 +782,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"decode_device_wait", nanoseconds_to_seconds(host.decode_device_wait_ns)},
                  {"prefill_host", nanoseconds_to_seconds(host.prefill_host_ns)},
                  {"prefill_device_wait", nanoseconds_to_seconds(host.prefill_device_wait_ns)},
+                 {"replay_host", nanoseconds_to_seconds(host.replay_host_ns)},
+                 {"replay_device_wait", nanoseconds_to_seconds(host.replay_device_wait_ns)},
                  {"control_host", nanoseconds_to_seconds(host.control_host_ns)},
                  {"control_device_wait", nanoseconds_to_seconds(host.control_device_wait_ns)}}},
            {"detail_subset_seconds",
@@ -849,30 +850,6 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
     return record.dump();
 }
 
-ServerLogEnvironment query_server_log_environment(int device) {
-    ServerLogEnvironment environment;
-    environment.device               = device;
-    environment.cuda_compile_version = cuda_version_string(CUDART_VERSION);
-
-    int runtime_version = 0;
-    if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess) {
-        environment.cuda_runtime_version = cuda_version_string(runtime_version);
-    }
-    int driver_version = 0;
-    if (cudaDriverGetVersion(&driver_version) == cudaSuccess) {
-        environment.cuda_driver_version = cuda_version_string(driver_version);
-    }
-    cudaDeviceProp properties{};
-    if (cudaGetDeviceProperties(&properties, device) == cudaSuccess) {
-        environment.gpu_name                  = properties.name;
-        environment.gpu_uuid                  = cuda_uuid_string(properties.uuid);
-        environment.total_device_memory_bytes = properties.totalGlobalMem;
-        environment.compute_capability_major  = properties.major;
-        environment.compute_capability_minor  = properties.minor;
-    }
-    return environment;
-}
-
 JsonlRequestLog::JsonlRequestLog(const std::string& path,
                                  const std::string& protected_artifact_path,
                                  std::shared_ptr<spdlog::logger> logger)
@@ -894,7 +871,8 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
                                          const ninfer::ModelSamplingDefaults& sampling_defaults,
                                          const std::string& public_model_id,
                                          const ninfer::LoadSummary& load,
-                                         const ninfer::MemorySummary& memory) {
+                                         const ninfer::MemorySummary& memory,
+                                         const ServerLogEnvironment& environment) {
     if (!enabled()) { return; }
     std::error_code error;
     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, error);
@@ -902,7 +880,7 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
         error ? std::nullopt : std::optional<std::uint64_t>(size);
     append(format_server_start_json(server_instance_id_, unix_time_ms(), options, engine_options,
                                     sampling_defaults, public_model_id, load, memory,
-                                    query_server_log_environment(options.device), artifact_size));
+                                    environment, artifact_size));
 }
 
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {

@@ -37,11 +37,13 @@ std::span<const moe::BankDescription> LoadPlan::expert_banks() const { return im
 
 ops::WeightInput LoadPlan::input(WeightId id) const {
     const auto& uses = impl_->pending.at(id.index).uses;
+    if (uses.empty()) return {impl_->views.at(id.index), ops::LinearPolicy::A16Only, {}};
     if (uses.size() != 1) throw artifact::ArtifactError("weight input requires one Use");
     return {impl_->views.at(id.index), uses[0].policy, uses[0].activation_input_divisor};
 }
 
 LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
+    validate_memory_options(options);
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->reader  = &reader;
     out->options = options;
@@ -112,10 +114,19 @@ Placement placement(const Data& data, Device device) {
     }
     std::vector<artifact::PlacementRequest> requests;
     for (std::size_t i = 0; i < data.pending.size(); ++i)
-        for (const auto& part : data.pending[i].reference.binding.parts)
-            requests.push_back({part.object, out.weights[i],
-                                out.weights[i] == Device::cpu() ? artifact::HostAccess::CudaTransfer
-                                                                : artifact::HostAccess::CpuOnly});
+        for (const auto& part : data.pending[i].reference.binding.parts) {
+            auto access = out.weights[i] == Device::cpu() ? artifact::HostAccess::CudaTransfer
+                                                          : artifact::HostAccess::CpuOnly;
+            if (data.options.host_pinned_vision_weights &&
+                data.pending[i].reference.name.starts_with("vision/")) {
+                out.weights[i] = Device::cpu();
+                access = artifact::HostAccess::CudaTransfer;
+            }
+            if (data.options.host_mapped_embedding && i == data.weights.text.embedding.index)
+                access = artifact::HostAccess::CudaMapped;
+            requests.push_back({part.object, access == artifact::HostAccess::CudaMapped
+                                                ? Device::cpu() : out.weights[i], access});
+        }
     out.storage = artifact::plan_materialization(*data.reader, requests);
     return out;
 }

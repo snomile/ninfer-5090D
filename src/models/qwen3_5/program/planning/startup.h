@@ -67,6 +67,7 @@ struct SequencePlanningInputs {
     std::shared_ptr<const execution::ModelProfile> profile;
     std::shared_ptr<const moe::Plan> moe;
     std::uint32_t capacity                 = 0;
+    std::uint32_t max_vision_item_tokens    = 16'384;
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
@@ -76,6 +77,7 @@ struct SequencePlanningInputs {
     models::LoadOptions features;
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
+    bool host_state_images            = false;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
 };
@@ -84,6 +86,7 @@ struct SequencePlanImpl {
     std::shared_ptr<const execution::ModelProfile> profile;
     std::shared_ptr<const moe::Plan> moe;
     std::uint32_t capacity                 = 0;
+    std::uint32_t max_vision_item_tokens    = 16'384;
     std::uint32_t kv_capacity              = 0;
     std::uint32_t main_page_groups         = 0;
     std::uint32_t max_concurrency          = 1;
@@ -95,6 +98,7 @@ struct SequencePlanImpl {
     models::LoadOptions features;
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
+    bool host_state_images            = false;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
     PersistentLayout persistent;

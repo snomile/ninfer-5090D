@@ -127,7 +127,8 @@ struct ContextCacheOptions {
     // Controls cross-request history reads and writes. Request pause/replay resources remain
     // available when history is disabled.
     bool enabled = true;
-    // Extra Device StateImage slots beyond max_concurrency. Defaults to max_concurrency.
+    // Extra Device StateImage slots beyond max_concurrency. With host_state_images these
+    // bound Host snapshots instead. Defaults to max_concurrency.
     std::optional<std::uint32_t> device_state_slots;
     // Shared Host quota for StateImages, KV, pause snapshots and in-flight destinations. Native
     // startup defaults to 8 GiB plus eight Host StateImages using the model's actual layout.
@@ -173,6 +174,11 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    std::uint32_t max_vision_item_tokens    = 16'384;
+    bool host_mapped_embedding             = false;
+    bool host_mapped_dflash2_codebooks      = false;
+    bool host_pinned_vision_weights        = false;
+    bool host_state_images                 = false;
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
@@ -954,6 +960,9 @@ struct VisionWorkspaceMemorySummary {
     std::size_t handoff_capacity_bytes    = 0;
     std::size_t handoff_active_bytes      = 0;
     std::size_t handoff_peak_bytes        = 0;
+    std::size_t weight_staging_offset_bytes = 0;
+    std::size_t weight_staging_slot_bytes = 0;
+    std::size_t weight_staging_capacity_bytes = 0;
 };
 
 struct MoeMemorySummary {
@@ -1038,6 +1047,8 @@ struct RuntimeHostWorkStats {
     std::uint64_t decode_device_wait_ns  = 0;
     std::uint64_t prefill_host_ns        = 0;
     std::uint64_t prefill_device_wait_ns = 0;
+    std::uint64_t replay_host_ns         = 0;
+    std::uint64_t replay_device_wait_ns  = 0;
     std::uint64_t control_host_ns        = 0;
     std::uint64_t control_device_wait_ns = 0;
     std::uint64_t prefill_units          = 0;
@@ -1149,6 +1160,11 @@ struct LoadSummary {
     std::uint64_t peak_staging_bytes   = 0;
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;
+    // Encoded payload bytes; disjoint subsets of registered Host weight backing.
+    std::uint64_t mapped_host_bytes = 0;
+    std::uint64_t pinned_host_bytes = 0;
+    std::size_t mapped_host_object_count = 0;
+    std::size_t pinned_host_object_count = 0;
     ContextCostSummary context_cost;
 };
 

@@ -96,6 +96,8 @@ PhysicalUsageSnapshot ProgramImpl::usage() const noexcept {
         out.capacity.kv_page_groups[i] = pool.capacity_pages();
     }
     out.host_state_slots = r.state_store->host_occupied();
+    out.occupied.host_state_slots = out.host_state_slots;
+    out.capacity.host_state_slots = r.state_store->host_capacity();
     if (r.host_context) {
         out.occupied.host_bytes      = r.host_context->occupied_bytes();
         out.capacity.host_bytes      = r.host_context->capacity_bytes();
@@ -197,7 +199,10 @@ MemorySummary Program::memory_summary() const {
             .handoff_offset_bytes   = vision.handoff_offset_bytes,
             .handoff_capacity_bytes = vision.handoff_capacity_bytes,
             .handoff_active_bytes   = active_vision,
-            .handoff_peak_bytes     = p.vision_handoff_peak_bytes};
+            .handoff_peak_bytes     = p.vision_handoff_peak_bytes,
+            .weight_staging_offset_bytes = vision.weight_staging_offset_bytes,
+            .weight_staging_slot_bytes = vision.weight_staging_slot_bytes,
+            .weight_staging_capacity_bytes = vision.weight_staging_capacity_bytes};
     }
     out.workspace_logical_peak_bytes = out.workspace.peak_used_bytes;
     out.runtime_reservation_bytes    = plan.device_bytes();

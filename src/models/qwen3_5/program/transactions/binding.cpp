@@ -114,7 +114,8 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
             state_store->checkpoint_references(image) == 1 &&
             state_store->source_pins(image) == 0) {
             transaction.state_action = StateBindingAction::Move;
-        } else if (state_store->device_resident(image) && state_store->host_resident(image) &&
+        } else if (state_store->occupied() < state_store->capacity() &&
+                   state_store->device_resident(image) && state_store->host_resident(image) &&
                    state_store->source_pins(image) == 0 &&
                    state_store->device_occupied() == state_store->device_capacity()) {
             transaction.state_action = StateBindingAction::Split;
@@ -185,6 +186,29 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
             backend_kv_pages ? difference(backend.device_pages(),
                                           backend_kv_pages->physical_pool().available_pages())
                              : 0U}};
+    if (action != StateBindingAction::Move) {
+        auto occupied_images = state_store->occupied();
+        std::vector<StateImageHandle> retired_images;
+        for (auto point : candidate.retired_points) {
+            const auto image = checkpoint(point).continuation().image;
+            if (std::find(retired_images.begin(), retired_images.end(), image) != retired_images.end())
+                continue;
+            retired_images.push_back(image);
+            const auto references = static_cast<std::uint32_t>(std::count_if(
+                candidate.retired_points.begin(), candidate.retired_points.end(), [&](auto retired) {
+                    return checkpoint(retired).continuation().image == image;
+                }));
+            if (references == state_store->checkpoint_references(image) &&
+                state_store->can_release_after_checkpoint_references(image, references))
+                --occupied_images;
+        }
+        if (occupied_images == state_store->capacity()) {
+            if (state_store->device_occupied() == state_store->device_capacity())
+                shortage.state_slots = 1;
+            else
+                shortage.host_state_slots = 1;
+        }
+    }
     if (!candidate.retired_points.empty() &&
         (shortage.state_slots || shortage.kv_page_groups[kTextKvPool.index] ||
          shortage.kv_page_groups[kBackendKvPool.index])) {
@@ -197,7 +221,7 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
             difference(shortage.kv_page_groups[kBackendKvPool.index],
                        credit->kv_page_groups[kBackendKvPool.index]);
     }
-    if (shortage.state_slots || shortage.kv_page_groups[kTextKvPool.index] ||
+    if (shortage.state_slots || shortage.host_state_slots || shortage.kv_page_groups[kTextKvPool.index] ||
         shortage.kv_page_groups[kBackendKvPool.index])
         return {
             .capacity_possible =

@@ -26,6 +26,11 @@ struct MaterializationStats {
     std::uint64_t registered_host_bytes = 0; // Subset of host_capacity_bytes.
     std::size_t device_object_count     = 0;
     std::size_t host_object_count       = 0; // CPU tensors and retained resources.
+    // Payload bytes excluding alignment; mapped and transfer-only subsets are disjoint.
+    std::uint64_t mapped_host_bytes = 0;
+    std::uint64_t pinned_host_bytes = 0;
+    std::size_t mapped_host_object_count = 0;
+    std::size_t pinned_host_object_count = 0;
     // I/O, CPU copies and upload completion; excludes backing allocation and pinning.
     double upload_seconds            = 0;
     double host_registration_seconds = 0;
@@ -59,6 +64,7 @@ private:
         std::vector<float> weight_divisors;
         std::optional<WeightParent> device;
         std::optional<WeightParent> host;
+        bool mapped = false;
     };
 
     HostBuffer host_storage_;

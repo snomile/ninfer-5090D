@@ -11,7 +11,8 @@ PersistentLayout persistent(const execution::ModelProfile& p, const EngineOption
     LayoutBuilder b;
     PersistentLayout out;
     const auto slots =
-        std::uint64_t(o.max_concurrency) + o.context_cache.device_state_slots.value();
+        std::uint64_t(o.max_concurrency) +
+        (o.host_state_images ? 0U : o.context_cache.device_state_slots.value());
     if (slots > INT32_MAX) throw std::invalid_argument("StateImage slots exceed int32");
     out.state = plan_state_image(b, p.config, slots);
     out.main  = plan_qsa_cache(b, p.config.text.qsa, p.config.text.qsa_layers, o.max_context, pages,
@@ -93,6 +94,15 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
     out.ple_prepare_bytes  = ple::disk::PrepareService::memory_bytes(table, out.ple, 2);
     out.host_context_bytes = o.context_cache.host_capacity_bytes.value_or(
         8ULL * 1024 * 1024 * 1024 + 8 * out.persistent.state.images.image_stride);
+    const auto byte_slots = out.host_context_bytes / out.persistent.state.images.image_stride;
+    const auto host_slots = o.host_state_images
+                                ? std::min<std::uint64_t>(byte_slots, *o.context_cache.device_state_slots)
+                                : byte_slots;
+    if (host_slots > UINT32_MAX) throw std::overflow_error("Host StateImage slots exceed uint32");
+    out.host_state_slots = static_cast<std::uint32_t>(host_slots);
+    if (o.host_state_images && *o.context_cache.device_state_slots && out.host_context_bytes &&
+        !out.host_state_slots)
+        throw std::invalid_argument("Host context capacity cannot hold one StateImage");
     // Keep all per-call metadata in the pinned ingress as well as input IDs/positions.
     out.pinned_io_bytes = out.persistent.buffers.batch.accepted_columns.region.offset +
                           out.persistent.buffers.batch.accepted_columns.region.bytes -

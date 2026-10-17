@@ -67,7 +67,7 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const VisionCo
                                            std::size_t& handoff_peak_bytes)
     : device_(device), workspace_(workspace), workspace_plan_(workspace_plan), prompt_(prompt),
       plan_(plan), handoff_(handoff), handoff_peak_bytes_(handoff_peak_bytes),
-      context_(device.execution_view(), config, parameters) {
+      context_(device, config, parameters, handoff) {
     if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }

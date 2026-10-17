@@ -72,6 +72,14 @@ Program::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
         const auto& states = *p.resources.state_store;
         out.consume_source = consume && p.checkpoints[h->index].pins == 0 &&
                              states.checkpoint_references(image) == 1 && !states.source_pins(image);
+        if (!out.consume_source && states.device_resident(image) &&
+            !states.host_resident(image) && !states.source_pins(image) &&
+            p.checkpoints[h->index].pins == 0 &&
+            states.device_occupied() == states.device_capacity() &&
+            states.occupied() < states.capacity() && states.can_reserve_host())
+            out.transfers.push_back(context::state_transfer_requirement(
+                {p.resources.states->storage().image_bytes(), 1},
+                runtime::ContextTransferDirection::DeviceToHost));
         if (!states.device_resident(image))
             out.transfers.push_back(context::state_transfer_requirement(
                 {p.resources.states->storage().image_bytes(), 1},
@@ -126,8 +134,6 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
     const bool consume  = checkpoint && (own || candidate.consume_source) &&
                          p.checkpoints[source->index].pins == 0 &&
                          states.checkpoint_references(image) == 1 && !states.source_pins(image);
-    const bool split = checkpoint && !consume && resident && states.host_resident(image) &&
-                       !states.source_pins(image);
     const auto target = resume ? resume->frontier() : f;
     const auto requested_peak =
         resume ? std::uint64_t(target) +
@@ -158,10 +164,40 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
         for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool)
             retired_prefixes[pool].push_back(&checkpoint->snapshot.prefix(pool));
     const auto released = p.footprint(retired, true);
+    auto occupied_images = states.occupied();
+    std::vector<detail::Image> retired_images;
+    for (const auto point : retired) {
+        const auto retired_image = p.checkpoints.at(point).snapshot.continuation().image;
+        if (std::find(retired_images.begin(), retired_images.end(), retired_image) !=
+            retired_images.end()) continue;
+        retired_images.push_back(retired_image);
+        const auto references = static_cast<std::uint32_t>(std::count_if(
+            retired.begin(), retired.end(), [&](auto handle) {
+                return p.checkpoints.at(handle).snapshot.continuation().image == retired_image;
+            }));
+        if (references == states.checkpoint_references(retired_image) &&
+            states.can_release_after_checkpoint_references(retired_image, references))
+            --occupied_images;
+    }
+    const bool logical_destination = occupied_images < states.capacity();
+    const bool split = checkpoint && !consume && resident && logical_destination &&
+                       states.host_resident(image) && !states.source_pins(image);
+    const bool backup_split =
+        checkpoint && !consume && resident && logical_destination &&
+        !states.host_resident(image) && !states.source_pins(image) &&
+        p.checkpoints[source->index].pins == 0 &&
+        states.device_occupied() - released.state_slots == states.device_capacity() &&
+        states.can_reserve_host();
     BindingReservation result;
-    if ((!resident || (!consume && !split)) &&
+    if ((!resident || (!consume && !split && !backup_split)) &&
         states.device_occupied() - released.state_slots == states.device_capacity())
         result.shortage.state_slots = 1;
+    if (!consume && !logical_destination) {
+        if (states.device_occupied() - released.state_slots == states.device_capacity())
+            result.shortage.state_slots = 1;
+        else
+            result.shortage.host_state_slots = 1;
+    }
     result.capacity_possible = true;
     for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool) {
         const auto& storage = p.resources.pool(pool);
@@ -176,7 +212,8 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
         result.capacity_possible &=
             (end + 63) / 64 + demand.tail_copies <= p.pools[pool].device_page_groups;
     }
-    if (result.shortage.state_slots || result.shortage.first_kv_deficit()) return result;
+    if (result.shortage.state_slots || result.shortage.host_state_slots ||
+        result.shortage.first_kv_deficit()) return result;
 
     detail::BindOperation action;
     action.lane           = lane.value;
@@ -193,6 +230,7 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
                             : !resident ? StateAction::Restore
                             : consume   ? StateAction::Move
                             : split     ? StateAction::Split
+                            : backup_split ? StateAction::BackupSplit
                                         : StateAction::Fork;
     p.operation     = std::make_unique<detail::ContextOperation>(p.resources, std::move(action));
     auto& tx        = std::get<detail::BindOperation>(p.operation->action);
@@ -236,6 +274,10 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
             else if (tx.state_action == StateAction::Restore) {
                 auto transfer = states.reserve_host_to_device(image, *destination);
                 if (!transfer) throw std::logic_error("binding lost its Host state source");
+                migration.add_state_copy(std::move(*transfer), true);
+            } else if (tx.state_action == StateAction::BackupSplit) {
+                auto transfer = states.reserve_device_to_host(image);
+                if (!transfer) throw std::logic_error("binding lost its Host backup reservation");
                 migration.add_state_copy(std::move(*transfer), true);
             }
         }
@@ -326,7 +368,8 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation
                     s.write_destination = destination.release();
                     ++result.operations.state_forks;
                 } else {
-                    if (tx->state_action == StateAction::Split) {
+                    if (tx->state_action == StateAction::Split ||
+                        tx->state_action == StateAction::BackupSplit) {
                         states.split_device_replica_identity(tx->source_image, destination.image());
                         ++result.operations.state_moves;
                     }

@@ -37,6 +37,8 @@ ops::WeightInput LoadPlan::input(WeightUseId id) const {
 }
 
 ops::WeightInput LoadPlan::input(WeightId id) const {
+    if (impl_->pending.at(id.index).uses.empty())
+        return {impl_->geometry_views.at(id.index), ops::LinearPolicy::A16Only, {}};
     if (impl_->pending.at(id.index).uses.size() != 1) {
         throw artifact::ArtifactError("weight description requires an explicit Use");
     }
@@ -58,6 +60,7 @@ std::span<const WeightUse> LoadPlan::uses(WeightId id) const {
 }
 
 LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
+    validate_memory_options(options);
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->reader  = &reader;
     out->options = options;
@@ -161,12 +164,29 @@ Placement describe_placement(const Data& data, Device cuda, Device expert_device
     };
     for (const auto& layer : data.weights.text.layers) place(layer);
     if (data.weights.mtp) place(data.weights.mtp->layer);
+    std::vector<artifact::HostAccess> access(data.pending.size(), artifact::HostAccess::CpuOnly);
+    if (data.options.host_mapped_embedding)
+        access[data.weights.text.token_embedding.index] = artifact::HostAccess::CudaMapped;
+    if (data.options.host_mapped_dflash2_codebooks) {
+        const auto& selector = *data.weights.draft->selector;
+        access[selector.predecessor_codebook.index] = artifact::HostAccess::CudaMapped;
+        access[selector.successor_codebook.index] = artifact::HostAccess::CudaMapped;
+    }
+    if (data.options.host_pinned_vision_weights)
+        for (std::size_t i = 0; i < data.pending.size(); ++i)
+            if (data.pending[i].reference.name.starts_with("vision/")) {
+                out.weights[i] = Device::cpu();
+                access[i] = artifact::HostAccess::CudaTransfer;
+            }
     std::vector<artifact::PlacementRequest> requests;
     for (std::size_t i = 0; i < data.pending.size(); ++i) {
         for (const auto& part : data.pending[i].reference.binding.parts) {
-            requests.push_back({part.object, out.weights[i],
-                                out.weights[i] == Device::cpu() ? artifact::HostAccess::CudaTransfer
-                                                                : artifact::HostAccess::CpuOnly});
+            const auto mode = access[i] == artifact::HostAccess::CpuOnly &&
+                                      out.weights[i] == Device::cpu()
+                                  ? artifact::HostAccess::CudaTransfer : access[i];
+            requests.push_back({part.object,
+                                mode == artifact::HostAccess::CudaMapped ? Device::cpu()
+                                                                         : out.weights[i], mode});
         }
     }
     out.storage = artifact::plan_materialization(*data.reader, requests);

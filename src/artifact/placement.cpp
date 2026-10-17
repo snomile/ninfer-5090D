@@ -35,16 +35,18 @@ MaterializationPlan plan_materialization(const Reader& reader,
     out.source       = &reader;
     out.object_count = reader.directory().objects.size();
     out.resources    = std::move(resources);
-    std::vector<bool> host(out.object_count), registered(out.object_count),
+    std::vector<bool> host(out.object_count), registered(out.object_count), mapped(out.object_count),
         device(out.object_count);
     bool has_device = false;
     for (const auto& request : requests) {
         (void)reader.geometry(request.object);
         if (request.device.type() == DeviceType::CPU) {
             host.at(request.object.index) = true;
-            if (request.host_access == HostAccess::CudaTransfer) {
+            if (request.host_access != HostAccess::CpuOnly) {
                 registered.at(request.object.index) = true;
             }
+            if (request.host_access == HostAccess::CudaMapped)
+                mapped.at(request.object.index) = true;
         } else {
             if (request.device.type() != DeviceType::CUDA ||
                 (has_device && request.device != out.device) ||
@@ -60,13 +62,15 @@ MaterializationPlan plan_materialization(const Reader& reader,
     for (std::size_t i = 0; i < out.object_count; ++i) {
         if (!host[i] && !device[i]) { continue; }
         const ObjectHandle handle{i};
+        if (mapped[i] && device[i])
+            throw ArtifactError("mapped Host parent conflicts with Device placement");
         const auto& g    = reader.geometry(handle);
         const auto& name = reader.directory().tensor(handle).id;
         if (host[i]) {
             auto& layout = registered[i] ? registered_layout : host_layout;
             auto& placements =
                 registered[i] ? out.registered_host_objects : out.ordinary_host_objects;
-            placements.push_back({handle, plan_host_tensor_region(layout, reader, handle)});
+            placements.push_back({handle, plan_host_tensor_region(layout, reader, handle), mapped[i]});
             out.host_alignment =
                 std::max({out.host_alignment, static_cast<std::size_t>(g.alignment),
                           static_cast<std::size_t>(kPayloadAlignment)});

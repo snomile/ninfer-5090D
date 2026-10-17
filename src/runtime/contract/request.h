@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 
 namespace ninfer::runtime {
 
@@ -39,6 +40,12 @@ struct OutputDecision {
     std::optional<std::uint32_t> prefix_execution_split_after;
 
     [[nodiscard]] bool finished() const noexcept { return finish_reason != FinishReason::None; }
+};
+
+// Frontend rejected target-owned output before Program mutation; only this request may be aborted.
+class OutputControlError final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
 };
 
 // Non-owning cancellation observation used while the worker advances a context transaction. The

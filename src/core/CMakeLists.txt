@@ -5,6 +5,7 @@ endif()
 
 add_library(ninfer_cpu STATIC
   cpu/system.cpp
+  cpu/workers.cpp
   cpu/task_pool.cpp
   cpu/executor.cpp
 )
@@ -19,6 +20,7 @@ add_library(ninfer_core STATIC
   transfer.cpp
   transfer.cu
   device.cu
+  device_memory.cpp
   dtype.cpp
   nf4.cpp
   io/file.cpp

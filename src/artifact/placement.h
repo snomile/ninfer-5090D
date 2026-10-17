@@ -29,7 +29,7 @@ struct PreparedResources {
     std::uint64_t owned_value_bytes = 0;
 };
 
-enum class HostAccess { CpuOnly, CudaTransfer };
+enum class HostAccess { CpuOnly, CudaTransfer, CudaMapped };
 
 struct PlacementRequest {
     ObjectHandle object;
@@ -40,6 +40,7 @@ struct PlacementRequest {
 struct TensorPlacement {
     ObjectHandle object;
     LayoutRegion region;
+    bool mapped = false;
 };
 
 struct MaterializationPlan {

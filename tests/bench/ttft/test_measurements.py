@@ -364,6 +364,40 @@ def test_missing_runtime_fields_remain_explicit(tmp_path):
     assert summary["stream_observations"][0]["preemptions"] is None
 
 
+def test_global_work_classes_preserve_replay_and_control_interval_deltas(tmp_path):
+    fields = ("decode_host", "decode_device_wait", "prefill_host",
+              "prefill_device_wait", "replay_host", "replay_device_wait",
+              "control_host", "control_device_wait")
+    events = [runtime_interval(final=False), runtime_interval(final=True)]
+    for multiplier, event in enumerate(events, start=1):
+        event["host_work"]["work_class_seconds"] = {
+            field: multiplier * (index + 1) * 0.001
+            for index, field in enumerate(fields)
+        }
+    summary = summarize_campaign(logged_campaign(tmp_path, [], events))
+    global_work = summary["global_runtime_observations"][0]
+    assert global_work["status"] == "available"
+    assert global_work["shutdown_tail"] == "observed"
+    classes = global_work["host_work"]["work_class_seconds"]
+    assert set(classes) == set(fields)
+    for index, field in enumerate(fields):
+        assert classes[field] == pytest.approx(3 * (index + 1) * 0.001)
+    assert global_work["host_work"]["elapsed_seconds"]["total"] == 0
+
+
+@pytest.mark.parametrize("invalid", [None, -0.001, float("nan"), float("inf"), True, "0.1"])
+def test_invalid_replay_interval_does_not_fabricate_a_sum(tmp_path, invalid):
+    first, tail = runtime_interval(final=False), runtime_interval(final=True)
+    first["host_work"]["work_class_seconds"] = {"replay_host": 0.1, "replay_device_wait": 0.2}
+    tail["host_work"]["work_class_seconds"] = {"replay_host": invalid, "replay_device_wait": 0.3}
+    summary = summarize_campaign(logged_campaign(tmp_path, [], [first, tail]))
+    classes = summary["global_runtime_observations"][0]["host_work"]["work_class_seconds"]
+    assert classes["replay_host"] is None
+    assert classes["replay_device_wait"] == pytest.approx(0.5)
+    assert classes["control_host"] is None
+    assert classes["control_device_wait"] is None
+
+
 def test_unsupported_runtime_schema_is_unavailable(tmp_path):
     summary = summarize_campaign(logged_campaign(tmp_path, [], [runtime_interval(schema=26)]))
     assert summary["global_runtime_observations"][0]["reason"] == "unsupported_runtime_schema"

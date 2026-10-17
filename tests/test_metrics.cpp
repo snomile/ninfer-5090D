@@ -1,6 +1,11 @@
 #include "serve/metrics.h"
 
+#include <cmath>
+#include <cstdint>
 #include <iostream>
+#include <locale>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -8,8 +13,107 @@
 using namespace ninfer;
 using namespace ninfer::serve;
 
+namespace {
+
+double sample(const std::string& text, const std::string& name) {
+    std::istringstream lines(text);
+    lines.imbue(std::locale::classic());
+    std::string key;
+    std::string line;
+    while (std::getline(lines, line)) {
+        std::istringstream fields(line);
+        fields.imbue(std::locale::classic());
+        double value = 0;
+        if (fields >> key >> value && key == name) { return value; }
+    }
+    throw std::runtime_error("missing metric sample: " + name);
+}
+
+int test_active_seconds() {
+    RuntimeStats baseline;
+    baseline.host_work = {.engine_boundary_ns      = 1'000'000'000,
+                          .program_submit_ns       = 2'000'000'000,
+                          .program_post_ns         = 3'000'000'000,
+                          .engine_commit_output_ns = 4'000'000'000,
+                          .engine_maintenance_ns   = 5'000'000'000,
+                          .device_wait_ns          = 6'000'000'000,
+                          .decode_host_ns          = 7'000'000'000,
+                          .decode_device_wait_ns   = 8'000'000'000,
+                          .prefill_host_ns         = 9'000'000'000,
+                          .prefill_device_wait_ns  = 10'000'000'000,
+                          .replay_host_ns          = 11'000'000'000,
+                          .replay_device_wait_ns   = 12'000'000'000,
+                          .control_host_ns         = 13'000'000'000,
+                          .control_device_wait_ns  = 14'000'000'000};
+    EngineOptions options;
+    options.context_cache.device_state_slots = 1;
+    Metrics metrics;
+    metrics.configure("active-seconds", options, {}, baseline);
+    struct Scenario {
+        const char* name;
+        std::uint64_t RuntimeHostWorkStats::* field;
+        double prefill;
+        double decode;
+    };
+    const Scenario scenarios[] = {
+        {"prefill host", &RuntimeHostWorkStats::prefill_host_ns, 1, 0},
+        {"prefill wait", &RuntimeHostWorkStats::prefill_device_wait_ns, 1, 0},
+        {"decode host", &RuntimeHostWorkStats::decode_host_ns, 0, 1},
+        {"decode wait", &RuntimeHostWorkStats::decode_device_wait_ns, 0, 1},
+        {"control host", &RuntimeHostWorkStats::control_host_ns, 1, 1},
+        {"control wait", &RuntimeHostWorkStats::control_device_wait_ns, 1, 1},
+        {"replay host", &RuntimeHostWorkStats::replay_host_ns, 0, 0},
+        {"replay wait", &RuntimeHostWorkStats::replay_device_wait_ns, 0, 0},
+        {"engine boundary", &RuntimeHostWorkStats::engine_boundary_ns, 0, 0},
+        {"device wait aggregate", &RuntimeHostWorkStats::device_wait_ns, 0, 0},
+    };
+    int failures = 0;
+    const auto expect = [&](const RuntimeStats& stats, double prefill, double decode,
+                            const char* name) {
+        const auto text = metrics.render(stats, true);
+        if (std::abs(sample(text, "ninfer_prefill_active_seconds_total") - prefill) > 1e-12 ||
+            std::abs(sample(text, "ninfer_decode_active_seconds_total") - decode) > 1e-12) {
+            std::cerr << "active seconds mismatch: " << name << '\n';
+            ++failures;
+        }
+        if (metrics.render(stats, true) != text) {
+            std::cerr << "active seconds scrape consumed counters: " << name << '\n';
+            ++failures;
+        }
+    };
+    expect(baseline, 0, 0, "warmup only");
+    auto combined = baseline;
+    for (const auto& scenario : scenarios) {
+        auto current = baseline;
+        current.host_work.*scenario.field += 1'000'000'000;
+        combined.host_work.*scenario.field += 1'000'000'000;
+        expect(current, scenario.prefill, scenario.decode, scenario.name);
+    }
+    expect(combined, 4, 4, "all work classes");
+    options.max_concurrency = 3;
+    options.context_cache.device_state_slots = 7;
+    RuntimeStats occupied;
+    occupied.device_state_occupied_slots = 2;
+    occupied.host_state_occupied_slots = 5;
+    for (bool host_images : {false, true}) {
+        options.host_state_images = host_images;
+        Metrics capacity;
+        capacity.configure("state-capacity", options, {}, {});
+        const auto text = capacity.render(occupied, true);
+        if (sample(text, "ninfer_device_state_capacity_slots") != (host_images ? 3 : 10) ||
+            sample(text, "ninfer_device_state_used_slots") != 2 ||
+            sample(text, "ninfer_host_state_images") != 5) {
+            std::cerr << "state capacity does not distinguish Host images from Device slots\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+} // namespace
+
 int main() {
-    int failures     = 0;
+    int failures     = test_active_seconds();
     const auto check = [&](bool pass, const char* message) {
         if (!pass) {
             std::cerr << message << '\n';

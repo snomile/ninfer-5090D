@@ -145,7 +145,12 @@ std::string serve_usage_text(const char* argv0) {
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
-           "       --vision enables media and loads the fixed Vision GPU allocations\n"
+           "       --vision enables media\n"
+           "       --max-vision-item-tokens N (1..16384; default 16384)\n"
+           "       --host-mapped-embedding maps input embeddings on Host\n"
+           "       --host-mapped-dflash2-codebooks requires --spec dflash2\n"
+           "       --host-pinned-vision-weights requires --vision\n"
+           "       --host-state-images uses --device-state-slots as the Host snapshot bound\n"
            "       --prefill-chunk requires a positive multiple of 128; defaults to 1024, or "
            "4096 with CPU expert offload\n"
            "       startup uses " +
@@ -309,6 +314,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--max-vision-item-tokens") {
+            const auto tokens = parse_u64(require_value("--max-vision-item-tokens"),
+                                           "max-vision-item-tokens");
+            if (!tokens || tokens > 16'384)
+                throw std::invalid_argument("--max-vision-item-tokens must be in [1,16384]");
+            options.max_vision_item_tokens = static_cast<std::uint32_t>(tokens);
+        } else if (arg == "--host-mapped-embedding") {
+            options.host_mapped_embedding = true;
+        } else if (arg == "--host-mapped-dflash2-codebooks") {
+            options.host_mapped_dflash2_codebooks = true;
+        } else if (arg == "--host-pinned-vision-weights") {
+            options.host_pinned_vision_weights = true;
+        } else if (arg == "--host-state-images") {
+            options.host_state_images = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
@@ -385,6 +404,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::invalid_argument("--default-max-tokens must be positive");
         }
     }
+    if (options.host_mapped_dflash2_codebooks &&
+        options.speculative.backend != SpeculativeBackend::DFlash2)
+        throw std::invalid_argument("--host-mapped-dflash2-codebooks requires --spec dflash2");
+    if (options.host_pinned_vision_weights && !options.enable_vision)
+        throw std::invalid_argument("--host-pinned-vision-weights requires --vision");
+    if (options.host_state_images && options.context_cache.device_state_slots.value_or(
+            options.max_concurrency) && options.context_cache.host_capacity_bytes &&
+        !*options.context_cache.host_capacity_bytes)
+        throw std::invalid_argument("--host-state-images requires nonzero Host capacity");
     return options;
 }
 

@@ -1,4 +1,7 @@
 #include "text/grammar.h"
+#include "../../third_party/xgrammar/cpp/compiled_grammar_impl.h"
+#include "../../third_party/xgrammar/cpp/grammar_builder.h"
+#include <xgrammar/xgrammar.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <iostream>
@@ -119,6 +122,14 @@ void contracts(ninfer::text::GrammarCompiler& compiler) {
         check(accepts(compiler, length, Json(value).dump()),
               "JSON character length/encoding mismatch");
     check(!accepts(compiler, length, Json("ab").dump()), "string length was ignored");
+    const auto mixed = Constraint::json_schema(
+        R"({"type":"string","minLength":2,"maxLength":3})");
+    for (const auto& value : std::vector<std::string>{"a\n", "\"你", "\\😀x"})
+        check(accepts(compiler, mixed, Json(value).dump()),
+              "mixed raw, escaped or non-BMP scalar length mismatch");
+    for (const auto& value : std::vector<std::string>{"a", "a\n你😀"})
+        check(!accepts(compiler, mixed, Json(value).dump()),
+              "mixed scalar length bound was ignored");
     auto pattern = Constraint::json_schema(R"({"type":"string","pattern":"p"})");
     check(accepts(compiler, pattern, "\"apple\""), "pattern must use search semantics");
     check(!accepts(compiler, pattern, "\"absent\""), "pattern admitted a nonmatching string");
@@ -126,6 +137,50 @@ void contracts(ninfer::text::GrammarCompiler& compiler) {
     for (const std::string separator : {"\n", "\r", "\u2028", "\u2029"})
         check(!accepts(compiler, dot, Json("a" + separator + "b").dump()),
               "ECMAScript dot admitted a line terminator");
+}
+
+void counted_repetition_metadata() {
+    const std::vector<std::string> vocabulary{"a", "aaaa", "\\n", "你", "😀", "\"", ""};
+    xgrammar::TokenizerInfo tokenizer(vocabulary, xgrammar::VocabType::RAW, std::nullopt,
+                                     std::vector<std::int32_t>{6});
+    xgrammar::GrammarCompiler compiler(tokenizer, 1, false);
+    const auto grammar = xgrammar::Grammar::FromJSONSchema(
+        R"({"type":"string","minLength":12,"maxLength":20})", false, std::nullopt,
+        std::pair<std::string, std::string>{",", ":"}, false);
+    const auto compiled = compiler.CompileGrammar(grammar);
+    check(compiled.GetGrammar().ToString().find("{12, 20}") != std::string::npos,
+          "bounded JSON repetition was expanded instead of counted");
+    std::size_t fast_masks = 0;
+    for (const auto& [state, mask] : compiled.ImplPtr()->adaptive_token_mask_cache) {
+        (void)state;
+        if (!mask.repeat_interior_bitsets.empty() || !mask.repeat_exit_tokens.empty() ||
+            !mask.repeat_interior_tokens.empty())
+            ++fast_masks;
+    }
+    check(fast_masks > 0, "counted JSON repetition did not build its token-mask fast path");
+
+    // Capture and lookahead metadata must survive scalar-rule optimization.
+    const auto captured = compiler.CompileGrammar(
+        "root ::= scalar{2,3} \"\\\"\"\nscalar[capture=\"scalar\"] ::= \"a\" | \"你\" | \"😀\"");
+    xgrammar::GrammarMatcher matcher(captured);
+    check(matcher.AcceptString("a你\""), "captured repetition rejected valid input");
+    const std::vector<std::pair<std::string, std::string>> expected{
+        {"scalar", "a"}, {"scalar", "你"}};
+    check(matcher.GetCaptures() == expected, "counted repetition lost scalar captures");
+    matcher.Rollback(1);
+    check(matcher.GetCaptures().empty(), "rollback retained tentative scalar captures");
+    check(matcher.AcceptString("😀a\"") &&
+              matcher.GetCaptures() ==
+                  std::vector<std::pair<std::string, std::string>>{
+                      {"scalar", "😀"}, {"scalar", "a"}},
+          "replay after rollback changed scalar capture bytes");
+
+    const auto lookahead = compiler.CompileGrammar(
+        "root ::= scalar{2,3} \"\\\"\"\nscalar ::= \"a\" | \"你\" (= \"\\\"\")");
+    bool kept = false;
+    for (std::int32_t rule = 0; rule < lookahead.GetGrammar()->NumRules(); ++rule)
+        kept |= lookahead.GetGrammar()->GetRule(rule).lookahead_assertion_id != -1;
+    check(kept, "counted repetition erased lookahead metadata");
 }
 } // namespace
 
@@ -161,6 +216,7 @@ int main(int argc, char** argv) {
             contracts(compiler);
             length_boundaries(compiler);
             dense_length_masks();
+            counted_repetition_metadata();
             std::cout << "JSON/schema CPU contracts passed\n";
         }
         return 0;

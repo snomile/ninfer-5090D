@@ -3,6 +3,7 @@
 #include "models/common/qwen/frontend/frontend.h"
 #include "models/common/qwen/frontend/prepared_prompt.h"
 #include "models/qwen3_5/load.h"
+#include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program.h"
 #include "models/qwen3_5/program/program_impl.h"
 
@@ -89,6 +90,67 @@ bool batch_covers(const q35::ContextDemotionBatch& batch,
                });
     });
     return selected != releases.end() && batch.covers(*selected);
+}
+
+void host_capacity_planning(DeviceContext& device, const q35::execution::Parameters& parameters,
+                            const EngineOptions& original) {
+    auto options = original;
+    options.max_concurrency = 2;
+    options.host_state_images = true;
+    options.context_cache.device_state_slots = 3;
+    options.context_cache.host_capacity_bytes = 512ULL * 1024 * 1024;
+    const auto initial =
+        q35::detail::make_sequence_planner_impl(parameters.profile, device, options);
+    const auto image_bytes = initial->minimum->persistent.state_images.images.image_stride;
+    require(image_bytes > 1, "Host capacity fixture requires a complete aligned StateImage");
+    for (const bool host_policy : {false, true}) {
+        for (const auto optional_slots : {0U, 1U, 3U}) {
+            for (const auto host_bytes :
+                 {std::size_t{0}, image_bytes, 2 * image_bytes, 4 * image_bytes - 1}) {
+                options.host_state_images = host_policy;
+                options.context_cache.device_state_slots = optional_slots;
+                options.context_cache.host_capacity_bytes = host_bytes;
+                const auto planned =
+                    q35::detail::make_sequence_planner_impl(parameters.profile, device, options);
+                require(planned->minimum->persistent.state_images.images.slot_count ==
+                            static_cast<std::int32_t>(
+                                options.max_concurrency + (host_policy ? 0U : optional_slots)) &&
+                            planned->minimum->persistent.state_images.images.image_stride ==
+                                image_bytes &&
+                            *planned->minimum->context_cache.host_capacity_bytes == host_bytes,
+                        "startup pool policy duplicated optional Host slots on Device");
+                auto planner = q35::make_sequence_planner(parameters, device, options);
+                auto plan = std::move(planner).finalize(8);
+                auto program = q35::create_program(parameters, std::move(plan), device, {});
+                const auto usage = program->physical_usage();
+                const auto expected_host = host_policy
+                    ? std::min<std::size_t>(host_bytes / image_bytes, optional_slots)
+                    : host_bytes / image_bytes;
+                require(usage.capacity.state_slots ==
+                            options.max_concurrency + (host_policy ? 0U : optional_slots) &&
+                            usage.capacity.host_state_slots == expected_host &&
+                            usage.capacity.host_bytes == host_bytes &&
+                            usage.occupied == q35::ContextResources{} &&
+                            usage.host_reserved_bytes == 0,
+                        "runtime Host cap must use complete-image bytes and the configured bound");
+            }
+        }
+    }
+    options.host_state_images = true;
+    options.context_cache.device_state_slots = 1;
+    options.context_cache.host_capacity_bytes = image_bytes - 1;
+    bool rejected = false;
+    try {
+        (void)q35::make_sequence_planner(parameters, device, options);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "startup accepted nonzero Host capacity smaller than one complete image");
+    options.context_cache.host_capacity_bytes.reset();
+    const auto defaults =
+        q35::detail::make_sequence_planner_impl(parameters.profile, device, options);
+    require(*defaults->minimum->context_cache.host_capacity_bytes ==
+                8ULL * 1024 * 1024 * 1024 + 8 * image_bytes &&
+                defaults->minimum->persistent.state_images.images.slot_count == 2,
+            "default Host bytes must include complete images without adding Device slots");
 }
 
 class Fixture {
@@ -665,19 +727,20 @@ public:
         require(static_cast<bool>(program_.start_binding(endpoint_base, {1}, *reader)),
                 "Host endpoint could not reserve an independent reader");
         const std::array<q35::CheckpointHandle, 1> endpoint_set{endpoint};
-        require(program_.host_bytes_released(endpoint_set) == 0 &&
+        require(program_.host_resources_released(endpoint_set) == q35::ContextResources{} &&
                     !program_.release_checkpoint(endpoint),
                 "pending reader allowed its complete Host suffix to be reclaimed");
         require(!settle(true).published, "Host suffix reader did not cancel");
         expect_usage(before_reader, "cancelled Host reader changed retained history ownership");
 
-        const auto expected_release = program_.host_bytes_released(endpoint_set);
-        const auto before_release   = program_.physical_usage().occupied.host_bytes;
-        require(expected_release > 0 && program_.release_checkpoint(endpoint),
+        const auto expected_release = program_.host_resources_released(endpoint_set);
+        const auto before_release   = program_.physical_usage().occupied;
+        require(expected_release.host_bytes > 0 && program_.release_checkpoint(endpoint),
                 "retiring E did not expose its unneeded Host suffix");
-        const auto after_release = program_.physical_usage().occupied.host_bytes;
-        require(before_release >= after_release &&
-                    before_release - after_release == expected_release &&
+        const auto after_release = program_.physical_usage().occupied;
+        require(before_release.host_bytes == after_release.host_bytes + expected_release.host_bytes &&
+                    before_release.host_state_slots ==
+                        after_release.host_state_slots + expected_release.host_state_slots &&
                     program_.valid_checkpoint(input),
                 "Host suffix release disagrees with its quote or invalidates retained P");
 
@@ -721,6 +784,144 @@ public:
         require(finished.checkpoint && program_.release_checkpoint(*finished.checkpoint),
                 "private Move did not publish a releasable successor");
         expect_empty("private Move retained its consumed owner");
+    }
+
+    q35::CheckpointHandle host_checkpoint() {
+        const auto point = checkpoint(request(64, true));
+        const std::array history{point};
+        const auto plan = program_.plan_reclaim(history, {}, {.state_slots = 1});
+        const auto* quote = demotion_with_sources(plan.demotions, history);
+        require(quote && quote->host_state_slots == 1 && quote->host_bytes > 0 &&
+                    program_.start_demote(*quote),
+                "Host slot fixture could not demote its independent checkpoint");
+        const auto demoted = settle();
+        require(demoted.published &&
+                    transferred(demoted, runtime::ContextTransferDirection::DeviceToHost,
+                                runtime::ContextTransferResource{}) &&
+                    program_.physical_usage().occupied.state_slots == 0 &&
+                    program_.physical_usage().occupied.host_state_slots == 1,
+                "Host slot fixture did not save a real Host-only StateImage");
+        require(program_.host_resources_released(history) ==
+                    q35::ContextResources{.host_bytes = quote->host_bytes, .host_state_slots = 1},
+                "Host-only checkpoint must quote one releasable image slot and its exact bytes");
+        return point;
+    }
+
+    void host_binding_pressure() {
+        const auto capacity = program_.physical_usage().capacity;
+        require(capacity.state_slots == 1 && capacity.host_bytes > 0 &&
+                    capacity.host_state_slots <= 1,
+                "Host binding fixture requires C1 and H0/H1 with nonzero backing");
+        std::optional<q35::CheckpointHandle> host;
+        if (capacity.host_state_slots) { host = host_checkpoint(); }
+        auto base = request(65, true);
+        const auto source = checkpoint(base);
+        const auto full = program_.physical_usage();
+        const std::array history{source};
+        const auto plan = program_.plan_reclaim(history, {}, {.state_slots = 1});
+        const auto* quote = demotion_with_sources(plan.demotions, history);
+        require(quote && quote->host_state_slots == 1 &&
+                    quote->host_bytes <= capacity.host_bytes - full.occupied.host_bytes &&
+                    full.occupied.state_slots == capacity.state_slots &&
+                    full.occupied.host_state_slots == capacity.host_state_slots,
+                "Host binding fixture exhausts slots while image-sized bytes remain free");
+        for (unsigned attempt = 0; attempt < 2; ++attempt) {
+            const auto candidate = program_.inspect_source(base, source);
+            require(candidate && candidate->state_action == q35::StateBindingAction::Fork,
+                    "slot-exhausted source admitted an infeasible backup or split");
+            const auto blocked = program_.start_binding(base, {0}, *candidate);
+            require(!blocked && blocked.source_valid && blocked.capacity_possible &&
+                        blocked.shortage == q35::ContextResources{.state_slots = 1} &&
+                        !program_.has_context_operation() &&
+                        program_.checkpoint_matches(source, base),
+                    "slot pressure must return a recoverable shortage and preserve its source");
+            expect_usage(full, "failed Host slot binding changed physical ownership");
+        }
+        const auto continuation = program_.inspect_source(base, source, true);
+        require(continuation && continuation->state_action == q35::StateBindingAction::Move &&
+                    static_cast<bool>(program_.start_binding(base, {0}, *continuation)),
+                "authorized continuation could not advance through exhausted Host slots");
+        const auto moved = settle();
+        require(moved.sequence && moved.operations.state_moves == 1 &&
+                    !program_.valid_checkpoint(source),
+                "authorized continuation did not consume exactly its private StateImage");
+        finish_prefill(*moved.sequence, 0, true);
+        const auto finished = program_.finish(*moved.sequence);
+        require(finished.checkpoint && program_.release_checkpoint(*finished.checkpoint),
+                "Host pressure continuation did not publish a releasable endpoint");
+        if (host) { require(program_.release_checkpoint(*host), "old Host snapshot retained"); }
+        expect_empty("Host pressure binding leaked a state, page or reservation");
+        next_request();
+        if (capacity.host_state_slots) {
+            const auto old = host_checkpoint();
+            const auto retry_source = checkpoint(base);
+            require(program_.release_checkpoint(old), "binding retry could not release a Host slot");
+            const auto retry = program_.inspect_source(base, retry_source);
+            require(retry && retry->state_action == q35::StateBindingAction::BackupSplit &&
+                        static_cast<bool>(program_.start_binding(base, {0}, *retry)),
+                    "non-consuming binding did not retry after real Host capacity was released");
+            const auto bound = settle();
+            require(bound.sequence && program_.checkpoint_matches(retry_source, base) &&
+                        program_.physical_usage().occupied.host_state_slots == 1 &&
+                        transferred(bound, runtime::ContextTransferDirection::DeviceToHost,
+                                    runtime::ContextTransferResource{}),
+                    "binding retry did not preserve and transfer its immutable source");
+            require(program_.abort(*bound.sequence).status == runtime::ConsumeStatus::Consumed &&
+                        program_.release_checkpoint(retry_source),
+                    "binding retry retained a writer or immutable recovery point");
+            expect_empty("binding retry did not return all stores to baseline");
+            next_request();
+        }
+    }
+
+    void host_capture_retry_after_slot_release() {
+        const auto capacity = program_.physical_usage().capacity;
+        require(capacity.state_slots == 1 && capacity.host_state_slots == 1,
+                "Host capture retry fixture requires C1/H1");
+        const auto old = host_checkpoint();
+        auto marked = marker_request();
+        const auto active = bind(marked.base);
+        reserve(active, q35::ExecutionUnitKind::Prefill);
+        const auto full = program_.physical_usage();
+        for (unsigned attempt = 0; attempt < 2; ++attempt) {
+            const auto prepared = program_.prepare_capture(active);
+            require(prepared && !prepared->reserved &&
+                        prepared->frontier == marked.frontiers.front() &&
+                        prepared->shortage == q35::ContextResources{.state_slots = 1} &&
+                        prepared->host_state_slots == 1 && prepared->host_bytes > 0 &&
+                        prepared->host_bytes <= capacity.host_bytes - full.occupied.host_bytes,
+                    "capture retry lost independent slot pressure with free backing bytes");
+            expect_usage(full, "unavailable Host capture retained a reservation");
+        }
+        require(program_.release_checkpoint(old), "capture could not release its old Host snapshot");
+        const auto before = program_.physical_usage();
+        const auto prepared = program_.prepare_capture(active);
+        require(prepared && prepared->reserved &&
+                    prepared->frontier == marked.frontiers.front() &&
+                    program_.physical_usage().occupied.host_state_slots == 1 &&
+                    program_.physical_usage().host_reserved_bytes > before.host_reserved_bytes,
+                "capture preparation must charge a pending ticket at its original boundary");
+        require(!program_.reclaim_capture_reservation({.kv_page_groups = {1}}) &&
+                    program_.reclaim_capture_reservation({.host_state_slots = 1}),
+                "capture slot cancellation must respect the requested resource dimension");
+        expect_usage(before, "capture ticket cancellation did not refund bytes and slot");
+        const auto retried = program_.prepare_capture(active);
+        require(retried && retried->reserved &&
+                    retried->frontier == marked.frontiers.front(),
+                "cancelled capture ticket could not be re-reserved at its original boundary");
+        const auto step = program_.advance_prefill(active);
+        require(step.capture_ready && !step.complete &&
+                    step.processed_prompt_tokens == marked.frontiers.front(),
+                "Host capture retry skipped its precise semantic boundary");
+        const auto saved =
+            capture(active, marked.frontiers.front(), runtime::CheckpointRole::SharedPrefix);
+        require(program_.physical_usage().occupied.host_state_slots == 1 &&
+                    program_.physical_usage().host_reserved_bytes == before.host_reserved_bytes &&
+                    program_.abort(active).status == runtime::ConsumeStatus::Consumed &&
+                    program_.release_checkpoint(saved),
+                "retried Host capture must publish one live image then release its owners");
+        expect_empty("Host capture retry leaked state or KV ownership");
+        next_request();
     }
 
     void capture_retry_after_reclaim() {
@@ -1481,7 +1682,8 @@ public:
         require(settle().published, "shared-prefix fact fixture lost its demotion");
         require(program_.physical_usage().occupied.host_bytes == main_bytes,
                 "demotion quote disagrees with its actual Host allocation");
-        require(program_.host_bytes_released(source_set) == main_bytes,
+        require(program_.host_resources_released(source_set) ==
+                    q35::ContextResources{.host_bytes = main_bytes},
                 "unique checkpoint Host bytes were not fully releasable");
 
         auto extension = request(128, true);
@@ -1502,7 +1704,7 @@ public:
             "active borrowed content was exposed as a demotion candidate");
         require(program_.release_redundant_host(source_set) == 0,
                 "Host replica cleanup ignored an excluded source");
-        require(program_.host_bytes_released(source_set) == 0,
+        require(program_.host_resources_released(source_set) == q35::ContextResources{},
                 "deleting one shared prefix claimed the descendant's Host page");
 
         finish_prefill(sequence, 64, true);
@@ -1511,9 +1713,11 @@ public:
         const auto descendant = *finished.checkpoint;
         const std::array<q35::CheckpointHandle, 2> family{source, descendant};
         const std::array<q35::CheckpointHandle, 3> repeated{source, descendant, source};
-        require(program_.host_bytes_released(source_set) == 0 &&
-                    program_.host_bytes_released(family) == main_bytes &&
-                    program_.host_bytes_released(repeated) == main_bytes,
+        require(program_.host_resources_released(source_set) == q35::ContextResources{} &&
+                    program_.host_resources_released(family) ==
+                        q35::ContextResources{.host_bytes = main_bytes} &&
+                    program_.host_resources_released(repeated) ==
+                        q35::ContextResources{.host_bytes = main_bytes},
                 "fixed-set Host accounting double-counted shared or duplicate references");
         const auto main_releases = program_.plan_releases(family, {}, {.kv_page_groups = {1}});
         const auto expected_main = program_.physical_usage().occupied.kv_page_groups[0] -
@@ -1576,7 +1780,7 @@ public:
                     program_.plan_reclaim(family, {}, {.state_slots = 1}).demotions.empty() &&
                     program_.plan_releases(family, {}, {.kv_page_groups = {1}}).empty() &&
                     program_.plan_releases(family, {}, {.kv_page_groups = {0, 1}}).empty() &&
-                    program_.host_bytes_released(family) == 0,
+                    program_.host_resources_released(family) == q35::ContextResources{},
                 "replica cleanup or fixed-set release ignored a pending reader's record pin");
         require(!settle(true).published, "pinned replica fixture did not cancel binding");
         expect_usage(baseline, "pinned replica checks changed physical ownership");
@@ -1643,7 +1847,8 @@ public:
         require(program_.physical_usage().occupied.host_bytes == main_bytes,
                 "releasing one ancestor prematurely freed shared Host storage");
         const std::array<q35::CheckpointHandle, 1> remaining{descendant};
-        require(program_.host_bytes_released(remaining) == main_bytes,
+        require(program_.host_resources_released(remaining) ==
+                    q35::ContextResources{.host_bytes = main_bytes},
                 "last descendant did not account the uniquely retained Host page");
         release_and_check(descendant);
         expect_empty("fixed-set Host accounting fixture leaked physical resources");
@@ -1685,15 +1890,20 @@ public:
         auto pause_base     = request(2 * kChunk);
         const auto to_pause = bind(pause_base);
         prefill_prefix(to_pause, kChunk);
-        const auto pause_bytes = program_.pause_host_bytes(to_pause);
-        require(pause_bytes && *pause_bytes > 0 && program_.start_pause(to_pause, true),
+        const auto pause_resources = program_.pause_host_resources(to_pause);
+        require(pause_resources && pause_resources->host_bytes > 0 &&
+                    pause_resources->host_state_slots == 1 && program_.start_pause(to_pause, true),
                 "snapshot fact fixture could not reserve its Host demand");
         auto paused = settle();
         require(paused.paused && paused.paused->snapshot_handle(),
                 "snapshot fact fixture did not preserve its checkpoint identity");
         const auto resources = program_.snapshot_resources(*paused.paused);
         require(resources.state_slots == 0 && resources.kv_page_groups[0] == 0 &&
-                    resources.kv_page_groups[1] == 0 && resources.host_bytes == *pause_bytes &&
+                    resources.kv_page_groups[1] == 0 &&
+                    resources.host_bytes == pause_resources->host_bytes &&
+                    resources.host_state_slots == pause_resources->host_state_slots &&
+                    program_.physical_usage().occupied.host_state_slots ==
+                        resources.host_state_slots &&
                     resources.host_bytes == program_.physical_usage().occupied.host_bytes,
                 "paused snapshot typed resources disagree with the actual saved replicas");
         require(program_.revoke_snapshot(*paused.paused) && !paused.paused->snapshot_handle() &&
@@ -2052,6 +2262,7 @@ int main(int argc, char** argv) {
         options.speculative.draft_tokens = backend == SpeculativeBackend::None ? 0U : 3U;
         options.context_cache.device_state_slots  = 2;
         options.context_cache.host_capacity_bytes = 512ULL * 1024 * 1024;
+        host_capacity_planning(device, parameters, options);
         auto planner = q35::make_sequence_planner(parameters, device, options);
         auto plan    = std::move(planner).finalize(16);
         auto program = q35::create_program(parameters, std::move(plan), device, {});
@@ -2102,6 +2313,19 @@ int main(int argc, char** argv) {
             no_capture_fixture.private_move();
         }
         no_capture_destination.reset();
+        options.host_state_images = true;
+        options.context_cache.host_capacity_bytes = 512ULL * 1024 * 1024;
+        for (const auto host_slots : {0U, 1U}) {
+            options.context_cache.device_state_slots = host_slots;
+            auto host_planner = q35::make_sequence_planner(parameters, device, options);
+            auto host_plan = std::move(host_planner).finalize(8);
+            auto bounded_host = q35::create_program(parameters, std::move(host_plan), device, {});
+            Fixture host_fixture(device, *bounded_host, frontend);
+            host_fixture.host_binding_pressure();
+            if (host_slots) { host_fixture.host_capture_retry_after_slot_release(); }
+        }
+        options.host_state_images = false;
+        options.context_cache.host_capacity_bytes = 0;
         options.context_cache.device_state_slots = 1;
         auto capture_retry_planner = q35::make_sequence_planner(parameters, device, options);
         auto capture_retry_plan    = std::move(capture_retry_planner).finalize(8);

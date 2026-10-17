@@ -34,6 +34,166 @@ bool cuda_unavailable(cudaError_t error) {
     return error == cudaErrorNoDevice || error == cudaErrorInsufficientDriver;
 }
 
+void test_state_host_reservations(ninfer::DeviceContext& device) {
+    using namespace ninfer;
+    StateImageBuilder schema;
+    (void)schema.add(DType::I32, {8}, 1, "state");
+    LayoutBuilder builder;
+    const auto layout = schema.finish(builder, 2);
+    DeviceBuffer backing(device.device(), builder.finish());
+    StateImageStorage physical(backing.span(), layout);
+    HostContextArena arena(layout.image_stride * 8, layout.image_stride);
+    store::StateImageStore images(physical, &arena, 4, 2);
+    const auto check = [&](std::uint32_t slots, std::size_t reserved, std::size_t live,
+                           std::string_view message) {
+        expect(images.host_occupied() == slots && arena.reserved_bytes() == reserved &&
+                   arena.live_bytes() == live && arena.occupied_bytes() == reserved + live,
+               message);
+    };
+    const auto initialize = [&] {
+        const auto image = images.reserve_destination().value();
+        physical.clear(images.physical_slot(image), device.execution_view());
+        images.complete_initialization(image);
+        images.freeze(image);
+        return image;
+    };
+    const auto first = initialize();
+    const auto second = initialize();
+    device.synchronize();
+    const auto stride = layout.image_stride;
+    expect(images.device_capacity() == 2 && images.host_capacity() == 2 &&
+               images.capacity() == 4,
+           "Host slot limit stays independent of larger shared byte capacity");
+
+    {
+        auto one = images.reserve_host_destination().value();
+        auto two = images.reserve_host_destination().value();
+        check(2, 2 * stride, 0, "pending tickets charge exactly one slot and extent each");
+        expect(!images.can_reserve_host() && !images.reserve_host_destination() &&
+                   !images.reserve_device_to_host(first) && arena.free_bytes() == 6 * stride,
+               "pending Host slots deny over-admission even with ample backing bytes");
+        store::StateImageStore::HostReservation moved(std::move(one));
+        expect(!one.valid() && moved.valid(), "Host ticket move transfers sole ownership");
+        moved = std::move(moved);
+        check(2, 2 * stride, 0, "Host ticket self-move preserves its charge");
+        moved = std::move(two);
+        expect(!two.valid() && moved.valid(), "Host ticket assignment consumes its source");
+        check(1, stride, 0, "Host ticket assignment returns its previous slot and bytes");
+        moved.reset();
+        moved.reset();
+        check(0, 0, 0, "Host ticket reset is idempotent and returns capacity");
+    }
+    {
+        auto ticket = images.reserve_host_destination().value();
+        auto copy = images.reserve_device_to_host(first, std::move(ticket)).value();
+        expect(!ticket.valid() && copy.valid() && images.source_pins(first) == 1 &&
+                   !images.host_resident(first),
+               "ticket hands its allocation to the pending copy without early publication");
+        check(1, stride, 0, "ticket-to-transfer handoff retains one pending charge");
+        expect(arena.allocation_count() == 1,
+               "ticket handoff must not allocate a second Host extent");
+        auto pending = images.reserve_host_destination().value();
+        check(2, 2 * stride, 0, "capture ticket and pending DMA share the slot upper bound");
+        expect(!images.reserve_host_destination(), "ticket plus DMA exhaust Host slots");
+        copy.enqueue(device.transfer_view());
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
+        copy.publish(true);
+        expect(!copy.valid() && images.source_pins(first) == 0 &&
+                   images.residency(first) == store::StateReplicaResidency::Both,
+               "completed copy publishes Both residency and releases its source lease");
+        check(2, stride, stride, "pending-to-live publication neither doubles nor loses a slot");
+        pending.reset();
+        check(1, 0, stride, "cancelling another ticket preserves the published image");
+        auto reader = images.read(first);
+        expect(!images.drop_host_replica(first), "read lease pins the real Host replica");
+        reader.reset();
+        expect(images.drop_host_replica(first), "unread redundant Host replica can retire");
+        check(0, 0, 0, "redundant replica retirement returns its live slot and bytes");
+    }
+    for (const bool cancelled : {true, false}) {
+        auto one = images.reserve_device_to_host(first).value();
+        auto two = images.reserve_device_to_host(second).value();
+        check(2, 2 * stride, 0, "independent pending copies count against the same Host cap");
+        expect(!images.reserve_host_destination(), "in-flight copies prohibit another ticket");
+        one.enqueue(device.transfer_view());
+        two.enqueue(device.transfer_view());
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
+        if (!cancelled) {
+            one.publish(true);
+            two.publish(true);
+            check(2, 0, 2 * stride, "two completed copies retain two live slots");
+            expect(images.drop_host_replica(first) && images.drop_host_replica(second),
+                   "published replicas retire independently");
+        }
+    }
+    check(0, 0, 0, "completed or cancelled transfers leave no pending slot charge");
+    expect(images.source_pins(first) == 0 && images.source_pins(second) == 0,
+           "cancelled transfer destruction releases both source leases");
+    {
+        auto copy = images.reserve_device_to_host(first).value();
+        auto duplicate = images.reserve_host_destination().value();
+        expect(!images.reserve_device_to_host(first, std::move(duplicate)),
+               "a second copy cannot target an already pending image");
+        check(1, stride, 0, "failed copy refunds its ticket while retaining the original DMA");
+    }
+    check(0, 0, 0, "cancelled original DMA returns its remaining reservation");
+    {
+        auto blocker = arena.allocate(arena.capacity_bytes()).value();
+        expect(images.host_occupied() == 0 && !images.can_reserve_host() &&
+                   !images.reserve_host_destination(),
+               "shared non-State allocations deny tickets without fabricating occupied slots");
+    }
+    {
+        store::StateImageStore foreign(physical, &arena, 3, 1);
+        auto ticket = foreign.reserve_host_destination().value();
+        bool rejected = false;
+        try {
+            (void)images.reserve_device_to_host(first, std::move(ticket));
+        } catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected && foreign.host_occupied() == 0 && images.host_occupied() == 0 &&
+                   arena.occupied_bytes() == 0,
+               "foreign Host ticket is rejected and refunded to its actual owner");
+    }
+    {
+        auto wrong_geometry = arena.allocate(2 * stride).value();
+        bool rejected = false;
+        try {
+            (void)images.reserve_device_to_host(first, std::move(wrong_geometry));
+        } catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "raw Host allocation must match the complete image geometry");
+        check(0, 0, 0, "geometry rejection returns both bytes and pending slot");
+    }
+    {
+        store::StateImageStore disabled(physical, &arena, 2, 0);
+        store::StateImageStore no_host(physical, nullptr, 2);
+        expect(disabled.host_capacity() == 0 && !disabled.reserve_host_destination() &&
+                   no_host.host_capacity() == 0 && !no_host.reserve_host_destination(),
+               "zero-slot or absent Host storage never admits a ticket");
+        bool rejected = false;
+        try {
+            store::StateImageStore undersized(physical, &arena, 3, 2);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "logical descriptors must cover Device plus Host slot capacities");
+    }
+    expect(images.release(first) && images.release(second) && images.occupied() == 0,
+           "Host reservation fixture releases its Device images");
+    {
+        const auto orphan = initialize();
+        device.synchronize();
+        images.retain_checkpoint_reference(orphan);
+        auto copy = images.reserve_device_to_host(orphan).value();
+        copy.enqueue(device.transfer_view());
+        expect(images.release_checkpoint_owner(orphan) && images.valid(orphan) &&
+                   images.host_occupied() == 1,
+               "last checkpoint retirement does not free in-flight source or destination");
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
+        copy.publish(true);
+        expect(!images.valid(orphan) && images.device_occupied() == 0,
+               "last transfer lease retires the orphaned logical identity");
+        check(0, 0, 0, "orphan transfer publication returns its live slot automatically");
+    }
+}
+
 void test_state_store(ninfer::DeviceContext& device) {
     ninfer::StateImageBuilder schema;
     (void)schema.add(ninfer::DType::BF16, {8, 3}, 1, "conv");
@@ -358,6 +518,7 @@ int main() {
 
     try {
         ninfer::DeviceContext device(0);
+        test_state_host_reservations(device);
         test_state_store(device);
         test_migration_state_fields(device);
         device.synchronize();

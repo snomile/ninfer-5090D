@@ -24,6 +24,9 @@ struct VisionWorkspacePlan {
     std::size_t handoff_offset_bytes   = 0;
     std::size_t handoff_capacity_bytes = 0;
     std::size_t capacity_bytes         = 0;
+    std::size_t weight_staging_offset_bytes = 0;
+    std::size_t weight_staging_slot_bytes = 0;
+    std::size_t weight_staging_capacity_bytes = 0;
 };
 
 struct VisionItemView {
@@ -31,10 +34,14 @@ struct VisionItemView {
     const VisionItemControl* control = nullptr;
 };
 
+class VisionHandoffState;
+
 class VisionContext {
 public:
     VisionContext(CudaExecutionView execution, const VisionConfig& config,
                   const VisionParameters& parameters);
+    VisionContext(DeviceContext& device, const VisionConfig& config,
+                  const VisionParameters& parameters, VisionHandoffState& staging);
 
     [[nodiscard]] static std::size_t workspace_bytes(const VisionConfig& config,
                                                      const VisionParameters& parameters,
@@ -60,6 +67,8 @@ public:
 
 private:
     CudaExecutionView execution_;
+    CudaExecutionView transfer_;
+    VisionHandoffState* staging_ = nullptr;
     const VisionConfig& config_;
     const VisionParameters& parameters_;
 };

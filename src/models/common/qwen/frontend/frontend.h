@@ -19,6 +19,7 @@ struct FrontendOptions {
     std::size_t grammar_cache_bytes        = 256ULL * 1024 * 1024;
     bool vision_enabled                    = true;
     std::uint32_t max_context              = 2'048;
+    std::uint32_t max_vision_item_tokens    = 16'384;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;

@@ -89,6 +89,7 @@ qwen::Frontend Startup::frontend(const Model& model, const EngineOptions& option
                                 .grammar_cache_bytes      = options.grammar_cache_bytes,
                                 .vision_enabled           = options.enable_vision,
                                 .max_context              = options.max_context,
+                                .max_vision_item_tokens    = options.max_vision_item_tokens,
                                 .media_cache_bytes        = options.media_cache_bytes,
                                 .media_live_bytes         = options.media_live_bytes,
                                 .media_preprocess_threads = options.media_preprocess_threads},

@@ -299,6 +299,7 @@ private:
     enum class HostWorkClass : std::uint8_t {
         Decode,
         Prefill,
+        Replay,
         Control,
     };
 
@@ -1258,13 +1259,16 @@ private:
                                     resources_.begin_reclaim(*instance_.program, admission)});
             }
             const auto usage = instance_.program->physical_usage();
-            if (capture->host_bytes && capture->host_bytes <= usage.capacity.host_bytes) {
-                if (capture->host_bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
+            if (capture->host_bytes && capture->host_bytes <= usage.capacity.host_bytes &&
+                capture->host_state_slots <= usage.capacity.host_state_slots) {
+                if (capture->host_bytes > usage.capacity.host_bytes - usage.occupied.host_bytes ||
+                    capture->host_state_slots >
+                        usage.capacity.host_state_slots - usage.occupied.host_state_slots) {
                     (void)instance_.program->release_redundant_host({}, request->sequence);
                 }
                 if (const auto victims = resources_.host_victims(
                         *instance_.program, capture->host_bytes, std::nullopt, {}, {}, admission,
-                        &decision->reclaim)) {
+                        &decision->reclaim, {}, capture->host_state_slots)) {
                     resources_.commit_host_victims(*instance_.program, *victims, decision->reclaim);
                     if (!victims->empty()) { scheduler_.capacity_released(); }
                     if (const auto retry = instance_.program->prepare_capture(*request->sequence);
@@ -1526,7 +1530,8 @@ private:
                  std::span<const Checkpoint> excluded               = {},
                  typename ResourceManagement::ReclaimCursor* cursor = nullptr,
                  std::optional<std::uint64_t> priority_ticket       = std::nullopt) {
-        if (!shortage.state_slots && !shortage.first_kv_deficit() && !shortage.host_bytes) {
+        if (!shortage.state_slots && !shortage.first_kv_deficit() && !shortage.host_bytes &&
+            !shortage.host_state_slots) {
             return false;
         }
         if (instance_.program->reclaim_capture_reservation(shortage)) {
@@ -1574,10 +1579,13 @@ private:
         if (instance_.program->has_context_operation()) { return false; }
         auto request       = slots_[lane];
         bool save_snapshot = false;
-        if (const auto bytes = instance_.program->pause_host_bytes(*request->sequence)) {
+        if (const auto needed = instance_.program->pause_host_resources(*request->sequence)) {
             const auto usage = instance_.program->physical_usage();
-            if (*bytes <= usage.capacity.host_bytes &&
-                *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
+            if (needed->host_bytes <= usage.capacity.host_bytes &&
+                needed->host_state_slots <= usage.capacity.host_state_slots &&
+                (needed->host_bytes > usage.capacity.host_bytes - usage.occupied.host_bytes ||
+                 needed->host_state_slots >
+                     usage.capacity.host_state_slots - usage.occupied.host_state_slots)) {
                 (void)instance_.program->release_redundant_host({}, request->sequence);
             }
             std::vector<Checkpoint> later;
@@ -1588,10 +1596,16 @@ private:
                 }
             }
             if (const auto victims =
-                    resources_.host_victims(*instance_.program, *bytes, std::nullopt, later)) {
+                    resources_.host_victims(*instance_.program, needed->host_bytes, std::nullopt,
+                                            later, {}, std::nullopt, nullptr, {},
+                                            needed->host_state_slots)) {
                 for (const auto handle : *victims) {
                     const auto usage = instance_.program->physical_usage();
-                    if (usage.capacity.host_bytes - usage.occupied.host_bytes >= *bytes) { break; }
+                    if (usage.capacity.host_bytes - usage.occupied.host_bytes >= needed->host_bytes &&
+                        usage.capacity.host_state_slots - usage.occupied.host_state_slots >=
+                            needed->host_state_slots) {
+                        break;
+                    }
                     if (resources_.erase(*instance_.program, handle)) { continue; }
                     const auto owner =
                         std::find_if(paused_.begin(), paused_.end(), [&](const auto& other) {
@@ -2056,6 +2070,23 @@ private:
         publish_runtime_stats();
     }
 
+    void fail_control_request(std::uint32_t lane, std::exception_ptr error) {
+        const auto request = slots_[lane];
+        if (request == nullptr || !request->sequence || !request->lane ||
+            request->lane->value != lane) {
+            throw std::logic_error("recoverable control failure lost its active request");
+        }
+        ProgramCallScope call(*this);
+        auto aborted = instance_.program->abort(*request->sequence);
+        if (aborted.status != ConsumeStatus::Consumed) {
+            throw std::logic_error("recoverable control failure could not abort its sequence");
+        }
+        request->generation_timings = aborted.timings;
+        request->speculative_stats  = std::move(aborted.speculative);
+        complete_error(request, std::move(error));
+        remove_completed_slot(lane);
+    }
+
     void run_control_batch(const ControlMembership& membership) {
         nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
                                         static_cast<std::uint64_t>(membership.size));
@@ -2081,6 +2112,8 @@ private:
             generated_staged = false;
         };
 
+        std::optional<std::uint32_t> recoverable_lane;
+        std::exception_ptr recoverable_error;
         for (std::size_t row = 0; row < membership.size; ++row) {
             const auto& request = slots_[membership.lanes[row]];
             if (request == nullptr) {
@@ -2101,8 +2134,15 @@ private:
                 const std::span<const TokenId> tokens =
                     std::span<const TokenId>(membership.tokens)
                         .subspan(row * membership.row_stride, membership.row_stride);
-                const OutputDecision decision =
-                    request->output.preview_control(tokens, request->budget->remaining());
+                OutputDecision decision;
+                try {
+                    decision =
+                        request->output.preview_control(tokens, request->budget->remaining());
+                } catch (const OutputControlError&) {
+                    recoverable_lane  = lane;
+                    recoverable_error = std::current_exception();
+                    break;
+                }
                 if (decision.accepted_tokens != membership.row_stride || decision.finished() ||
                     decision.continuation != ContinuationAction::Decode ||
                     (decision.prefix_execution_split_after &&
@@ -2117,6 +2157,13 @@ private:
                         "admission did not reserve thinking-control token capacity");
                 }
                 request->generated.insert(request->generated.end(), tokens.begin(), tokens.end());
+            }
+            if (recoverable_error) {
+                rollback_generated();
+                fail_control_request(*recoverable_lane, std::move(recoverable_error));
+                phase.finish();
+                publish_runtime_stats();
+                return;
             }
             phase.pause_range();
             ProgramCallScope program_call(*this);
@@ -2328,8 +2375,8 @@ private:
                 }
                 if (const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_)) {
                     const auto request = slots_[*lane];
-                    set_host_work_class(HostWorkClass::Prefill);
                     if (request->is_replaying()) {
+                        set_host_work_class(HostWorkClass::Replay);
                         ProgramCallScope call(*this);
                         auto progress = instance_.program->advance_replay(*request->sequence,
                                                                           &call.failed_timing());
@@ -2350,6 +2397,7 @@ private:
                                                GenerationSchedulingTransition::ReplayComplete);
                         }
                     } else {
+                        set_host_work_class(HostWorkClass::Prefill);
                         run_prefill_step(*lane, snapshot_cancellations());
                     }
                     scheduler_.prefill_executed(*lane, max_concurrency_);

@@ -26,7 +26,11 @@ public:
 
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
 
-    [[nodiscard]] ops::WeightInput input(WeightId id) const { return weight_input(bound_, id); }
+    [[nodiscard]] ops::WeightInput input(WeightId id) const {
+        const auto& parameter = bound_.at(id.index);
+        if (parameter.uses.empty()) return {parameter.view, ops::LinearPolicy::A16Only, {}};
+        return weight_input(bound_, id);
+    }
 
     [[nodiscard]] std::span<const BoundWeight> weight_data() const { return bound_; }
 

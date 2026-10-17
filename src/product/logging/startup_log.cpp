@@ -297,6 +297,10 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
         format_pretty_bytes(load.host_to_device_bytes),
         format_pretty_bytes(load.peak_staging_bytes), format_pretty_count(load.device_object_count),
         format_pretty_count(load.host_object_count));
+    impl_->logger->debug(
+        "host weight payload | mapped {} in {} objects | pinned transfer-only {} in {} objects",
+        format_pretty_bytes(load.mapped_host_bytes), format_pretty_count(load.mapped_host_object_count),
+        format_pretty_bytes(load.pinned_host_bytes), format_pretty_count(load.pinned_host_object_count));
     impl_->logger->debug("context cost | transfer {} | prefill {} | signature {}",
                          context_cost_preset_source_name(load.context_cost.transfer_source),
                          context_cost_preset_source_name(load.context_cost.prefill_source),

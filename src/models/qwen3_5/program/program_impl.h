@@ -184,7 +184,7 @@ struct CaptureReservation {
     ProgramImpl* owner = nullptr;
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
     StateImageHandle state;
-    std::optional<HostContextAllocation> host;
+    std::optional<StateImageStore::HostReservation> host;
     std::uint32_t frontier = 0;
     ~CaptureReservation();
 };
@@ -299,10 +299,10 @@ public:
     [[nodiscard]] bool release_checkpoint(CheckpointHandle) noexcept;
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
     [[nodiscard]] ContextResources snapshot_resources(const ResumeState& paused) const;
-    // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
-    [[nodiscard]] std::size_t
-    host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
-    [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
+    // Exact Host resources freed by this fixed set, with physical sharing counted once.
+    [[nodiscard]] ContextResources
+    host_resources_released(std::span<const CheckpointHandle> checkpoints) const;
+    [[nodiscard]] std::optional<ContextResources> pause_host_resources(SequenceHandle sequence) const;
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
                            std::optional<SequenceHandle> pending_backup = std::nullopt);

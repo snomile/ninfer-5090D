@@ -91,6 +91,10 @@ int main() {
     load.peak_staging_bytes   = 128;
     load.device_object_count  = 42;
     load.host_object_count    = 6;
+    load.mapped_host_bytes = 80;
+    load.pinned_host_bytes = 120;
+    load.mapped_host_object_count = 2;
+    load.pinned_host_object_count = 3;
     load.context_cost         = {
                 .transfer_source   = ninfer::ContextCostPresetSource::External,
                 .prefill_source    = ninfer::ContextCostPresetSource::CompiledDefault,
@@ -118,6 +122,9 @@ int main() {
                    .handoff_capacity_bytes  = 200,
                    .handoff_active_bytes    = 0,
                    .handoff_peak_bytes      = 150,
+                   .weight_staging_offset_bytes = 500,
+                   .weight_staging_slot_bytes = 256,
+                   .weight_staging_capacity_bytes = 512,
     };
     memory.minimum_runtime_reservation_bytes = 1300;
     memory.kv_capacity_increment_bytes       = 100;
@@ -152,6 +159,8 @@ int main() {
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
+    failures += check(kRequestLogSchemaVersion == 29 && server.at("schema_version") == 29,
+                      "device environment split changed the schema 29 contract");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
@@ -208,6 +217,45 @@ int main() {
             server.at("engine").at("context_cache").at("total_device_state_slots") == 4 &&
             server.at("engine").at("context_cache").at("host_capacity_bytes") == (64ULL << 20),
         "resolved context-cache configuration missing");
+    auto host_image_options = engine_options;
+    host_image_options.host_state_images = true;
+    host_image_options.host_mapped_embedding = true;
+    host_image_options.host_mapped_dflash2_codebooks = true;
+    host_image_options.host_pinned_vision_weights = true;
+    host_image_options.max_vision_item_tokens = 2048;
+    const auto host_image_server = Json::parse(format_server_start_json(
+        "serve-test", 1001, options, host_image_options, sampling_defaults, "deployment-alias",
+        load, memory, environment, std::uint64_t{123456}));
+    failures += check(
+        host_image_server.at("engine").at("context_cache").at("total_device_state_slots") ==
+                host_image_options.max_concurrency &&
+            host_image_server.at("engine").at("context_cache").at("total_device_state_slots") == 2 &&
+            host_image_server.at("engine").at("context_cache").at("device_state_slots") == 2 &&
+            host_image_server.at("engine").at("context_cache").at("host_capacity_bytes") ==
+                (64ULL << 20) &&
+            host_image_server.at("schema_version") == 29,
+        "Host StateImages were incorrectly advertised as extra Device StateImage slots");
+    for (const char* key : {"host_state_images", "host_mapped_embedding",
+                            "host_mapped_dflash2_codebooks", "host_pinned_vision_weights"}) {
+        failures += check(server.at("engine").at(key) == false &&
+                              host_image_server.at("engine").at(key) == true,
+                          "Host option was omitted or lost its configured value");
+    }
+    failures += check(
+        host_image_server.at("engine").at("max_vision_item_tokens") == 2048 &&
+            server.at("engine").at("max_vision_item_tokens") == 16384 &&
+            host_image_server.at("engine").at("context_cache").at("extra_state_placement") == "host" &&
+            server.at("engine").at("context_cache").at("extra_state_placement") == "device",
+        "Vision limit or StateImage placement was not recorded");
+    failures += check(
+        server.at("artifact").at("mapped_host_bytes") == 80 &&
+            server.at("artifact").at("pinned_host_bytes") == 120 &&
+            server.at("artifact").at("mapped_host_object_count") == 2 &&
+            server.at("artifact").at("pinned_host_object_count") == 3 &&
+            server.at("memory").at("vision_workspace").at("weight_staging_offset_bytes") == 500 &&
+            server.at("memory").at("vision_workspace").at("weight_staging_slot_bytes") == 256 &&
+            server.at("memory").at("vision_workspace").at("weight_staging_capacity_bytes") == 512,
+        "Host weight payload or Vision staging breakdown was not recorded");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");
     failures +=
@@ -867,6 +915,64 @@ int main() {
             throughput_json.at("context_cache").at("selections").at("checkpoint") == 2,
         "context-cache throughput statistics missing or not interval-scoped");
 
+    ThroughputReport phase_delta;
+    phase_delta.interval_seconds = 1.0;
+    phase_delta.previous.host_work = {.decode_host_ns          = 10'000'000,
+                                      .decode_device_wait_ns   = 20'000'000,
+                                      .prefill_host_ns         = 30'000'000,
+                                      .prefill_device_wait_ns  = 40'000'000,
+                                      .replay_host_ns          = 50'000'000,
+                                      .replay_device_wait_ns   = 60'000'000,
+                                      .control_host_ns         = 70'000'000,
+                                      .control_device_wait_ns  = 80'000'000};
+    phase_delta.current.host_work = {.decode_host_ns          = 11'000'000,
+                                     .decode_device_wait_ns   = 22'000'000,
+                                     .prefill_host_ns         = 33'000'000,
+                                     .prefill_device_wait_ns  = 44'000'000,
+                                     .replay_host_ns          = 55'000'000,
+                                     .replay_device_wait_ns   = 66'000'000,
+                                     .control_host_ns         = 77'000'000,
+                                     .control_device_wait_ns  = 88'000'000};
+    const Json phases = Json::parse(format_throughput_json("serve-test", 6000, phase_delta));
+    const auto& classes = phases.at("host_work").at("work_class_seconds");
+    const char* fields[] = {"decode_host", "decode_device_wait", "prefill_host",
+                            "prefill_device_wait", "replay_host", "replay_device_wait",
+                            "control_host", "control_device_wait"};
+    for (std::size_t index = 0; index < std::size(fields); ++index) {
+        failures += check(
+            std::abs(classes.at(fields[index]).get<double>() -
+                     static_cast<double>(index + 1) * 0.001) < 1e-15,
+            "work class interval delta lost its nonzero baseline or independent Replay field");
+    }
+    failures += check(phases.at("schema_version") == 29 &&
+                          phases.at("tokens").at("computed_prefill") == 0 &&
+                          phases.at("host_work").at("elapsed_seconds").at("total") == 0,
+                      "Replay fabricated initial Prefill tokens or aggregate Host work");
+    std::uint64_t ninfer::RuntimeHostWorkStats::* const counters[] = {
+        &ninfer::RuntimeHostWorkStats::decode_host_ns,
+        &ninfer::RuntimeHostWorkStats::decode_device_wait_ns,
+        &ninfer::RuntimeHostWorkStats::prefill_host_ns,
+        &ninfer::RuntimeHostWorkStats::prefill_device_wait_ns,
+        &ninfer::RuntimeHostWorkStats::replay_host_ns,
+        &ninfer::RuntimeHostWorkStats::replay_device_wait_ns,
+        &ninfer::RuntimeHostWorkStats::control_host_ns,
+        &ninfer::RuntimeHostWorkStats::control_device_wait_ns};
+    for (bool rollback : {false, true}) {
+        const ninfer::RuntimeStats previous = phase_delta.previous;
+        ninfer::RuntimeStats current = previous;
+        if (rollback) {
+            for (auto field : counters) { --(current.host_work.*field); }
+        }
+        const ThroughputReport reset{.interval_seconds = 1.0,
+                                     .previous = previous, .current = current};
+        const auto reset_json = Json::parse(format_throughput_json("serve-test", 6001, reset));
+        for (auto field : fields) {
+            failures += check(
+                reset_json.at("host_work").at("work_class_seconds").at(field) == 0,
+                "unchanged or rolled-back work class counter did not clamp to zero");
+        }
+    }
+
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
         ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
@@ -902,6 +1008,30 @@ int main() {
                           "third appended event mismatch");
     }
     input.close();
+    std::filesystem::remove(log_path);
+
+    {
+        JsonlRequestLog writer(log_path.string());
+        writer.write_server_start(options, engine_options, sampling_defaults, "deployment-alias",
+                                  load, memory, environment);
+        writer.write_server_start(options, engine_options, sampling_defaults, "deployment-alias",
+                                  load, memory, ServerLogEnvironment{.device = -1});
+    }
+    std::ifstream environment_input(log_path);
+    std::getline(environment_input, first_line);
+    std::getline(environment_input, second_line);
+    std::getline(environment_input, extra_line);
+    const auto injected = Json::parse(first_line);
+    const auto unavailable = Json::parse(second_line);
+    failures += check(injected.at("environment") == server.at("environment") &&
+                          injected.at("schema_version") == 29 && extra_line.empty(),
+                      "explicit environment writer did not preserve caller-provided values");
+    failures += check(unavailable.at("environment").at("device") == -1 &&
+                          unavailable.at("environment").at("gpu_name") == "" &&
+                          unavailable.at("environment").at("cuda_runtime_version") == "" &&
+                          unavailable.at("environment").at("total_device_memory_bytes") == 0,
+                      "unavailable environment was replaced with a fabricated CUDA query");
+    environment_input.close();
     std::filesystem::remove(log_path);
 
     if (failures == 0) { std::cout << "ok\n"; }

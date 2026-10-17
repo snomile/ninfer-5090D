@@ -28,9 +28,12 @@ class VisionPrefillSession;
 // Text and decode use the disjoint general workspace and preserve its owner.
 class VisionHandoffState {
     friend class VisionPrefillSession;
+    friend class VisionContext;
 
     const VisionPrefillSession* owner_ = nullptr;
     std::uint64_t generation_          = 0;
+    std::array<std::optional<CudaCompletionEvent>, 2> staging_ready_;
+    std::array<std::optional<CudaCompletionEvent>, 2> staging_consumed_;
 };
 
 struct VisionUseSpan {

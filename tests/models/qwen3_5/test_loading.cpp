@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <iostream>
+#include <string_view>
 
 namespace {
 
@@ -160,6 +161,88 @@ struct ModelFixture {
         file.root["files"] =
             Json::array({{{"path", nullptr}, {"payload_bytes", file.payload.size()}}});
     }
+
+    void vision() {
+        file.root["components"]["vision"] = {
+            {"target", "text"},
+            {"config", {{"model_type", "qwen3_5_vision"}, {"depth", 1}, {"hidden_size", 8},
+                        {"intermediate_size", 12}, {"num_heads", 1}, {"patch_size", 2},
+                        {"temporal_patch_size", 1}, {"spatial_merge_size", 2},
+                        {"num_position_embeddings", 4}}}};
+        parameter("vision/patch_embedding", {8, 12}, "vision/patch_input");
+        parameter("vision/patch_embedding_bias", {8});
+        parameter("vision/position_embedding", {4, 8});
+        const std::string p = "vision/layers/0/";
+        for (const auto* name : {"norm1_weight", "norm1_bias", "norm2_weight", "norm2_bias"}) {
+            parameter(p + name, {8});
+        }
+        for (const auto* name : {"query", "key", "value"}) {
+            parameter(p + "attention/" + name, {8, 8}, p + "attention_input");
+        }
+        for (const auto* name : {"query_bias", "key_bias", "value_bias"}) {
+            parameter(p + "attention/" + name, {8});
+        }
+        parameter(p + "attention/output", {8, 8}, p + "attention_output");
+        parameter(p + "attention/output_bias", {8});
+        parameter(p + "mlp/fc1", {12, 8}, p + "mlp_input");
+        parameter(p + "mlp/fc1_bias", {12});
+        parameter(p + "mlp/fc2", {8, 12}, p + "mlp_activation");
+        parameter(p + "mlp/fc2_bias", {8});
+        parameter("vision/merger/norm_weight", {8});
+        parameter("vision/merger/norm_bias", {8});
+        parameter("vision/merger/fc1", {32, 32}, "vision/merger/input");
+        parameter("vision/merger/fc1_bias", {32});
+        parameter("vision/merger/fc2", {128, 32}, "vision/merger/activation");
+        parameter("vision/merger/fc2_bias", {128});
+        const auto processor = Json{{"patch_size", 2}, {"temporal_patch_size", 1},
+                                    {"merge_size", 2}}.dump();
+        for (const auto* role : {"preprocessor_config.json", "video_preprocessor_config.json"}) {
+            resource(role, processor);
+            file.root["components"]["text"]["resources"].erase(role);
+            file.root["components"]["vision"]["resources"][role] = role;
+        }
+    }
+
+    void dflash2() {
+        file.root["components"]["dflash2"] = {
+            {"target", "text"},
+            {"config", {{"architectures", {"DFlash2DraftModel"}}, {"model_type", "qwen3"},
+                        {"intermediate_size", 24}, {"num_attention_heads", 2},
+                        {"num_key_value_heads", 1}, {"head_dim", 8}, {"num_hidden_layers", 1},
+                        {"max_position_embeddings", 128}, {"rms_norm_eps", 1e-6},
+                        {"rope_parameters", {{"rope_theta", 10000}}},
+                        {"layer_types", {"sliding_attention"}}, {"sliding_window", 17},
+                        {"dflash_config", {{"target_layer_ids", {0}}, {"mask_token_id", 263},
+                                           {"conv_kernel_size", 2}, {"conv_group_size", 16},
+                                           {"selector_rank", 4}, {"selector_top_k", 2}}}}}};
+        use("text/output_head", "dflash2/final_hidden");
+        parameter("dflash2/feature_projection", {128, 128}, "dflash2/target_features");
+        parameter("dflash2/context_norm", {128});
+        parameter("dflash2/final_norm", {128});
+        const std::string p = "dflash2/layers/0/";
+        parameter(p + "input_norm", {128});
+        parameter(p + "post_attention_norm", {128});
+        for (const auto* name : {"query", "key", "value"}) {
+            parameter(p + "attention/" + name, {std::string_view(name) == "query" ? 16U : 8U, 128},
+                      p + "query_projection_input");
+        }
+        for (const auto* name : {"context_key", "context_value"}) {
+            parameter(p + "attention/" + name, {8, 128}, "dflash2/context_input");
+        }
+        parameter(p + "attention/query_norm", {8});
+        parameter(p + "attention/key_norm", {8});
+        parameter(p + "attention/output", {128, 16}, p + "attention_output");
+        parameter(p + "mlp/gate", {24, 128}, p + "mlp_input");
+        parameter(p + "mlp/up", {24, 128}, p + "mlp_input");
+        parameter(p + "mlp/down", {128, 24}, p + "mlp_product");
+        for (const auto* name : {"attention_conv", "mlp_conv"}) {
+            parameter(p + name + "/base_kernel", {2, 2, 128});
+            parameter(p + name + "/kernel_projection", {32, 128}, p + name + "_input");
+        }
+        parameter("dflash2/candidate_selector/hidden_projection", {4, 128}, "dflash2/final_hidden");
+        parameter("dflash2/candidate_selector/predecessor_codebook", {272, 4});
+        parameter("dflash2/candidate_selector/successor_codebook", {272, 4});
+    }
 };
 
 void logical_data_and_instances() {
@@ -197,6 +280,23 @@ void logical_data_and_instances() {
             "incomplete selected Vision was accepted");
     rejects([&] { (void)q35::plan_load(reader, {.speculative = SpeculativeBackend::Mtp}); },
             "absent MTP was accepted");
+    rejects<std::invalid_argument>(
+        [&] { (void)q35::plan_load(reader, {.host_pinned_vision_weights = true}); },
+        "Host-pinned Vision weights were accepted without Vision");
+    for (const auto backend : {SpeculativeBackend::None, SpeculativeBackend::Mtp,
+                               SpeculativeBackend::DFlash}) {
+        rejects<std::invalid_argument>(
+            [&] {
+                (void)q35::plan_load(reader, {.speculative = backend,
+                                              .host_mapped_dflash2_codebooks = true});
+            },
+            "Host-mapped codebooks were accepted outside DFlash2");
+    }
+    auto shared = q35::plan_load(reader, {.host_mapped_embedding = true});
+    rejects([&] { (void)shared.placement(Device::cuda(0), Device::cuda(0)); },
+            "shared embedding/head parent accepted incompatible mapped placement");
+    rejects([&] { (void)q35::resolve_load(std::move(shared), Device::cuda(0)); },
+            "resolve_load accepted a shared mapped embedding and Device output head");
 
     const auto resolved                   = q35::resolve_load(std::move(plan), Device::cuda(0));
     const auto capacity                   = resolved.materialization().device_capacity_bytes;
@@ -297,6 +397,90 @@ void native_uses() {
         "combined coverage hid an incorrect gate/up boundary");
 }
 
+void optional_host_placements() {
+    ModelFixture fixture;
+    fixture.file.root["components"]["text"]["config"]["tie_word_embeddings"] = false;
+    fixture.tensor("output-storage", {272, 128});
+    fixture.file.root["bindings"]["text/output_head"] = {{"object", "output-storage"}};
+    fixture.vision();
+    fixture.dflash2();
+    fixture.file.root["files"][0]["payload_bytes"] = fixture.file.payload.size();
+    fixture.file.write();
+    artifact::Reader reader(fixture.file.entry);
+    const auto cuda = Device::cuda(0);
+    const auto baseline = q35::plan_load(
+        reader, {.vision = true, .speculative = SpeculativeBackend::DFlash2}).placement(cuda, cuda);
+    require(baseline.registered_host_objects.empty() && baseline.ordinary_host_objects.empty() &&
+                baseline.host_capacity_bytes == 0 && baseline.registered_host_bytes == 0,
+            "default Vision and DFlash2 weights no longer reside entirely on Device");
+    for (unsigned flags = 0; flags < 8; ++flags) {
+        const LoadOptions options{.vision = true, .speculative = SpeculativeBackend::DFlash2,
+                                  .host_mapped_embedding = bool(flags & 1),
+                                  .host_mapped_dflash2_codebooks = bool(flags & 2),
+                                  .host_pinned_vision_weights = bool(flags & 4)};
+        auto logical = q35::plan_load(reader, options);
+        require(logical.options() == options && logical.weights().vision &&
+                    logical.weights().draft && logical.weights().draft->selector,
+                "Host options changed the selected logical model components");
+        const auto storage = logical.placement(cuda, cuda);
+        const auto on_host = [&](const std::string& id) {
+            return (options.host_mapped_embedding && id == "embedding-storage") ||
+                   (options.host_mapped_dflash2_codebooks &&
+                    (id == "dflash2/candidate_selector/predecessor_codebook" ||
+                     id == "dflash2/candidate_selector/successor_codebook")) ||
+                   (options.host_pinned_vision_weights && id.starts_with("vision/"));
+        };
+        std::size_t expected_host = 0;
+        std::size_t expected_mapped = 0;
+        for (const auto& placement : baseline.device_objects) {
+            const auto& id = reader.directory().tensor(placement.object).id;
+            if (on_host(id)) {
+                ++expected_host;
+                if (!id.starts_with("vision/")) { ++expected_mapped; }
+            }
+        }
+        require(storage.ordinary_host_objects.empty() &&
+                    storage.registered_host_objects.size() == expected_host &&
+                    storage.device_objects.size() + expected_host == baseline.device_objects.size(),
+                "Host selection duplicated or omitted complete parent objects");
+        std::size_t actual_mapped = 0;
+        for (const auto& placement : storage.registered_host_objects) {
+            const auto& id = reader.directory().tensor(placement.object).id;
+            require(on_host(id) && placement.mapped == !id.starts_with("vision/") &&
+                        placement.region.bytes == reader.geometry(placement.object).bytes &&
+                        placement.region.offset <= storage.registered_host_bytes &&
+                        placement.region.bytes <=
+                            storage.registered_host_bytes - placement.region.offset,
+                    "Host parent has incorrect mapping mode or incomplete registered storage");
+            actual_mapped += placement.mapped;
+        }
+        for (const auto& placement : storage.device_objects) {
+            require(!on_host(reader.directory().tensor(placement.object).id),
+                    "Host-selected parent still occupies Device weight storage");
+        }
+        require(actual_mapped == expected_mapped &&
+                    storage.host_capacity_bytes == storage.registered_host_bytes &&
+                    (expected_host == 0 || storage.registered_host_bytes > 0) &&
+                    (expected_host == 0 ||
+                     storage.device_capacity_bytes < baseline.device_capacity_bytes),
+                "Host placement did not account its mapped and transfer-only capacity");
+        const auto resolved = q35::resolve_load(std::move(logical), cuda);
+        require(resolved.materialization().host_capacity_bytes == storage.host_capacity_bytes &&
+                    resolved.materialization().device_capacity_bytes == storage.device_capacity_bytes,
+                "resolve_load changed the cold Host placement capacity");
+    }
+    EngineOptions engine;
+    engine.enable_vision = true;
+    engine.speculative.backend = SpeculativeBackend::DFlash2;
+    engine.host_mapped_embedding = true;
+    engine.host_mapped_dflash2_codebooks = true;
+    engine.host_pinned_vision_weights = true;
+    const auto options = load_options(engine);
+    require(options.vision && options.dflash2() && options.host_mapped_embedding &&
+                options.host_mapped_dflash2_codebooks && options.host_pinned_vision_weights,
+            "engine-to-load conversion dropped a Host memory option");
+}
+
 void invalid_model_data() {
     ModelFixture fixture;
     const Json original = fixture.file.root;
@@ -342,6 +526,7 @@ int main() {
     try {
         logical_data_and_instances();
         native_uses();
+        optional_host_placements();
         cold_matrix_profile();
         invalid_model_data();
         std::cout << "model config, binding, resources and Use checks passed\n";

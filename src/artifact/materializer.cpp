@@ -307,6 +307,22 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     place(plan.registered_host_objects,
           out.host_storage_.span().subspan(0, plan.registered_host_bytes), false,
           plan.host_alignment);
+    for (const auto& placement : plan.registered_host_objects) {
+        if (!placement.mapped) {
+            out.stats_.pinned_host_bytes += placement.region.bytes;
+            ++out.stats_.pinned_host_object_count;
+            continue;
+        }
+        out.stats_.mapped_host_bytes += placement.region.bytes;
+        ++out.stats_.mapped_host_object_count;
+        auto& object = out.objects_.at(placement.object.index);
+        const auto mapped = out.host_transfer_view(placement.object);
+        if (!mapped.device_address) throw ArtifactError("mapped Host parent has no CUDA address");
+        object.device = *object.host;
+        object.device->device = mapped.cuda_device;
+        object.device->data = static_cast<const std::byte*>(mapped.device_address);
+        object.mapped = true;
+    }
     place(plan.ordinary_host_objects, out.host_storage_.span().subspan(plan.registered_host_bytes),
           false);
     place(plan.device_objects, out.device_storage_.span(), true);
@@ -325,7 +341,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             };
             ranges.push_back({segment.file_index, segment.file_offset,
                               checked_add(segment.file_offset, segment.bytes, "copy range"),
-                              address(object.host), address(object.device),
+                              address(object.host), object.mapped ? nullptr : address(object.device),
                               segment.destination_offset, geometry.divisor_offset, divisors});
         }
     }

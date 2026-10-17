@@ -69,11 +69,6 @@ DeviceMemorySnapshot device_memory_snapshot(Device device) {
     return snapshot;
 }
 
-std::int64_t device_memory_growth(DeviceMemorySnapshot before, DeviceMemorySnapshot after) {
-    return static_cast<std::int64_t>(before.free_bytes) -
-           static_cast<std::int64_t>(after.free_bytes);
-}
-
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     if (err == cudaSuccess) { return; }
     std::fprintf(stderr, "%s:%d: CUDA_CHECK(%s) failed: %s: %s\n", file, line, expr,
@@ -91,12 +86,13 @@ DeviceContext::DeviceContext(int device_id) : device_(Device::cuda(device_id)) {
     if (count <= 0) { throw std::runtime_error("no CUDA devices available"); }
     if (device_id >= count) { throw std::invalid_argument("invalid CUDA device id"); }
 
-    bind_to_current_thread();
-
-    err = cudaSetDeviceFlags(sync_flags);
+    // Set primary-context flags before cudaSetDevice can initialize that context.
+    err = cudaInitDevice(device_id, sync_flags | cudaDeviceMapHost,
+                         cudaInitDeviceFlagsAreValid);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaSetDeviceFlags failed", err));
+        throw std::runtime_error(cuda_error_message("cudaInitDevice failed", err));
     }
+    bind_to_current_thread();
 
     err = cudaGetDeviceProperties(&props_, device_id);
     if (err != cudaSuccess) {

@@ -102,7 +102,12 @@ std::string usage_text(const char* argv0) {
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
-           "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
+           "--vision enables image/video input.\n"
+           "--max-vision-item-tokens N bounds one image/video item (1..16384; default 16384).\n"
+           "--host-mapped-embedding maps the input embedding from Host memory.\n"
+           "--host-mapped-dflash2-codebooks maps selector tables (requires --spec dflash2).\n"
+           "--host-pinned-vision-weights stages Host Vision weights (requires --vision).\n"
+           "--host-state-images places extra StateImage snapshots on Host.\n"
            "--prefill-chunk requires a positive multiple of 128; defaults to 1024, or 4096 with "
            "CPU expert offload.\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
@@ -178,6 +183,18 @@ Options parse_options(int argc, char** argv) {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--max-vision-item-tokens") {
+            options.max_vision_item_tokens = parse_u32(value(arg), "max-vision-item-tokens");
+            if (options.max_vision_item_tokens > 16'384)
+                throw std::invalid_argument("--max-vision-item-tokens must be in [1,16384]");
+        } else if (arg == "--host-mapped-embedding") {
+            options.host_mapped_embedding = true;
+        } else if (arg == "--host-mapped-dflash2-codebooks") {
+            options.host_mapped_dflash2_codebooks = true;
+        } else if (arg == "--host-pinned-vision-weights") {
+            options.host_pinned_vision_weights = true;
+        } else if (arg == "--host-state-images") {
+            options.host_state_images = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--stop-token-id") {
@@ -254,6 +271,11 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--thinking-budget cannot be combined with --no-thinking");
     }
     if (options.greedy) { options.sampling.temperature = 0.0F; }
+    if (options.host_mapped_dflash2_codebooks &&
+        options.speculative.backend != SpeculativeBackend::DFlash2)
+        throw std::invalid_argument("--host-mapped-dflash2-codebooks requires --spec dflash2");
+    if (options.host_pinned_vision_weights && !options.enable_vision)
+        throw std::invalid_argument("--host-pinned-vision-weights requires --vision");
     return options;
 }
 

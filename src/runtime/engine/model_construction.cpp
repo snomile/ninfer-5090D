@@ -23,6 +23,9 @@ void validate_options(const EngineOptions& options) {
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    models::validate_memory_options(models::load_options(options));
+    if (!options.max_vision_item_tokens || options.max_vision_item_tokens > 16'384)
+        throw std::invalid_argument("max_vision_item_tokens must be in [1,16384]");
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit:
         if (options.kv_capacity.explicit_tokens == 0) {
@@ -82,6 +85,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
         options.speculative          = {};
         options.enable_vision        = false;
+        options.host_mapped_dflash2_codebooks = false;
+        options.host_pinned_vision_weights = false;
+        options.host_state_images = false;
         options.use_cuda_graph       = false;
         options.context_cache        = ContextCacheOptions{
                    .enabled = false, .device_state_slots = 0, .host_capacity_bytes = 0};
@@ -101,6 +107,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("context cache Device state capacity exceeds uint32");
     }
+    models::validate_memory_options(models::load_options(options));
+    if (!options.max_vision_item_tokens || options.max_vision_item_tokens > 16'384)
+        throw std::invalid_argument("max_vision_item_tokens must be in [1,16384]");
+    if (options.host_state_images && *cache.device_state_slots &&
+        cache.host_capacity_bytes && !*cache.host_capacity_bytes)
+        throw std::invalid_argument("Host StateImage slots require nonzero Host capacity");
     return options;
 }
 

@@ -110,18 +110,45 @@ void StateImageStore::Transfer::publish(bool keep_source_replica) {
     owner_->publish_transfer(*this, keep_source_replica);
 }
 
+StateImageStore::HostReservation::~HostReservation() { reset(); }
+
+StateImageStore::HostReservation::HostReservation(HostReservation&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr)), allocation_(std::move(other.allocation_)) {}
+
+StateImageStore::HostReservation&
+StateImageStore::HostReservation::operator=(HostReservation&& other) noexcept {
+    if (this != &other) {
+        reset();
+        owner_ = std::exchange(other.owner_, nullptr);
+        allocation_ = std::move(other.allocation_);
+    }
+    return *this;
+}
+
+void StateImageStore::HostReservation::reset() noexcept {
+    if (!owner_) return;
+    --owner_->pending_host_images_;
+    owner_ = nullptr;
+    allocation_ = {};
+}
+
 StateImageStore::StateImageStore(StateImageStorage& device, HostContextArena* host,
-                                 std::uint32_t logical_capacity)
+                                 std::uint32_t logical_capacity,
+                                 std::optional<std::uint32_t> host_slot_limit)
     : device_(&device), host_(host), objects_(logical_capacity), free_objects_(logical_capacity),
       free_device_slots_(static_cast<std::size_t>(device.slot_count())),
       free_object_count_(logical_capacity),
       free_device_count_(static_cast<std::uint32_t>(device.slot_count())) {
     if (logical_capacity == 0 || device.slot_count() <= 0 ||
-        logical_capacity < static_cast<std::uint32_t>(device.slot_count()) ||
-        (host != nullptr && logical_capacity < static_cast<std::uint32_t>(device.slot_count()) +
-                                                   host->capacity_bytes() / device.image_bytes())) {
+        logical_capacity < static_cast<std::uint32_t>(device.slot_count())) {
         throw std::invalid_argument("StateImageStore capacity is inconsistent");
     }
+    const auto host_slots = host ? host->capacity_bytes() / device.image_bytes() : 0;
+    const auto maximum = std::min<std::uint64_t>(
+        host_slots, host_slot_limit.value_or(std::numeric_limits<std::uint32_t>::max()));
+    if (maximum > logical_capacity - static_cast<std::uint32_t>(device.slot_count()))
+        throw std::invalid_argument("StateImageStore logical capacity cannot cover Host slots");
+    host_capacity_ = static_cast<std::uint32_t>(maximum);
     for (std::uint32_t index = 0; index < logical_capacity; ++index) {
         free_objects_[index] = logical_capacity - 1U - index;
     }
@@ -149,6 +176,20 @@ std::uint32_t StateImageStore::host_occupied() const noexcept {
     std::uint32_t count = pending_host_images_;
     for (const auto& object : objects_) { count += object.host_slot.has_value(); }
     return count;
+}
+
+bool StateImageStore::can_reserve_host() const noexcept {
+    return host_ && host_occupied() < host_capacity_ &&
+           host_->can_allocate(device_->image_bytes());
+}
+
+std::optional<StateImageStore::HostReservation>
+StateImageStore::reserve_host_destination() noexcept {
+    if (!can_reserve_host()) return std::nullopt;
+    auto allocation = host_->allocate(device_->image_bytes());
+    if (!allocation) return std::nullopt;
+    ++pending_host_images_;
+    return HostReservation(*this, std::move(*allocation));
 }
 
 std::optional<StateImageStore::Handle> StateImageStore::reserve_destination() noexcept {
@@ -400,16 +441,32 @@ StateImageSelectors StateImageStore::selectors(Handle source, Handle destination
 
 std::optional<StateImageStore::Transfer>
 StateImageStore::reserve_device_to_host(Handle source, HostContextAllocation reserved) {
+    if (!reserved.valid()) {
+        auto ticket = reserve_host_destination();
+        if (!ticket) return std::nullopt;
+        return reserve_device_to_host(source, std::move(*ticket));
+    }
+    if (!host_ || host_occupied() >= host_capacity_) return std::nullopt;
+    ++pending_host_images_;
+    return reserve_device_to_host(source, HostReservation(*this, std::move(reserved)));
+}
+
+std::optional<StateImageStore::Transfer>
+StateImageStore::reserve_device_to_host(Handle source, HostReservation reserved) {
+    if (reserved.owner_ != this)
+        throw std::invalid_argument("StateImage Host reservation belongs to another store");
+    auto transfer = reserve_device_to_host_allocation(source, std::move(reserved.allocation_));
+    if (transfer) reserved.owner_ = nullptr;
+    return transfer;
+}
+
+std::optional<StateImageStore::Transfer>
+StateImageStore::reserve_device_to_host_allocation(Handle source, HostContextAllocation reserved) {
     Object& object = require(source);
     if (host_ == nullptr || object.role != StateImageRole::CheckpointImmutable ||
         !object.device_slot || object.host_slot || has_pending_replica(object) ||
         object.source_pins == std::numeric_limits<std::uint32_t>::max()) {
         return std::nullopt;
-    }
-    if (!reserved.valid()) {
-        auto target = host_->allocate(device_->image_bytes());
-        if (!target) { return std::nullopt; }
-        reserved = std::move(*target);
     }
     if (!reserved.reserved() || reserved.bytes() != device_->image_bytes()) {
         throw std::invalid_argument("StateImage Host reservation has incompatible geometry");
@@ -417,7 +474,6 @@ StateImageStore::reserve_device_to_host(Handle source, HostContextAllocation res
     const auto id = next_transfer();
     Transfer transfer(*this, id, StateTransferDirection::DeviceToHost, read(source), source);
     transfer.host_slot_.emplace(std::move(reserved));
-    ++pending_host_images_;
     object.transfer_id        = id;
     object.destination_pinned = true;
     return transfer;

@@ -7,6 +7,7 @@
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
+#include "runtime/engine/generation_handle_impl.h"
 #include "runtime/engine/model_construction.h"
 
 #include <algorithm>
@@ -83,68 +84,6 @@ const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept
 }
 
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
-
-class GenerationHandle::Impl {
-public:
-    class Concept {
-    public:
-        virtual ~Concept() = default;
-        virtual GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) = 0;
-    };
-
-    template <class Submission>
-    class Model final : public Concept {
-    public:
-        Model(std::shared_ptr<void> keep_alive, Submission submission)
-            : keep_alive_(std::move(keep_alive)), submission_(std::move(submission)) {}
-
-        GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) override {
-            return submission_.wait(sink, cancellation);
-        }
-
-    private:
-        std::shared_ptr<void> keep_alive_;
-        Submission submission_;
-    };
-
-    template <class Submission>
-    Impl(std::shared_ptr<void> keep_alive, Submission submission,
-         ResolvedSamplingParameters sampling)
-        : state_(std::make_unique<Model<Submission>>(std::move(keep_alive), std::move(submission))),
-          sampling_(sampling) {}
-
-    GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
-        return state_->wait(sink, cancellation);
-    }
-
-    [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept {
-        return sampling_;
-    }
-
-private:
-    std::unique_ptr<Concept> state_;
-    ResolvedSamplingParameters sampling_;
-};
-
-GenerationHandle::GenerationHandle() noexcept                              = default;
-GenerationHandle::~GenerationHandle()                                      = default;
-GenerationHandle::GenerationHandle(GenerationHandle&&) noexcept            = default;
-GenerationHandle& GenerationHandle::operator=(GenerationHandle&&) noexcept = default;
-
-GenerationHandle::GenerationHandle(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
-
-GenerationHandle::operator bool() const noexcept { return impl_ != nullptr; }
-
-const ResolvedSamplingParameters& GenerationHandle::resolved_sampling() const noexcept {
-    static const ResolvedSamplingParameters empty;
-    return impl_ != nullptr ? impl_->resolved_sampling() : empty;
-}
-
-GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView& cancellation) {
-    if (impl_ == nullptr) { throw std::logic_error("GenerationHandle is empty"); }
-    std::unique_ptr<Impl> impl = std::move(impl_);
-    return impl->wait(sink, cancellation);
-}
 
 class Engine::Impl {
 public:

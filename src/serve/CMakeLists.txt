@@ -14,9 +14,12 @@ add_library(ninfer_serve STATIC
   openai_responses_store.cpp
   translate.cpp
   generation_service.cpp
+  request_error.cpp
   request_events.cpp
   operational_log.cpp
+  operational_log_engine.cpp
   request_log.cpp
+  device_environment.cpp
   metrics.cpp
   http_server.cpp
   openai_responses_http.cpp

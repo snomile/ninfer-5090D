@@ -1,5 +1,6 @@
 #pragma once
 
+#include "serve/engine_failure_monitor.h"
 #include "serve/generation_service.h"
 #include "serve/metrics.h"
 #include "serve/operational_log.h"
@@ -114,6 +115,7 @@ private:
     std::condition_variable stats_cv_;
     std::thread stats_thread_;
     bool stats_stopping_ = false;
+    EngineFailureMonitor engine_monitor_;
 };
 
 } // namespace ninfer::serve

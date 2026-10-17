@@ -42,8 +42,9 @@ namespace fi = frontend;
 
 constexpr std::string_view kThinkClose = "</think>";
 constexpr std::string_view kThinkingControl =
-    "\n\n Considering the limited time by the user, I have to give the solution based on the "
+    " \n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n</think>\n\n";
+// Break a partial canonical close left at the model budget before appending the control.
 static_assert(kThinkingControl.ends_with(fi::kCanonicalReasoningCloseSerialization));
 constexpr double kRescaleFactor = 1.0 / 255.0;
 constexpr double kVideoFps      = 2.0;
@@ -523,6 +524,18 @@ public:
             std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
         processor.max_vision_tokens = vision_tokens;
         processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
+        if (!options.max_vision_item_tokens ||
+            options.max_vision_item_tokens > kMaximumVisionItemTokens)
+            throw std::invalid_argument("frontend max_vision_item_tokens must be in [1,16384]");
+        processor.max_item_vision_tokens =
+            std::min<std::uint64_t>(vision_tokens, options.max_vision_item_tokens);
+        processor.max_item_raw_patches =
+            processor.max_item_vision_tokens * kRawPatchesPerVisionToken;
+        const auto pixels = processor.max_item_vision_tokens * 32ULL * 32ULL;
+        processor.image_max_pixels = std::min(processor.image_max_pixels, pixels);
+        processor.image_min_pixels = std::min(processor.image_min_pixels, processor.image_max_pixels);
+        processor.video_max_pixels = std::min(processor.video_max_pixels, pixels);
+        processor.video_min_pixels = std::min(processor.video_min_pixels, processor.video_max_pixels);
         if (vision_enabled) {
             const std::uint64_t minimum_live =
                 processor.max_raw_patches * kPreparedVisionPatchFeatures * sizeof(std::uint16_t);

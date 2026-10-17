@@ -293,6 +293,10 @@ build_model(const artifact::Reader& reader, EngineOptions& options, DeviceContex
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     summary.device_object_count = stats.device_object_count;
     summary.host_object_count   = stats.host_object_count;
+    summary.mapped_host_bytes = stats.mapped_host_bytes;
+    summary.pinned_host_bytes = stats.pinned_host_bytes;
+    summary.mapped_host_object_count = stats.mapped_host_object_count;
+    summary.pinned_host_object_count = stats.pinned_host_object_count;
     summary.context_cost        = std::move(context_cost.summary);
     return {std::move(instance), std::move(summary), std::move(context_cost.model)};
 }

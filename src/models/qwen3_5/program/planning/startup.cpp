@@ -81,7 +81,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
     }
     const std::int32_t state_image_slots = checked_i32(
-        static_cast<std::uint64_t>(plan.max_concurrency) + *plan.context_cache.device_state_slots,
+        static_cast<std::uint64_t>(plan.max_concurrency) +
+            (plan.host_state_images ? 0U : *plan.context_cache.device_state_slots),
         "Qwen3.5 StateImage slot count exceeds int32");
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
@@ -714,7 +715,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(plan.capacity, qwen::kMaximumVisionItemTokens));
+            std::min<std::uint64_t>({plan.capacity, plan.max_vision_item_tokens,
+                                     qwen::kMaximumVisionItemTokens}));
         out.vision   = qwen::VisionContext::plan_workspace(*profile.config.vision, *profile.vision,
                                                            merged, out.general_capacity);
         out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
@@ -724,6 +726,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
 void validate_target_options(const execution::ModelProfile& profile, DeviceContext& device,
                              const EngineOptions& options) {
+    if (!options.max_vision_item_tokens || options.max_vision_item_tokens > qwen::kMaximumVisionItemTokens)
+        throw std::invalid_argument("max_vision_item_tokens must be in [1,16384]");
     if (!profile.config.text.attention || profile.config.text.full_attention_layers == 0) {
         throw std::invalid_argument("Qwen3.5 Program requires at least one full-attention layer");
     }
@@ -817,12 +821,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency      = inputs.max_concurrency;
     impl->prefill_chunk        = inputs.prefill_chunk;
+    impl->max_vision_item_tokens = inputs.max_vision_item_tokens;
     impl->draft_window         = inputs.draft_window;
     impl->speculative_backend  = inputs.speculative_backend;
     impl->proposal_head        = inputs.proposal_head;
     impl->features             = inputs.features;
     impl->use_cuda_graph       = inputs.use_cuda_graph;
     impl->causal_scoring       = inputs.causal_scoring;
+    impl->host_state_images    = inputs.host_state_images;
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
@@ -835,6 +841,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                     "Host context state default overflow"),
                         "Host context default overflow");
     }
+    if (impl->host_state_images && *impl->context_cache.device_state_slots &&
+        *impl->context_cache.host_capacity_bytes &&
+        *impl->context_cache.host_capacity_bytes < impl->persistent.state_images.images.image_stride)
+        throw std::invalid_argument("Host context capacity cannot hold one StateImage");
     impl->workspace = build_workspace_plan(*impl);
     impl->device_reservation_bytes =
         checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence device capacity");
@@ -856,6 +866,7 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
         .profile         = std::move(profile),
         .moe             = std::move(moe),
         .capacity        = options.max_context,
+        .max_vision_item_tokens = options.max_vision_item_tokens,
         .max_concurrency = options.max_concurrency,
         .prefill_chunk =
             std::min(options.prefill_chunk ? options.prefill_chunk : 1024U, options.max_context),
@@ -866,6 +877,7 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
         .features             = models::load_options(options),
         .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
+        .host_state_images    = options.host_state_images,
         .multiprocessor_count = device.multiprocessor_count(),
         .context_cache        = options.context_cache,
     };
