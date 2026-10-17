@@ -1933,7 +1933,11 @@ private:
 
     enum class ReservationScope { Round, Prefill };
 
-    void reserve_resident_units(ReservationScope scope = ReservationScope::Round) {
+    void reserve_resident_units(HostPhaseMeasurement& boundary,
+                                ReservationScope scope = ReservationScope::Round) {
+        // Finished rows still own Native/cache resources until terminal settlement. Recheck
+        // after context progress and Decode, before shortage handling can select live victims.
+        (void)settle_terminal_requests(boundary);
         runnable_units_.fill(false);
         std::optional<std::uint32_t> recovering;
         std::optional<std::uint32_t> oldest;
@@ -2279,7 +2283,7 @@ private:
                     (void)try_admit_one(true);
                     executed |= progress_context_operation(boundary);
                 }
-                reserve_resident_units();
+                reserve_resident_units(boundary);
                 // A failed restore leaves spare resources available to fresh requests.
                 // An in-flight restoration/reclaim keeps its own candidate until settled.
                 if (!admission_decision_ || !admission_decision_->restoring) {
@@ -2293,7 +2297,9 @@ private:
                 }
                 if (instance_.program->has_context_operation()) {
                     executed |= progress_context_operation(boundary);
-                    if (!instance_.program->has_context_operation()) { reserve_resident_units(); }
+                    if (!instance_.program->has_context_operation()) {
+                        reserve_resident_units(boundary);
+                    }
                 }
                 const auto cancelled = snapshot_cancellations();
                 auto controls = scheduler_.build_control_membership(slots_, max_concurrency_);
@@ -2348,7 +2354,7 @@ private:
                     if (!instance_.program->has_context_operation()) {
                         // Control/Decode permits were consumed. Only the still-unexecuted
                         // Prefill/Replay turn can receive a new permit in this round.
-                        reserve_resident_units(ReservationScope::Prefill);
+                        reserve_resident_units(progress_boundary, ReservationScope::Prefill);
                     }
                     finish_engine_phase(progress_boundary, EngineHostPhase::Boundary);
                 }

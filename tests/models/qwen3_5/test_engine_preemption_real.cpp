@@ -118,7 +118,15 @@ struct Timeline {
     void output(std::size_t row, bool terminal) {
         std::lock_guard lock(mutex);
         if (first_output[row] == 0) { first_output[row] = ++ordinal; }
-        if (terminal && finished[row] == 0) { finished[row] = ++ordinal; }
+        if (terminal && finished[row] == 0) {
+            peer_prompt_at_finish[row] = processed_prompt[1 - row];
+            finished[row]              = ++ordinal;
+        }
+    }
+
+    void prompt(std::size_t row, std::uint32_t processed) {
+        std::lock_guard lock(mutex);
+        processed_prompt[row] = processed;
     }
 
     void complete(std::size_t row) {
@@ -141,6 +149,8 @@ struct Timeline {
     std::array<std::uint64_t, 2> started{};
     std::array<std::uint64_t, 2> first_output{};
     std::array<std::uint64_t, 2> finished{};
+    std::array<std::uint32_t, 2> processed_prompt{};
+    std::array<std::uint32_t, 2> peer_prompt_at_finish{};
 };
 
 class ObservationSink final : public ninfer::OutputSink {
@@ -514,6 +524,218 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     require(engine.is_available(), "Engine became unavailable after recovery");
 }
 
+void exercise_terminal_prefill(const std::filesystem::path& artifact,
+                               ninfer::SpeculativeBackend selected) {
+    static constexpr std::array<std::uint32_t, 2> prompt_tokens{151041, 150017};
+    // One Begin token and one Decode token force terminal commitment at the first Decode
+    // boundary, independently of the artifact's EOS prediction (the captured request said OK).
+    constexpr std::uint32_t output_tokens = 2;
+    constexpr std::uint32_t capacity      = 301056;
+    auto options                         = engine_options(artifact, selected, true);
+    options.max_context                  = 200000;
+    options.kv_capacity                  = ninfer::KvCapacityPolicy::explicit_capacity(capacity);
+    options.prefill_chunk                = 1024;
+    options.context_cache.enabled        = true;
+    options.kv_cache                     = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    options.host_mapped_embedding        = true;
+    options.host_mapped_dflash2_codebooks = selected == ninfer::SpeculativeBackend::DFlash2;
+    if (selected != ninfer::SpeculativeBackend::None) {
+        options.speculative.draft_tokens = 7;
+    }
+    ninfer::Engine engine(options);
+    require(engine.memory_summary().kv_capacity == capacity,
+            "terminal/prefill fixture requires exactly 4704 KV page groups");
+
+    ninfer::RequestOptions generation;
+    generation.execution.requested_output_tokens = output_tokens;
+    generation.execution.sampling.temperature    = 0.0F;
+    generation.execution.allow_prefix_reuse      = true;
+    generation.stop.include_model_defaults       = false;
+    generation.output.raw                        = true;
+    generation.constraint = ninfer::OutputConstraint::grammar("root ::= \"OK\" \"x\"{65536}");
+
+    Timeline timeline;
+    class Sink final : public ninfer::OutputSink {
+    public:
+        Sink(Timeline& timeline, std::size_t row, std::function<void()> on_start = {})
+            : timeline_(timeline), row_(row), on_start_(std::move(on_start)) {}
+
+        void start(ninfer::GenerationStart start) override {
+            require(++starts == 1 && start.prompt.prompt_tokens == prompt_tokens[row_] &&
+                        start.reused_prompt_tokens == 0,
+                    "terminal/prefill fixture reused input or restarted a request");
+            timeline_.start(row_);
+            if (on_start_) { on_start_(); }
+        }
+
+        void progress(ninfer::PromptProgress progress) override {
+            require(starts == 1 && progress.total_prompt_tokens == prompt_tokens[row_] &&
+                        progress.reused_prompt_tokens == 0 &&
+                        progress.processed_prompt_tokens >= processed &&
+                        progress.processed_prompt_tokens <= prompt_tokens[row_],
+                    "terminal/prefill prompt progress regressed or reused history");
+            processed = progress.processed_prompt_tokens;
+            timeline_.prompt(row_, processed);
+        }
+
+        void timing(ninfer::GenerationTimingObservation timing) override {
+            require(processed == prompt_tokens[row_] && timing.generated_tokens > generated &&
+                        timing.generated_tokens <= output_tokens,
+                    "terminal/prefill output accounting regressed or exceeded its budget");
+            generated = timing.generated_tokens;
+            timeline_.output(row_, generated == output_tokens);
+        }
+
+        void publish(ninfer::OutputDelta delta) override {
+            (delta.channel == ninfer::OutputChannel::Reasoning ? reasoning : content) += delta.text;
+        }
+
+        void validate(const ninfer::GenerationResult& result) const {
+            require(starts == 1 && generated == output_tokens &&
+                        result.generated_token_ids.size() == output_tokens &&
+                        result.finish_reason == ninfer::FinishReason::OutputLimit &&
+                        result.engine_timing.decode_rounds == 1,
+                    "terminal/prefill request did not complete its original output budget");
+            require(result.content == content && result.reasoning == reasoning &&
+                        (!content.empty() || !reasoning.empty()),
+                    "terminal/prefill stream differs from its terminal response");
+            require(result.reused_prompt_tokens == 0 &&
+                        result.computed_prefill_tokens == prompt_tokens[row_] &&
+                        result.scheduling.preemptions == 0 &&
+                        result.scheduling.replay_restores == 0 &&
+                        result.scheduling.snapshot_restores == 0 &&
+                        result.scheduling.replayed_tokens == 0,
+                    "terminal/prefill fixture took a cache-hit or pressure-recovery route");
+        }
+
+        unsigned starts         = 0;
+        std::uint32_t processed = 0, generated = 0;
+        std::string content, reasoning;
+
+    private:
+        Timeline& timeline_;
+        std::size_t row_;
+        std::function<void()> on_start_;
+    };
+
+    // Start the older request one chunk ahead, but give it one extra chunk of input. The
+    // younger request must finish first while the older still needs its last 513 tokens.
+    // Adding 1024 input and capacity tokens preserves the captured 150017x2/300032 pool's
+    // two-page shortage: the rounded prompts need 4706 pages in a 4704-page pool.
+    const auto prepare = [&](std::size_t row) {
+        const auto identity = "terminal-prefill-" + std::to_string(row) + ".";
+        std::string text = identity;
+        for (std::uint32_t token = 0; token < prompt_tokens[row] + 128; ++token) {
+            text += " x";
+        }
+        const auto prefix = [&](std::size_t bytes) {
+            ninfer::PromptInput input;
+            input.options.enable_thinking = false;
+            for (const auto& [role, content] :
+                 std::array<std::pair<ninfer::ChatRole, std::string>, 2>{
+                     std::pair{ninfer::ChatRole::System, text.substr(0, bytes)},
+                     std::pair{ninfer::ChatRole::User, std::string("Reply OK.")}}) {
+                ninfer::ChatMessage message;
+                message.role = role;
+                message.parts.push_back({.kind = ninfer::MessagePartKind::Text, .text = content});
+                input.messages.push_back(std::move(message));
+            }
+            // Use the public chat route so the input-recovery capture occurs before the
+            // assistant suffix, just as in the captured Anthropic request.
+            return engine.prepare(std::move(input));
+        };
+        std::size_t low = identity.size(), high = text.size();
+        while (low < high) {
+            const auto middle = low + (high - low) / 2;
+            auto prepared     = prefix(middle);
+            const auto count  = prepared.summary().prompt_tokens;
+            if (count == prompt_tokens[row]) { return prepared; }
+            if (count < prompt_tokens[row]) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        auto prepared = prefix(low);
+        require(prepared.summary().prompt_tokens == prompt_tokens[row],
+                "could not construct exact terminal/prefill chat input");
+        return prepared;
+    };
+    auto first_prepared   = prepare(0);
+    auto second_prepared  = prepare(1);
+    const auto before     = engine.runtime_stats();
+    std::mutex handoff_mutex;
+    std::condition_variable handoff;
+    std::optional<ninfer::GenerationHandle> second_handle;
+    std::optional<ninfer::GenerationResult> first_result;
+    std::exception_ptr first_error;
+    bool first_finished = false;
+    Sink first_sink(timeline, 0, [&] {
+        auto handle = engine.submit(std::move(second_prepared), generation,
+                                    ninfer::OutputConsumerMode::Streaming, kObservations);
+        {
+            std::lock_guard lock(handoff_mutex);
+            second_handle.emplace(std::move(handle));
+        }
+        handoff.notify_one();
+    });
+    Sink second_sink(timeline, 1);
+    auto first_handle = engine.submit(std::move(first_prepared), generation,
+                                      ninfer::OutputConsumerMode::Streaming, kObservations);
+    std::jthread first_consumer([&] {
+        try {
+            first_result = first_handle.wait(&first_sink);
+        } catch (...) { first_error = std::current_exception(); }
+        {
+            std::lock_guard lock(handoff_mutex);
+            first_finished = true;
+        }
+        handoff.notify_one();
+    });
+    ninfer::GenerationHandle second;
+    {
+        std::unique_lock lock(handoff_mutex);
+        handoff.wait(lock, [&] { return second_handle.has_value() || first_finished; });
+        if (second_handle) { second = std::move(*second_handle); }
+    }
+    if (!second) {
+        first_consumer.join();
+        if (first_error) { std::rethrow_exception(first_error); }
+        throw std::runtime_error("terminal/prefill fixture never submitted its second request");
+    }
+    const auto second_result = second.wait(&second_sink);
+    first_consumer.join();
+    if (first_error) { std::rethrow_exception(first_error); }
+    require(first_result.has_value(), "terminal/prefill fixture lost its first result");
+    first_sink.validate(*first_result);
+    second_sink.validate(second_result);
+    require(timeline.started[0] != 0 && timeline.started[1] > timeline.started[0] &&
+                timeline.first_output[1] > timeline.started[1] &&
+                timeline.first_output[0] > timeline.finished[1] &&
+                timeline.peer_prompt_at_finish[1] == 150528,
+            "younger terminal did not overlap the older request's final 513-token chunk");
+    (void)engine.memory_summary(); // Wait for the worker's completion boundary.
+    const auto after = engine.runtime_stats();
+    require(after.running_requests == 0 && after.waiting_requests == 0 &&
+                after.paused_requests == 0 && after.materializing_requests == 0 &&
+                after.capture_pending_requests == 0 && after.terminal_pending_requests == 0 &&
+                after.preemptions == before.preemptions &&
+                after.computed_prefill_tokens - before.computed_prefill_tokens ==
+                    prompt_tokens[0] + prompt_tokens[1] &&
+                after.generated_tokens - before.generated_tokens == 2 * output_tokens,
+            "terminal/prefill completion leaked membership or duplicated execution accounting");
+    generation.execution.requested_output_tokens = 4;
+    generation.execution.allow_prefix_reuse      = false;
+    const auto probe = engine.generate(engine.prepare_tokens({198, 1002, 198}), generation);
+    require(engine.is_available() && probe.generated_token_ids.size() == 4 &&
+                probe.finish_reason == ninfer::FinishReason::OutputLimit,
+            "Engine could not execute another request after terminal/prefill pressure");
+    std::cout << "terminal-prefill backend=" << static_cast<unsigned>(selected)
+              << " computed_prefill_tokens="
+              << after.computed_prefill_tokens - before.computed_prefill_tokens
+              << " preemptions=" << after.preemptions - before.preemptions << '\n';
+}
+
 } // namespace
 
 int main() {
@@ -530,9 +752,10 @@ int main() {
         const auto selected     = backend(backend_name);
         const auto scenario     = setting("NINFER_PREEMPTION_REAL_SCENARIO", "all");
         require(scenario == "all" || scenario == "replay" || scenario == "snapshot" ||
-                    scenario == "cancel-paused" || scenario == "cancel-replay",
-                "NINFER_PREEMPTION_REAL_SCENARIO must be all, replay, snapshot, cancel-paused "
-                "or cancel-replay");
+                    scenario == "cancel-paused" || scenario == "cancel-replay" ||
+                    scenario == "terminal-prefill",
+                "NINFER_PREEMPTION_REAL_SCENARIO must be all, replay, snapshot, cancel-paused, "
+                "cancel-replay or terminal-prefill");
         if (scenario == "all" || scenario == "replay") {
             exercise(artifact, selected, backend_name, false);
         }
@@ -545,6 +768,7 @@ int main() {
         if (scenario == "all" || scenario == "cancel-replay") {
             exercise(artifact, selected, backend_name, false, CancelStage::Replay);
         }
+        if (scenario == "terminal-prefill") { exercise_terminal_prefill(artifact, selected); }
     } catch (const std::exception& error) {
         std::cerr << "real Engine preemption test failed: " << error.what() << '\n';
         return 1;
