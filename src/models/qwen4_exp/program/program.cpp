@@ -96,8 +96,6 @@ PhysicalUsageSnapshot ProgramImpl::usage() const noexcept {
         out.capacity.kv_page_groups[i] = pool.capacity_pages();
     }
     out.host_state_slots = r.state_store->host_occupied();
-    out.occupied.host_state_slots = out.host_state_slots;
-    out.capacity.host_state_slots = r.state_store->host_capacity();
     if (r.host_context) {
         out.occupied.host_bytes      = r.host_context->occupied_bytes();
         out.capacity.host_bytes      = r.host_context->capacity_bytes();

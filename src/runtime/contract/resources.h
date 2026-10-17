@@ -42,7 +42,6 @@ struct ContextResources {
     std::uint32_t state_slots                  = 0;
     std::array<std::uint32_t, PoolCapacity> kv_page_groups{};
     std::size_t host_bytes = 0;
-    std::uint32_t host_state_slots = 0;
 
     [[nodiscard]] std::optional<KvPoolId> first_kv_deficit() const noexcept {
         for (std::size_t i = 0; i < PoolCapacity; ++i) {
@@ -56,17 +55,14 @@ struct ContextResources {
         if (const auto pool = shortage.first_kv_deficit()) {
             return std::min(kv_page_groups[pool->index], shortage.kv_page_groups[pool->index]);
         }
-        if (shortage.host_state_slots)
-            return std::min(host_state_slots, shortage.host_state_slots);
         return std::min(host_bytes, shortage.host_bytes);
     }
 
-    [[nodiscard]] std::array<std::uint64_t, PoolCapacity + 3> quantities() const noexcept {
-        std::array<std::uint64_t, PoolCapacity + 3> result{};
+    [[nodiscard]] std::array<std::uint64_t, PoolCapacity + 2> quantities() const noexcept {
+        std::array<std::uint64_t, PoolCapacity + 2> result{};
         result[0] = state_slots;
         for (std::size_t i = 0; i < PoolCapacity; ++i) result[i + 1] = kv_page_groups[i];
-        result[PoolCapacity + 1] = host_bytes;
-        result.back() = host_state_slots;
+        result.back() = host_bytes;
         return result;
     }
 

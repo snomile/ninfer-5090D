@@ -217,36 +217,36 @@ int main() {
             server.at("engine").at("context_cache").at("total_device_state_slots") == 4 &&
             server.at("engine").at("context_cache").at("host_capacity_bytes") == (64ULL << 20),
         "resolved context-cache configuration missing");
-    auto host_image_options = engine_options;
-    host_image_options.host_state_images = true;
-    host_image_options.host_mapped_embedding = true;
-    host_image_options.host_mapped_dflash2_codebooks = true;
-    host_image_options.host_pinned_vision_weights = true;
-    host_image_options.max_vision_item_tokens = 2048;
-    const auto host_image_server = Json::parse(format_server_start_json(
-        "serve-test", 1001, options, host_image_options, sampling_defaults, "deployment-alias",
+    auto host_weight_options = engine_options;
+    host_weight_options.context_cache.device_state_slots = 0;
+    host_weight_options.host_mapped_embedding = true;
+    host_weight_options.host_mapped_dflash2_codebooks = true;
+    host_weight_options.host_pinned_vision_weights = true;
+    host_weight_options.max_vision_item_tokens = 2048;
+    const auto host_weight_server = Json::parse(format_server_start_json(
+        "serve-test", 1001, options, host_weight_options, sampling_defaults, "deployment-alias",
         load, memory, environment, std::uint64_t{123456}));
     failures += check(
-        host_image_server.at("engine").at("context_cache").at("total_device_state_slots") ==
-                host_image_options.max_concurrency &&
-            host_image_server.at("engine").at("context_cache").at("total_device_state_slots") == 2 &&
-            host_image_server.at("engine").at("context_cache").at("device_state_slots") == 2 &&
-            host_image_server.at("engine").at("context_cache").at("host_capacity_bytes") ==
+        host_weight_server.at("engine").at("context_cache").at("total_device_state_slots") ==
+                host_weight_options.max_concurrency &&
+            host_weight_server.at("engine").at("context_cache").at("total_device_state_slots") == 2 &&
+            host_weight_server.at("engine").at("context_cache").at("device_state_slots") == 0 &&
+            host_weight_server.at("engine").at("context_cache").at("host_capacity_bytes") ==
                 (64ULL << 20) &&
-            host_image_server.at("schema_version") == 29,
-        "Host StateImages were incorrectly advertised as extra Device StateImage slots");
-    for (const char* key : {"host_state_images", "host_mapped_embedding",
-                            "host_mapped_dflash2_codebooks", "host_pinned_vision_weights"}) {
+            host_weight_server.at("schema_version") == 29,
+        "zero extra Device StateImage slots must leave exactly max_concurrency Device slots");
+    for (const char* key : {"host_mapped_embedding", "host_mapped_dflash2_codebooks",
+                            "host_pinned_vision_weights"}) {
         failures += check(server.at("engine").at(key) == false &&
-                              host_image_server.at("engine").at(key) == true,
+                              host_weight_server.at("engine").at(key) == true,
                           "Host option was omitted or lost its configured value");
     }
     failures += check(
-        host_image_server.at("engine").at("max_vision_item_tokens") == 2048 &&
+        host_weight_server.at("engine").at("max_vision_item_tokens") == 2048 &&
             server.at("engine").at("max_vision_item_tokens") == 16384 &&
-            host_image_server.at("engine").at("context_cache").at("extra_state_placement") == "host" &&
-            server.at("engine").at("context_cache").at("extra_state_placement") == "device",
-        "Vision limit or StateImage placement was not recorded");
+            !server.at("engine").contains("host_state_images") &&
+            !server.at("engine").at("context_cache").contains("extra_state_placement"),
+        "Vision limit missing or removed Host StateImage fields still recorded");
     failures += check(
         server.at("artifact").at("mapped_host_bytes") == 80 &&
             server.at("artifact").at("pinned_host_bytes") == 120 &&

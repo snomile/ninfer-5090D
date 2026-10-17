@@ -41,20 +41,18 @@ void options(Parse parser, bool cli) {
     };
     const auto defaults = configured({});
     require(!defaults.host_mapped_embedding && !defaults.host_mapped_dflash2_codebooks &&
-                !defaults.host_pinned_vision_weights && !defaults.host_state_images &&
+                !defaults.host_pinned_vision_weights &&
                 defaults.max_vision_item_tokens == 16384,
             "memory defaults changed");
-    for (unsigned mask = 0; mask < 16; ++mask) {
+    for (unsigned mask = 0; mask < 8; ++mask) {
         std::vector<std::string> flags{"--vision", "--spec", "dflash2", "--draft-tokens", "7"};
         if (mask & 1) flags.push_back("--host-mapped-embedding");
         if (mask & 2) flags.push_back("--host-mapped-dflash2-codebooks");
         if (mask & 4) flags.push_back("--host-pinned-vision-weights");
-        if (mask & 8) flags.push_back("--host-state-images");
         const auto value = configured(flags);
         require(value.host_mapped_embedding == bool(mask & 1) &&
                     value.host_mapped_dflash2_codebooks == bool(mask & 2) &&
-                    value.host_pinned_vision_weights == bool(mask & 4) &&
-                    value.host_state_images == bool(mask & 8),
+                    value.host_pinned_vision_weights == bool(mask & 4),
                 "independent memory flags were coupled or dropped");
     }
     for (unsigned limit : {1U, 2048U, 4096U, 16384U}) {
@@ -71,24 +69,21 @@ void options(Parse parser, bool cli) {
         configured({"--spec", "dflash", "--draft-tokens", "7",
                     "--host-mapped-dflash2-codebooks"});
     });
+    rejects([&] { configured({"--host-state-images"}); });
     if constexpr (requires { defaults.context_cache; }) {
-        rejects([&] {
-            configured({"--host-state-images", "--device-state-slots", "2",
-                        "--host-context-mib", "0"});
-        });
-        const auto disabled = configured({"--host-state-images", "--device-state-slots", "0",
-                                           "--host-context-mib", "0"});
-        require(disabled.host_state_images && disabled.context_cache.device_state_slots == 0 &&
+        const auto disabled = configured({"--device-state-slots", "0", "--host-context-mib", "0"});
+        require(disabled.context_cache.device_state_slots == 0 &&
                     disabled.context_cache.host_capacity_bytes == 0,
                 "explicit zero snapshot capacity was lost");
     }
     const auto help = cli ? ninfer::cli::usage_text("ninfer") :
                             ninfer::serve::serve_usage_text("ninfer");
     for (const char* flag : {"--host-mapped-embedding", "--host-mapped-dflash2-codebooks",
-                             "--host-pinned-vision-weights", "--host-state-images",
-                             "--max-vision-item-tokens"}) {
+                             "--host-pinned-vision-weights", "--max-vision-item-tokens"}) {
         require(help.find(flag) != std::string::npos, "help omitted a memory flag");
     }
+    require(help.find("--host-state-images") == std::string::npos,
+            "help still advertises the removed Host StateImage flag");
 }
 
 void loader_mapping() {

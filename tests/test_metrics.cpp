@@ -95,15 +95,15 @@ int test_active_seconds() {
     RuntimeStats occupied;
     occupied.device_state_occupied_slots = 2;
     occupied.host_state_occupied_slots = 5;
-    for (bool host_images : {false, true}) {
-        options.host_state_images = host_images;
+    for (std::uint32_t extra : {7U, 0U}) {
+        options.context_cache.device_state_slots = extra;
         Metrics capacity;
         capacity.configure("state-capacity", options, {}, {});
         const auto text = capacity.render(occupied, true);
-        if (sample(text, "ninfer_device_state_capacity_slots") != (host_images ? 3 : 10) ||
+        if (sample(text, "ninfer_device_state_capacity_slots") != 3 + extra ||
             sample(text, "ninfer_device_state_used_slots") != 2 ||
             sample(text, "ninfer_host_state_images") != 5) {
-            std::cerr << "state capacity does not distinguish Host images from Device slots\n";
+            std::cerr << "Device state capacity must equal max_concurrency plus extra slots\n";
             ++failures;
         }
     }

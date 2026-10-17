@@ -1,5 +1,4 @@
 #include "runtime/engine/context_cache/resource_manager.h"
-#include "models/qwen4_exp/program/release_resources.h"
 
 #include <algorithm>
 #include <array>
@@ -88,7 +87,6 @@ struct Program {
     struct HostBlock {
         std::size_t bytes;
         bool external_reference;
-        bool state_image = false;
     };
 
     struct Metadata {
@@ -120,11 +118,9 @@ struct Program {
     std::uint32_t main_capacity    = 1024;
     bool transfer_in_progress      = false;
     bool combined_demotion_blocked = false;
-    std::uint32_t host_state_capacity = 64;
 
-    std::size_t host_block(std::size_t bytes, bool external_reference = false,
-                           bool state_image = false) {
-        blocks.push_back({bytes, external_reference, state_image});
+    std::size_t host_block(std::size_t bytes, bool external_reference = false) {
+        blocks.push_back({bytes, external_reference});
         return blocks.size() - 1;
     }
 
@@ -135,8 +131,6 @@ struct Program {
         contents.back().role = role;
         require(physical_usage().occupied.host_bytes <= host_capacity,
                 "fixture exceeded its physical Host capacity");
-        require(physical_usage().occupied.host_state_slots <= host_state_capacity,
-                "fixture exceeded its physical Host State capacity");
         return handle;
     }
 
@@ -159,7 +153,6 @@ struct Program {
                 if (std::find(unique.begin(), unique.end(), block) == unique.end()) {
                     unique.push_back(block);
                     result.host_bytes += blocks.at(block).bytes;
-                    result.host_state_slots += blocks.at(block).state_image;
                 }
             }
         }
@@ -192,21 +185,19 @@ struct Program {
     [[nodiscard]] PhysicalUsage physical_usage() const {
         PhysicalUsage result{.capacity = {.state_slots    = 64,
                                           .kv_page_groups = {main_capacity, 1024, 1024},
-                                          .host_bytes     = host_capacity,
-                                          .host_state_slots = host_state_capacity}};
+                                          .host_bytes     = host_capacity}};
         for (std::size_t block = 0; block < blocks.size(); ++block) {
             if (blocks[block].external_reference ||
                 std::any_of(contents.begin(), contents.end(),
                             [&](const auto& content) { return references(content, block); })) {
                 result.occupied.host_bytes += blocks[block].bytes;
-                result.occupied.host_state_slots += blocks[block].state_image;
             }
         }
         return result;
     }
 
-    [[nodiscard]] Usage host_resources_released(std::span<const Handle> victims) const {
-        Usage released;
+    [[nodiscard]] std::size_t host_bytes_released(std::span<const Handle> victims) const {
+        std::size_t bytes = 0;
         for (std::size_t block = 0; block < blocks.size(); ++block) {
             if (blocks[block].external_reference) { continue; }
             bool referenced = false;
@@ -214,22 +205,14 @@ struct Program {
             for (std::uint32_t index = 0; index < contents.size(); ++index) {
                 if (!references(contents[index], block)) { continue; }
                 referenced = true;
-                if (!contents[index].evictable || contents[index].leased ||
-                    contents[index].release_blocked ||
+                if (!contents[index].evictable ||
                     std::find(victims.begin(), victims.end(), Handle{index}) == victims.end()) {
                     survives = true;
                 }
             }
-            if (referenced && !survives) {
-                released.host_bytes += blocks[block].bytes;
-                released.host_state_slots += blocks[block].state_image;
-            }
+            if (referenced && !survives) { bytes += blocks[block].bytes; }
         }
-        return released;
-    }
-
-    [[nodiscard]] std::size_t host_bytes_released(std::span<const Handle> victims) const {
-        return host_resources_released(victims).host_bytes;
+        return bytes;
     }
 
     [[nodiscard]] bool valid_checkpoint(Handle handle) const {
@@ -287,7 +270,6 @@ struct Program {
         std::vector<Handle> sources;
         Usage released;
         std::vector<std::pair<Handle, std::uint32_t>> main_parts;
-        std::uint32_t host_state_slots = 0;
     };
 
     struct Release {
@@ -361,8 +343,7 @@ struct Program {
                  released.kv_page_groups[0]
                      ? std::vector<std::pair<Handle, std::uint32_t>>{{handle,
                                                                       released.kv_page_groups[0]}}
-                     : std::vector<std::pair<Handle, std::uint32_t>>{},
-                 released.state_slots});
+                     : std::vector<std::pair<Handle, std::uint32_t>>{}});
         }
         return result;
     }
@@ -447,11 +428,8 @@ struct Program {
                 released.kv_page_groups[1] += content.other_pool_pages[0];
                 released.kv_page_groups[2] += content.other_pool_pages[1];
             }
-            const auto host = host_resources_released(sources);
-            released.host_bytes = host.host_bytes;
-            released.host_state_slots = host.host_state_slots;
-            const bool useful =
-                ninfer::models::qwen4_exp::detail::release_resources_useful(released, shortage);
+            released.host_bytes = host_bytes_released(sources);
+            const bool useful   = released.useful(shortage) != 0;
             if (!useful) { return; }
             if (std::none_of(result.begin(), result.end(),
                              [&](const auto& action) { return action.sources == sources; })) {
@@ -459,7 +437,7 @@ struct Program {
             }
         };
         for (const auto handle : allowed) { append({handle}); }
-        if (shortage.host_bytes || shortage.host_state_slots) {
+        if (shortage.host_bytes) {
             for (std::size_t block = 0; block < blocks.size(); ++block) {
                 std::vector<Handle> sources;
                 for (std::uint32_t i = 0; i < contents.size(); ++i) {
@@ -523,9 +501,7 @@ struct Program {
             return false;
         }
         const auto usage = physical_usage();
-        if (plan.host_bytes > usage.capacity.host_bytes - usage.occupied.host_bytes ||
-            plan.host_state_slots >
-                usage.capacity.host_state_slots - usage.occupied.host_state_slots) {
+        if (plan.host_bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
             return false;
         }
         if (!plan.main_parts.empty()) {
@@ -538,10 +514,7 @@ struct Program {
             }
         } else {
             auto& content = contents.at(plan.handle.index);
-            if (plan.host_bytes) {
-                content.host_blocks.push_back(host_block(plan.host_bytes, false,
-                                                          plan.host_state_slots != 0));
-            }
+            if (plan.host_bytes) { content.host_blocks.push_back(host_block(plan.host_bytes)); }
             if (plan.released.state_slots) { content.device_state = false; }
             demoted.push_back(plan.handle);
         }
@@ -599,128 +572,6 @@ struct Fixture {
         cache.abandon(program, token);
     }
 };
-
-void test_release_resources_respect_requested_dimensions() {
-    using ninfer::models::qwen4_exp::detail::release_resources_useful;
-    struct Case {
-        Usage released;
-        Usage shortage;
-        bool expected;
-    };
-    const std::array cases{
-        Case{{.host_bytes = 48}, {.host_bytes = 64, .host_state_slots = 1}, true},
-        Case{{.host_bytes = 16, .host_state_slots = 1},
-             {.host_bytes = 64, .host_state_slots = 1}, true},
-        Case{{.host_bytes = 48}, {.host_state_slots = 1}, false},
-        Case{{.host_state_slots = 1}, {.host_bytes = 64}, false},
-        Case{{.host_state_slots = 1}, {.host_state_slots = 1}, true},
-        Case{{.host_bytes = 48}, {.host_bytes = 64}, true},
-        Case{{}, {.host_bytes = 64, .host_state_slots = 1}, false},
-        Case{{.host_bytes = 48, .host_state_slots = 1}, {}, false},
-        Case{{.host_bytes = 48}, {.state_slots = 1, .host_bytes = 64}, false},
-        Case{{.state_slots = 1}, {.state_slots = 1, .host_bytes = 64}, true},
-        Case{{.kv_page_groups = {0, 1}}, {.kv_page_groups = {1, 1}}, false},
-        Case{{.kv_page_groups = {0, 1}}, {.kv_page_groups = {0, 1}}, true},
-    };
-    for (const auto& item : cases) {
-        require(release_resources_useful(item.released, item.shortage) == item.expected,
-                "release filter lost a requested resource or changed Device deficit priority");
-    }
-}
-
-void test_host_slot_pressure_without_byte_pressure() {
-    Fixture f(1024);
-    f.program.host_state_capacity = 1;
-    const auto kv = f.program.add({1}, {f.program.host_block(32)});
-    const auto state = f.program.add({2}, {f.program.host_block(16, false, true)});
-    f.publish(kv);
-    f.publish(state);
-    const auto victims = f.cache.host_victims(f.program, 16, {}, {}, {}, {}, nullptr, {}, 1);
-    require(victims && *victims == std::vector<Handle>{state} && f.program.released.empty(),
-            "slot-only preflight must choose State history without deleting KV-only history");
-    require(f.cache.reclaim(f.program, {.host_state_slots = 1}) ==
-                ninfer::runtime::ReclaimProgress::Changed &&
-                f.program.released == std::vector<Handle>{state} &&
-                f.program.physical_usage().occupied.host_state_slots == 0 &&
-                f.program.valid_checkpoint(kv),
-            "slot-only reclamation must release the actual Host descriptor");
-}
-
-void test_host_slot_and_byte_pressure_require_both_resources() {
-    Fixture f(64);
-    f.program.host_state_capacity = 1;
-    const auto kv = f.program.add({1}, {f.program.host_block(48)});
-    const auto state = f.program.add({2}, {f.program.host_block(16, false, true)});
-    f.publish(kv);
-    f.publish(state);
-    const std::array allowed{kv, state};
-    const auto plans =
-        f.program.plan_releases(allowed, {}, {.host_bytes = 64, .host_state_slots = 1});
-    require(plans.size() == 2 &&
-                std::any_of(plans.begin(), plans.end(), [&](const auto& action) {
-                    return action.sources == std::vector<Handle>{kv} &&
-                           action.released.host_bytes == 48 &&
-                           action.released.host_state_slots == 0;
-                }),
-            "Host release filter discarded the KV-only byte action under simultaneous slot pressure");
-    const auto victims = f.cache.host_victims(f.program, 64, {}, {}, {}, {}, nullptr, {}, 1);
-    require(victims && victims->size() == 2 &&
-                std::find(victims->begin(), victims->end(), state) != victims->end() &&
-                std::find(victims->begin(), victims->end(), kv) != victims->end(),
-            "preflight cannot stop after resolving only one of bytes and slots");
-    require(!f.cache.host_victims(f.program, 65, {}, {}, {}, {}, nullptr, {}, 1) &&
-                !f.cache.host_victims(f.program, 16, {}, {}, {}, {}, nullptr, {}, 2) &&
-                f.program.released.empty(),
-            "requests above either physical capacity must fail without partial deletion");
-    auto cursor = f.cache.begin_reclaim(f.program);
-    f.cache.commit_host_victims(f.program, *victims, cursor);
-    const auto usage = f.program.physical_usage();
-    require(usage.occupied.host_bytes == 0 && usage.occupied.host_state_slots == 0 &&
-                f.cache.host_victims(f.program, 64, {}, {}, {}, {}, nullptr, {}, 1) ==
-                    std::optional(std::vector<Handle>{}),
-            "combined release did not make the full bytes-and-slot request admissible");
-}
-
-void test_host_slot_aliases_and_pins_prevent_partial_release() {
-    Fixture f(1024);
-    f.program.host_state_capacity = 1;
-    const auto block = f.program.host_block(16, false, true);
-    const auto a = f.program.add({1}, {block});
-    const auto b = f.program.add({2}, {block});
-    f.publish(a);
-    f.publish(b);
-    const std::array family{a, b};
-    require(f.program.checkpoint_footprint(family).host_state_slots == 1 &&
-                f.program.host_resources_released({&a, 1}).host_state_slots == 0 &&
-                f.program.host_resources_released(family).host_state_slots == 1,
-            "all physical aliases must retire before crediting one Host slot");
-    require(!f.cache.host_victims(f.program, 16, {}, {}, {&b, 1}, {}, nullptr, {}, 1),
-            "an excluded alias keeps the shared Host slot alive");
-    f.program.contents[b.index].leased = true;
-    require(!f.cache.host_victims(f.program, 16, {}, {}, {}, {}, nullptr, {}, 1),
-            "a leased alias blocks Host slot reclamation");
-    f.program.contents[b.index].leased = false;
-    const auto victims = f.cache.host_victims(f.program, 16, {}, {}, {}, {}, nullptr, {}, 1);
-    require(victims && victims->size() == 2 && f.program.released.empty(),
-            "slot preflight must select the complete shared holder set atomically");
-}
-
-void test_host_slot_pressure_keeps_paused_snapshot_order() {
-    Fixture f(1024);
-    f.program.host_state_capacity = 2;
-    const auto older = f.program.add({1}, {f.program.host_block(16, false, true)});
-    const auto younger = f.program.add({2}, {f.program.host_block(16, false, true)});
-    const std::array snapshots{younger, older};
-    const auto one = f.cache.host_victims(f.program, 16, {}, snapshots, {}, {}, nullptr, {}, 1);
-    const auto two = f.cache.host_victims(f.program, 32, {}, snapshots, {}, {}, nullptr, {}, 2);
-    require(one && *one == std::vector<Handle>{younger} &&
-                two && *two == std::vector<Handle>{younger, older},
-            "slot pressure preserves Engine's youngest-first paused snapshot order");
-    Fixture disabled(1024);
-    disabled.program.host_state_capacity = 0;
-    require(!disabled.cache.host_victims(disabled.program, 16, {}, {}, {}, {}, nullptr, {}, 1),
-            "zero Host slot capacity must report unavailable without mutation");
-}
 
 void test_cold_writeback_protects_reused_history() {
     Fixture f(64);
@@ -2045,11 +1896,6 @@ void test_consuming_rewind_resets_proven_progress_to_the_adopted_prefix() {
 
 int main() {
     try {
-        test_release_resources_respect_requested_dimensions();
-        test_host_slot_pressure_without_byte_pressure();
-        test_host_slot_and_byte_pressure_require_both_resources();
-        test_host_slot_aliases_and_pins_prevent_partial_release();
-        test_host_slot_pressure_keeps_paused_snapshot_order();
         test_demotion_competes_with_its_actual_host_recovery_loss();
         test_adjacent_kv_demotions_share_one_submission();
         test_kv_demotion_batch_stops_at_an_intervening_delete();

@@ -45,7 +45,7 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
     for (const auto& l : layouts) minimum_kv = std::min(minimum_kv, l.page_stride);
     const auto image_bytes = states->storage().image_bytes();
     const auto logical_states =
-        count(states->storage().slot_count() + std::uint64_t(plan.host_state_slots));
+        count(states->storage().slot_count() + plan.host_context_bytes / image_bytes);
     const auto histories = count(4ULL * logical_states + 3ULL * plan.shape.max_concurrency + 2);
     if (plan.host_context_bytes) {
         host_context       = std::make_unique<HostContextArena>(plan.host_context_bytes,
@@ -55,7 +55,7 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
         if (extents) host_extents = std::make_unique<context::HostKVExtentStore>(*host_kv, extents);
     }
     state_store = std::make_unique<context::StateImageStore>(states->storage(), host_context.get(),
-                                                             logical_states, plan.host_state_slots);
+                                                             logical_states);
     main = std::make_unique<ContextPool>(backing, plan.persistent.main, plan.host_context_bytes,
                                          histories, host_extents.get());
     if (plan.persistent.mtp)

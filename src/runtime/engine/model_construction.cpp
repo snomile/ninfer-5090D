@@ -87,7 +87,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         options.enable_vision        = false;
         options.host_mapped_dflash2_codebooks = false;
         options.host_pinned_vision_weights = false;
-        options.host_state_images = false;
         options.use_cuda_graph       = false;
         options.context_cache        = ContextCacheOptions{
                    .enabled = false, .device_state_slots = 0, .host_capacity_bytes = 0};
@@ -110,9 +109,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     models::validate_memory_options(models::load_options(options));
     if (!options.max_vision_item_tokens || options.max_vision_item_tokens > 16'384)
         throw std::invalid_argument("max_vision_item_tokens must be in [1,16384]");
-    if (options.host_state_images && *cache.device_state_slots &&
-        cache.host_capacity_bytes && !*cache.host_capacity_bytes)
-        throw std::invalid_argument("Host StateImage slots require nonzero Host capacity");
     return options;
 }
 

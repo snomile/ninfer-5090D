@@ -62,7 +62,7 @@ struct CaptureReservation {
     context::StateImageStore* states;
     Checkpoints* checkpoints;
     Image destination;
-    std::optional<context::StateImageStore::HostReservation> host;
+    std::optional<HostContextAllocation> host;
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> records;
     ~CaptureReservation();
 };
@@ -125,7 +125,7 @@ struct Reclaim {
     const ProgramImpl* owner;
 };
 
-enum class StateBindingAction { Root, Move, Fork, Restore, Split, BackupSplit };
+enum class StateBindingAction { Root, Move, Fork, Restore, Split };
 
 struct BindOperation {
     static constexpr auto kind = ContextOperationKind::Bind;

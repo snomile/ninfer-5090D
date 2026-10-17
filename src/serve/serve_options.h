@@ -51,7 +51,6 @@ struct ServeOptions {
     bool host_mapped_embedding = false;
     bool host_mapped_dflash2_codebooks = false;
     bool host_pinned_vision_weights = false;
-    bool host_state_images = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
     std::optional<bool> enable_thinking;

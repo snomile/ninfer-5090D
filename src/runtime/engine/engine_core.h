@@ -1259,16 +1259,13 @@ private:
                                     resources_.begin_reclaim(*instance_.program, admission)});
             }
             const auto usage = instance_.program->physical_usage();
-            if (capture->host_bytes && capture->host_bytes <= usage.capacity.host_bytes &&
-                capture->host_state_slots <= usage.capacity.host_state_slots) {
-                if (capture->host_bytes > usage.capacity.host_bytes - usage.occupied.host_bytes ||
-                    capture->host_state_slots >
-                        usage.capacity.host_state_slots - usage.occupied.host_state_slots) {
+            if (capture->host_bytes && capture->host_bytes <= usage.capacity.host_bytes) {
+                if (capture->host_bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
                     (void)instance_.program->release_redundant_host({}, request->sequence);
                 }
                 if (const auto victims = resources_.host_victims(
                         *instance_.program, capture->host_bytes, std::nullopt, {}, {}, admission,
-                        &decision->reclaim, {}, capture->host_state_slots)) {
+                        &decision->reclaim)) {
                     resources_.commit_host_victims(*instance_.program, *victims, decision->reclaim);
                     if (!victims->empty()) { scheduler_.capacity_released(); }
                     if (const auto retry = instance_.program->prepare_capture(*request->sequence);
@@ -1530,8 +1527,7 @@ private:
                  std::span<const Checkpoint> excluded               = {},
                  typename ResourceManagement::ReclaimCursor* cursor = nullptr,
                  std::optional<std::uint64_t> priority_ticket       = std::nullopt) {
-        if (!shortage.state_slots && !shortage.first_kv_deficit() && !shortage.host_bytes &&
-            !shortage.host_state_slots) {
+        if (!shortage.state_slots && !shortage.first_kv_deficit() && !shortage.host_bytes) {
             return false;
         }
         if (instance_.program->reclaim_capture_reservation(shortage)) {
@@ -1579,13 +1575,10 @@ private:
         if (instance_.program->has_context_operation()) { return false; }
         auto request       = slots_[lane];
         bool save_snapshot = false;
-        if (const auto needed = instance_.program->pause_host_resources(*request->sequence)) {
+        if (const auto bytes = instance_.program->pause_host_bytes(*request->sequence)) {
             const auto usage = instance_.program->physical_usage();
-            if (needed->host_bytes <= usage.capacity.host_bytes &&
-                needed->host_state_slots <= usage.capacity.host_state_slots &&
-                (needed->host_bytes > usage.capacity.host_bytes - usage.occupied.host_bytes ||
-                 needed->host_state_slots >
-                     usage.capacity.host_state_slots - usage.occupied.host_state_slots)) {
+            if (*bytes <= usage.capacity.host_bytes &&
+                *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
                 (void)instance_.program->release_redundant_host({}, request->sequence);
             }
             std::vector<Checkpoint> later;
@@ -1596,16 +1589,10 @@ private:
                 }
             }
             if (const auto victims =
-                    resources_.host_victims(*instance_.program, needed->host_bytes, std::nullopt,
-                                            later, {}, std::nullopt, nullptr, {},
-                                            needed->host_state_slots)) {
+                    resources_.host_victims(*instance_.program, *bytes, std::nullopt, later)) {
                 for (const auto handle : *victims) {
                     const auto usage = instance_.program->physical_usage();
-                    if (usage.capacity.host_bytes - usage.occupied.host_bytes >= needed->host_bytes &&
-                        usage.capacity.host_state_slots - usage.occupied.host_state_slots >=
-                            needed->host_state_slots) {
-                        break;
-                    }
+                    if (usage.capacity.host_bytes - usage.occupied.host_bytes >= *bytes) { break; }
                     if (resources_.erase(*instance_.program, handle)) { continue; }
                     const auto owner =
                         std::find_if(paused_.begin(), paused_.end(), [&](const auto& other) {

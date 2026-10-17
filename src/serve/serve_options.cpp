@@ -150,7 +150,6 @@ std::string serve_usage_text(const char* argv0) {
            "       --host-mapped-embedding maps input embeddings on Host\n"
            "       --host-mapped-dflash2-codebooks requires --spec dflash2\n"
            "       --host-pinned-vision-weights requires --vision\n"
-           "       --host-state-images uses --device-state-slots as the Host snapshot bound\n"
            "       --prefill-chunk requires a positive multiple of 128; defaults to 1024, or "
            "4096 with CPU expert offload\n"
            "       startup uses " +
@@ -326,8 +325,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.host_mapped_dflash2_codebooks = true;
         } else if (arg == "--host-pinned-vision-weights") {
             options.host_pinned_vision_weights = true;
-        } else if (arg == "--host-state-images") {
-            options.host_state_images = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
@@ -409,10 +406,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--host-mapped-dflash2-codebooks requires --spec dflash2");
     if (options.host_pinned_vision_weights && !options.enable_vision)
         throw std::invalid_argument("--host-pinned-vision-weights requires --vision");
-    if (options.host_state_images && options.context_cache.device_state_slots.value_or(
-            options.max_concurrency) && options.context_cache.host_capacity_bytes &&
-        !*options.context_cache.host_capacity_bytes)
-        throw std::invalid_argument("--host-state-images requires nonzero Host capacity");
     return options;
 }
 

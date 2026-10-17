@@ -36,7 +36,6 @@ struct ExecutionPlan {
     std::size_t pinned_output_bytes   = 0;
     std::size_t ple_prepare_bytes     = 0;
     std::size_t host_context_bytes    = 0;
-    std::uint32_t host_state_slots    = 0;
     std::size_t pinned_io_bytes       = 0;
     std::size_t pinned_sampling_bytes = 0;
     std::size_t pinned_mtp_bytes      = 0;

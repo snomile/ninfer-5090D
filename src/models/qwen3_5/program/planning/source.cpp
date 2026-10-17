@@ -63,7 +63,6 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         }
     }
     auto occupied_states = state_store->device_occupied();
-    auto occupied_images = state_store->occupied();
     for (std::size_t i = 0; i < candidate.retired_points.size(); ++i) {
         const auto state = checkpoint(candidate.retired_points[i]).continuation().image;
         if (std::any_of(
@@ -75,9 +74,9 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             candidate.retired_points.begin(), candidate.retired_points.end(),
             [&](auto point) { return checkpoint(point).continuation().image == state; }));
         if (references == state_store->checkpoint_references(state) &&
+            state_store->device_resident(state) &&
             state_store->can_release_after_checkpoint_references(state, references)) {
-            --occupied_images;
-            if (state_store->device_resident(state)) --occupied_states;
+            --occupied_states;
         }
     }
     const auto& rewrite = prompt.identity.rewrite_checkpoint;
@@ -106,11 +105,11 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         candidate.state_action = StateBindingAction::Move;
     } else if (occupied_states == state_store->device_capacity() &&
                state_store->device_resident(image) && state_store->source_pins(image) == 0) {
-        const bool logical_destination = occupied_images < state_store->capacity();
-        if (logical_destination && state_store->host_resident(image)) {
+        if (state_store->host_resident(image)) {
             candidate.state_action = StateBindingAction::Split;
         } else if (checkpoints[handle->index].pins == 0) {
-            if (logical_destination && state_store->can_reserve_host()) {
+            if (host_context_arena &&
+                host_context_arena->can_allocate(state_images->storage().image_bytes())) {
                 candidate.state_action = StateBindingAction::BackupSplit;
                 candidate.transfers.push_back(context::state_transfer_requirement(
                     state_images->storage().layout().transfer_work(),

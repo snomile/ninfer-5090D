@@ -3,7 +3,6 @@
 
 #include <cstdint>
 #include <iostream>
-#include <stdexcept>
 #include <string_view>
 
 namespace {
@@ -18,9 +17,9 @@ void expect(bool condition, std::string_view message) {
     std::cerr << "FAIL: " << message << '\n';
 }
 
-q36::StateImageDeviceLayout plan(bool dflash, std::int32_t slots = 2) {
+q36::StateImageDeviceLayout plan(bool dflash) {
     q36::StateImageSpec spec{
-        .slot_count = slots,
+        .slot_count = 2,
         .linear =
             {
                 .layers         = 2,
@@ -59,38 +58,6 @@ int main() {
            "full image copy includes common and local fields in one contiguous range");
     expect(dflash.images.storage.bytes == 2 * full_work.payload_bytes,
            "Device capacity uses full image stride");
-    for (const bool local : {false, true}) {
-        const auto reference = plan(local, 1);
-        for (const auto slots : {1, 2, 8}) {
-            const auto layout = plan(local, slots);
-            expect(layout.images.slot_count == slots &&
-                       layout.images.image_stride == reference.images.image_stride &&
-                       layout.images.storage.bytes ==
-                           static_cast<std::size_t>(slots) * reference.images.image_stride &&
-                       layout.images.transfer_work().payload_bytes == reference.images.image_stride,
-                   "complete Host image size stays independent of Device pool capacity");
-            expect(layout.images.fields.size() == reference.images.fields.size(),
-                   "slot policy changed the continuation field inventory");
-            for (std::size_t i = 0; i < layout.images.fields.size(); ++i) {
-                const auto& field = layout.images.fields[i];
-                const auto& original = reference.images.fields[i];
-                expect(field.tensor.region == original.tensor.region &&
-                           field.tensor.dtype == original.tensor.dtype &&
-                           field.tensor.shape == original.tensor.shape &&
-                           field.layers == original.layers &&
-                           field.layer_stride == original.layer_stride &&
-                           field.slot_axis == original.slot_axis,
-                       "Host and Device mirrors require identical per-image field offsets");
-            }
-        }
-        for (const auto slots : {0, -1}) {
-            bool rejected = false;
-            try {
-                (void)plan(local, slots);
-            } catch (const std::invalid_argument&) { rejected = true; }
-            expect(rejected, "physical StateImage pool must reject nonpositive Device slots");
-        }
-    }
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

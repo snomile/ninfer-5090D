@@ -107,7 +107,6 @@ std::string usage_text(const char* argv0) {
            "--host-mapped-embedding maps the input embedding from Host memory.\n"
            "--host-mapped-dflash2-codebooks maps selector tables (requires --spec dflash2).\n"
            "--host-pinned-vision-weights stages Host Vision weights (requires --vision).\n"
-           "--host-state-images places extra StateImage snapshots on Host.\n"
            "--prefill-chunk requires a positive multiple of 128; defaults to 1024, or 4096 with "
            "CPU expert offload.\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
@@ -193,8 +192,6 @@ Options parse_options(int argc, char** argv) {
             options.host_mapped_dflash2_codebooks = true;
         } else if (arg == "--host-pinned-vision-weights") {
             options.host_pinned_vision_weights = true;
-        } else if (arg == "--host-state-images") {
-            options.host_state_images = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--stop-token-id") {

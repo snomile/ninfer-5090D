@@ -81,8 +81,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
     }
     const std::int32_t state_image_slots = checked_i32(
-        static_cast<std::uint64_t>(plan.max_concurrency) +
-            (plan.host_state_images ? 0U : *plan.context_cache.device_state_slots),
+        static_cast<std::uint64_t>(plan.max_concurrency) + *plan.context_cache.device_state_slots,
         "Qwen3.5 StateImage slot count exceeds int32");
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
@@ -828,7 +827,6 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->features             = inputs.features;
     impl->use_cuda_graph       = inputs.use_cuda_graph;
     impl->causal_scoring       = inputs.causal_scoring;
-    impl->host_state_images    = inputs.host_state_images;
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
@@ -841,10 +839,6 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                     "Host context state default overflow"),
                         "Host context default overflow");
     }
-    if (impl->host_state_images && *impl->context_cache.device_state_slots &&
-        *impl->context_cache.host_capacity_bytes &&
-        *impl->context_cache.host_capacity_bytes < impl->persistent.state_images.images.image_stride)
-        throw std::invalid_argument("Host context capacity cannot hold one StateImage");
     impl->workspace = build_workspace_plan(*impl);
     impl->device_reservation_bytes =
         checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence device capacity");
@@ -877,7 +871,6 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
         .features             = models::load_options(options),
         .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
-        .host_state_images    = options.host_state_images,
         .multiprocessor_count = device.multiprocessor_count(),
         .context_cache        = options.context_cache,
     };

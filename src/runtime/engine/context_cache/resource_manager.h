@@ -494,19 +494,17 @@ public:
                  std::span<const Handle> later_snapshots = {},
                  std::span<const Handle> excluded        = {},
                  std::optional<Admission> admission      = std::nullopt,
-                 const ReclaimCursor* decision = nullptr, ReclaimRights rights = {},
-                 std::uint32_t host_state_slots = 0) {
+                 const ReclaimCursor* decision = nullptr, ReclaimRights rights = {}) {
         prune(program);
         Evaluation evaluation;
         if (decision) {
             return host_victims_in_order(program, bytes, incoming, later_snapshots, excluded,
-                                         decision->admission, *decision, evaluation, false,
-                                         host_state_slots);
+                                         decision->admission, *decision, evaluation);
         }
         auto cursor   = reclaim_order(program);
         cursor.rights = admission ? ReclaimRights{ReclaimPurpose::OptionalWrite} : rights;
         return host_victims_in_order(program, bytes, incoming, later_snapshots, excluded, admission,
-                                     cursor, evaluation, false, host_state_slots);
+                                     cursor, evaluation);
     }
 
     void commit_host_victims(Program& program, std::span<const Handle> handles,
@@ -536,8 +534,7 @@ public:
                                           std::span<const Handle> excluded, ReclaimCursor& cursor) {
         if (program.has_context_operation()) { return ReclaimProgress::Transferring; }
         prune(program);
-        if ((shortage.host_bytes || shortage.host_state_slots) &&
-            program.release_redundant_host(excluded)) {
+        if (shortage.host_bytes && program.release_redundant_host(excluded)) {
             return ReclaimProgress::Changed;
         }
         std::vector<Handle> allowed;
@@ -547,12 +544,11 @@ public:
                 allowed.push_back(victim.handle);
             }
         }
-        if (shortage.host_bytes || shortage.host_state_slots) {
+        if (shortage.host_bytes) {
             Evaluation evaluation;
             const auto victims =
                 host_victims_in_order(program, shortage.host_bytes, std::nullopt, {}, excluded,
-                                      cursor.admission, cursor, evaluation, true,
-                                      shortage.host_state_slots);
+                                      cursor.admission, cursor, evaluation, true);
             if (!victims) { return ReclaimProgress::Blocked; }
             commit_release(program, *victims, cursor);
             return victims->empty() ? ReclaimProgress::Blocked : ReclaimProgress::Changed;
@@ -572,17 +568,12 @@ public:
 
         const auto usage     = program.physical_usage();
         const auto free_host = usage.capacity.host_bytes - usage.occupied.host_bytes;
-        const auto free_slots = usage.capacity.host_state_slots - usage.occupied.host_state_slots;
         const bool needs_host_cleanup =
             std::any_of(plans.demotions.begin(), plans.demotions.end(),
-                        [&](const auto& plan) {
-                            return plan.host_bytes > free_host || plan.host_state_slots > free_slots;
-                        });
+                        [&](const auto& plan) { return plan.host_bytes > free_host; });
         const bool existing_host_destination =
             std::any_of(plans.demotions.begin(), plans.demotions.end(),
-                        [](const auto& plan) {
-                            return plan.host_bytes == 0 && plan.host_state_slots == 0;
-                        });
+                        [](const auto& plan) { return plan.host_bytes == 0; });
         // Redundant-replica cleanup is a distinct capacity change. Quotes below are read
         // only and never observe side effects from evaluating another candidate.
         if (needs_host_cleanup && !existing_host_destination &&
@@ -606,8 +597,7 @@ public:
                 preservation_admission(program, plan.sources, cursor, facts.priority);
             auto victims =
                 host_victims_in_order(program, plan.host_bytes, preservation.checkpoint, {},
-                                      protected_sources, preservation, cursor, evaluation, false,
-                                      plan.host_state_slots);
+                                      protected_sources, preservation, cursor, evaluation);
             if (!victims) { continue; }
             auto rank       = rank_action(program, plan.sources, facts, units, evaluation, true);
             auto host_facts = action_facts(program, *victims, cursor, evaluation);
@@ -683,8 +673,7 @@ public:
                                          plan.sources.end());
                 const auto current = host_victims_in_order(
                     program, plan.host_bytes, action.preservation->checkpoint, {},
-                    protected_sources, action.preservation, cursor, evaluation, false,
-                    plan.host_state_slots);
+                    protected_sources, action.preservation, cursor, evaluation);
                 if (!current || *current != action.host_victims) { continue; }
                 commit_release(program, action.host_victims, cursor, action.rank.loss);
                 if (program.start_demote(plan)) {
@@ -1297,19 +1286,12 @@ private:
     host_victims_in_order(Program& program, std::size_t bytes, std::optional<Handle> incoming,
                           std::span<const Handle> later_snapshots, std::span<const Handle> excluded,
                           std::optional<Admission> admission, const ReclaimCursor& cursor,
-                          Evaluation& evaluation, bool resources_are_shortage = false,
-                          std::uint32_t host_state_slots = 0) const {
+                          Evaluation& evaluation, bool bytes_are_shortage = false) const {
         const auto usage    = program.physical_usage();
         const auto free     = usage.capacity.host_bytes - usage.occupied.host_bytes;
-        const auto free_slots = usage.capacity.host_state_slots - usage.occupied.host_state_slots;
-        ContextResources required{
-            .host_bytes = resources_are_shortage ? bytes : (bytes > free ? bytes - free : 0),
-            .host_state_slots = resources_are_shortage ? host_state_slots
-                                : (host_state_slots > free_slots ? host_state_slots - free_slots : 0)};
-        if (!required.host_bytes && !required.host_state_slots) return std::vector<Handle>{};
-        if (!resources_are_shortage &&
-            (bytes > usage.capacity.host_bytes || host_state_slots > usage.capacity.host_state_slots))
-            return std::nullopt;
+        const auto required = bytes_are_shortage ? bytes : (bytes > free ? bytes - free : 0);
+        if (!required) { return std::vector<Handle>{}; }
+        if (!bytes_are_shortage && bytes > usage.capacity.host_bytes) { return std::nullopt; }
         if (!admission && incoming) {
             admission = preservation_admission(
                 program, {&*incoming, 1}, cursor,
@@ -1333,14 +1315,13 @@ private:
                 }
             }
         }
-        auto actions = program.plan_releases(allowed, excluded, required);
+        auto actions = program.plan_releases(allowed, excluded, {.host_bytes = required});
         std::vector<Handle> selected;
-        ContextResources released;
-        while (released.host_bytes < required.host_bytes ||
-               released.host_state_slots < required.host_state_slots) {
+        std::size_t released = 0;
+        while (released < required) {
             std::optional<std::size_t> best;
             std::vector<Handle> best_union;
-            ContextResources best_resources;
+            std::size_t best_bytes = 0;
             ActionRank best_rank;
             std::size_t best_snapshot_order = 0;
             for (std::size_t i = 0; i < actions.size(); ++i) {
@@ -1348,13 +1329,8 @@ private:
                 for (const auto handle : actions[i].sources) {
                     if (!contains(combined, handle)) { combined.push_back(handle); }
                 }
-                const auto amount = program.host_resources_released(combined);
-                const bool advances =
-                    (released.host_bytes < required.host_bytes &&
-                     amount.host_bytes > released.host_bytes) ||
-                    (released.host_state_slots < required.host_state_slots &&
-                     amount.host_state_slots > released.host_state_slots);
-                if (!advances) continue;
+                const auto amount = program.host_bytes_released(combined);
+                if (amount <= released) { continue; }
                 auto facts = action_facts(program, combined, cursor, evaluation);
                 // A migration must satisfy both its own preservation rights and the
                 // optional capture that requested space. Source heat cannot grant the
@@ -1363,11 +1339,8 @@ private:
                     !admits(program, combined, facts, cursor.admission, cursor, evaluation)) {
                     continue;
                 }
-                const auto units = released.host_state_slots < required.host_state_slots &&
-                                           amount.host_state_slots > released.host_state_slots
-                                       ? std::min(amount.host_state_slots, required.host_state_slots)
-                                       : std::min(amount.host_bytes, required.host_bytes);
-                const auto rank = rank_action(program, combined, facts, units, evaluation);
+                const auto rank            = rank_action(program, combined, facts,
+                                                         std::min<std::size_t>(amount, required), evaluation);
                 std::size_t snapshot_order = 0;
                 for (std::size_t snapshot = 0; snapshot < later_snapshots.size(); ++snapshot) {
                     if (contains(combined, later_snapshots[snapshot])) {
@@ -1380,14 +1353,14 @@ private:
                     (snapshot_order == best_snapshot_order && less_rank(rank, best_rank))) {
                     best                = i;
                     best_union          = std::move(combined);
-                    best_resources      = amount;
+                    best_bytes          = amount;
                     best_rank           = rank;
                     best_snapshot_order = snapshot_order;
                 }
             }
             if (!best) { return std::nullopt; }
             selected = std::move(best_union);
-            released = best_resources;
+            released = best_bytes;
             actions.erase(actions.begin() + *best);
         }
         return selected;

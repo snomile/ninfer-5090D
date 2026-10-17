@@ -26,7 +26,7 @@ bool ProgramImpl::reclaim_capture_reservation(ContextResources shortage) {
         if (!ticket) { continue; }
         const bool relevant =
             (shortage.state_slots && state_store->device_resident(ticket->state)) ||
-            ((shortage.host_bytes || shortage.host_state_slots) && ticket->host);
+            (shortage.host_bytes && ticket->host);
         if (relevant) {
             request.capture_reservation.reset();
             return true;
@@ -57,7 +57,7 @@ bool ProgramImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
     }
     auto destination = state_store->reserve_destination();
     if (!destination && host_context_arena) {
-        ticket->host = state_store->reserve_host_destination();
+        ticket->host = host_context_arena->allocate(state_images->storage().image_bytes());
         if (ticket->host) { destination = state_store->reserve_logical_destination(); }
     }
     if (!destination) { return false; }
@@ -102,7 +102,6 @@ std::optional<CapturePreparation> ProgramImpl::prepare_capture(SequenceHandle ha
         if (state_store->device_occupied() == state_store->device_capacity()) {
             result.shortage.state_slots = 1;
             result.host_bytes           = state_images->storage().image_bytes();
-            result.host_state_slots     = 1;
         }
         return result;
     }

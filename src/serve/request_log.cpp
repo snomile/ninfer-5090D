@@ -548,7 +548,7 @@ std::string format_server_start_json(
     const ninfer::ContextCostSummary& context_cost = load.context_cost;
     const std::uint64_t total_device_state_slots =
         static_cast<std::uint64_t>(engine_options.max_concurrency) +
-        (engine_options.host_state_images ? 0U : cache.device_state_slots.value());
+        cache.device_state_slots.value();
     record["engine"] =
         Json{{"device", engine_options.device},
              {"max_context", engine_options.max_context},
@@ -567,7 +567,6 @@ std::string format_server_start_json(
              {"host_mapped_embedding", engine_options.host_mapped_embedding},
              {"host_mapped_dflash2_codebooks", engine_options.host_mapped_dflash2_codebooks},
              {"host_pinned_vision_weights", engine_options.host_pinned_vision_weights},
-             {"host_state_images", engine_options.host_state_images},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"prefix_reuse", options.allow_prefix_reuse},
              {"speculative_backend",
@@ -584,8 +583,6 @@ std::string format_server_start_json(
              {"context_cache", Json{{"enabled", cache.enabled},
                                     {"device_state_slots", cache.device_state_slots.value()},
                                     {"total_device_state_slots", total_device_state_slots},
-                                    {"extra_state_placement",
-                                     engine_options.host_state_images ? "host" : "device"},
                                     {"host_capacity_bytes", cache.host_capacity_bytes.value()}}}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},

@@ -43,17 +43,9 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_bytes(memory.runtime_reservation_bytes),
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
 
-    if (engine.host_state_images) {
-        logger_->info(
-            "context | history {} | {} active + 0 extra device states | host snapshots at most {} "
-            "| shared host {}",
-            cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
-            product::format_pretty_bytes(*cache.host_capacity_bytes));
-    } else {
-        logger_->info("context | history {} | {} active + {} extra device states | host {}",
-                      cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
-                      product::format_pretty_bytes(*cache.host_capacity_bytes));
-    }
+    logger_->info("context | history {} | {} active + {} extra device states | host {}",
+                  cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
+                  product::format_pretty_bytes(*cache.host_capacity_bytes));
 
     if (service.options().enable_vision) {
         const ninfer::MediaCacheSummary media = service.media_cache_summary();

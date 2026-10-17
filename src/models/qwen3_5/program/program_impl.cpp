@@ -101,11 +101,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
         return static_cast<std::uint32_t>(value);
     };
-    const auto host_slots = checked_count(std::min<std::uint64_t>(
-        host_bytes / state_images->storage().image_bytes(),
-        plan.host_state_images ? *plan.context_cache.device_state_slots
-                               : std::numeric_limits<std::uint64_t>::max()));
-    const auto logical_states = checked_count(state_images->storage().slot_count() + host_slots);
+    const auto logical_states = checked_count(state_images->storage().slot_count() +
+                                              host_bytes / state_images->storage().image_bytes());
     // One immutable image can serve private replay, an explicit anchor, a public view and an
     // exact-hit endpoint. Alias descriptors are bounded separately from physical state slots.
     checkpoints.resize(checked_count(4ULL * logical_states + 2ULL * max_concurrency));
@@ -122,8 +119,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         phase.complete(host_bytes, host_bytes);
     }
     state_store              = std::make_unique<StateImageStore>(state_images->storage(),
-                                                                 host_context_arena.get(),
-                                                                 logical_states, host_slots);
+                                                                 host_context_arena.get(), logical_states);
     const auto logical_pages = [&](const DeviceKVPagePool& pool) {
         const auto stride = plan_host_kv_page_layout(pool.geometry()).page_stride;
         return checked_count(pool.capacity_pages() + host_bytes / stride);

@@ -102,26 +102,6 @@ public:
         Handle write_source_;
     };
 
-    // Charges one Host image slot and its shared-arena bytes before a capture boundary.
-    class HostReservation {
-    public:
-        HostReservation() noexcept = default;
-        ~HostReservation();
-        HostReservation(HostReservation&& other) noexcept;
-        HostReservation& operator=(HostReservation&& other) noexcept;
-        HostReservation(const HostReservation&)            = delete;
-        HostReservation& operator=(const HostReservation&) = delete;
-
-        [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
-        void reset() noexcept;
-    private:
-        HostReservation(StateImageStore& owner, HostContextAllocation allocation) noexcept
-            : owner_(&owner), allocation_(std::move(allocation)) {}
-        StateImageStore* owner_ = nullptr;
-        HostContextAllocation allocation_;
-        friend class StateImageStore;
-    };
-
     // Physical reservations and source readership belong to this move-only copy. MigrationBatch
     // retains it until its completion fence permits publication or rollback.
     class Transfer {
@@ -156,8 +136,7 @@ public:
     [[nodiscard]] ReadLease read(Handle image);
 
     StateImageStore(StateImageStorage& device, HostContextArena* host,
-                    std::uint32_t logical_capacity,
-                    std::optional<std::uint32_t> host_slot_limit = std::nullopt);
+                    std::uint32_t logical_capacity);
 
     StateImageStore(const StateImageStore&)            = delete;
     StateImageStore& operator=(const StateImageStore&) = delete;
@@ -173,10 +152,6 @@ public:
     [[nodiscard]] std::uint32_t device_capacity() const noexcept;
 
     [[nodiscard]] std::uint32_t host_occupied() const noexcept;
-
-    [[nodiscard]] std::uint32_t host_capacity() const noexcept { return host_capacity_; }
-    [[nodiscard]] bool can_reserve_host() const noexcept;
-    [[nodiscard]] std::optional<HostReservation> reserve_host_destination() noexcept;
 
     [[nodiscard]] std::optional<Handle> reserve_destination() noexcept;
 
@@ -239,9 +214,6 @@ public:
     [[nodiscard]] std::optional<Transfer>
     reserve_device_to_host(Handle source, HostContextAllocation reserved = {});
 
-    [[nodiscard]] std::optional<Transfer>
-    reserve_device_to_host(Handle source, HostReservation reserved);
-
     [[nodiscard]] std::optional<Transfer> reserve_host_to_device(Handle source);
     [[nodiscard]] std::optional<Transfer> reserve_host_to_device(Handle source, Handle destination);
 
@@ -293,9 +265,6 @@ private:
     void publish_transfer(Transfer& transfer, bool keep_source_replica);
     void abort_transfer(Transfer& transfer) noexcept;
 
-    [[nodiscard]] std::optional<Transfer>
-    reserve_device_to_host_allocation(Handle source, HostContextAllocation reserved);
-
     static void consume(Transfer& transfer) noexcept;
 
     StateImageStorage* device_ = nullptr;
@@ -306,7 +275,6 @@ private:
     std::uint32_t free_object_count_   = 0;
     std::uint32_t free_device_count_   = 0;
     std::uint32_t pending_host_images_ = 0;
-    std::uint32_t host_capacity_       = 0;
     std::uint64_t next_content_epoch_  = 0;
     std::uint64_t next_transfer_id_    = 0;
 };

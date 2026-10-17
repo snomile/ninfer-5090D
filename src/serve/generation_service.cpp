@@ -220,7 +220,6 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.host_mapped_embedding = options_.host_mapped_embedding;
     engine_options.host_mapped_dflash2_codebooks = options_.host_mapped_dflash2_codebooks;
     engine_options.host_pinned_vision_weights = options_.host_pinned_vision_weights;
-    engine_options.host_state_images = options_.host_state_images;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
