@@ -43,7 +43,7 @@ enum class KvCapacityMode : std::uint8_t {
     Automatic,
 };
 
-inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
+inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 400ULL * 1024ULL * 1024ULL;
 
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;

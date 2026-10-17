@@ -412,6 +412,10 @@ int main() {
                           automatic.kv_capacity.automatic_headroom_bytes ==
                               ninfer::kDefaultKvCapacityHeadroomBytes,
                       "--kv-capacity auto did not select automatic sizing");
+    failures += check(
+        serve_usage_text("ninfer-serve").find("startup uses 400 MiB of planning headroom") !=
+            std::string::npos,
+        "serve help does not report the 400 MiB startup planning headroom");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});
