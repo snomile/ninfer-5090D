@@ -11,6 +11,16 @@
 #include <string_view>
 #include <utility>
 
+#if defined(__linux__)
+#    include <features.h>
+#    if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#        if __GLIBC_PREREQ(2, 33)
+#            include <malloc.h>
+#            define NINFER_HAS_MALLINFO2 1
+#        endif
+#    endif
+#endif
+
 namespace ninfer::serve {
 namespace {
 
@@ -36,6 +46,31 @@ std::string escape_label(std::string_view value) {
         }
     }
     return out;
+}
+
+struct AllocatorStats {
+    bool available              = false;
+    std::size_t arena_bytes     = 0;
+    std::size_t allocated_bytes = 0;
+    std::size_t free_bytes      = 0;
+    std::size_t mmap_bytes      = 0;
+    std::size_t mmap_regions    = 0;
+};
+
+AllocatorStats allocator_stats() noexcept {
+#if defined(NINFER_HAS_MALLINFO2)
+    const struct mallinfo2 info = mallinfo2();
+    return AllocatorStats{
+        .available       = true,
+        .arena_bytes     = info.arena,
+        .allocated_bytes = info.uordblks,
+        .free_bytes      = info.fordblks,
+        .mmap_bytes      = info.hblkhd,
+        .mmap_regions    = info.hblks,
+    };
+#else
+    return {};
+#endif
 }
 
 } // namespace
@@ -101,7 +136,8 @@ void Metrics::response_failed() {
     ++requests_.response_failures;
 }
 
-std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
+std::string Metrics::render(const RuntimeStats& stats, const MediaCacheSummary& media_cache,
+                            bool ready) const {
     Requests requests;
     {
         std::lock_guard lock(mutex_);
@@ -123,6 +159,7 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
         header(name, "counter", help);
         out << "ninfer_" << name << ' ' << current - baseline << '\n';
     };
+    const AllocatorStats allocator = allocator_stats();
     header("constraint_requests_total", "counter",
            "Settled constrained requests by language completion.");
     const char* outcomes[]    = {"terminated", "complete_interrupted", "incomplete_interrupted"};
@@ -158,7 +195,49 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     gauge("max_context_tokens", options_.max_context, "Per-request logical context limit.");
     gauge("spec_decode_draft_window", options_.speculative.draft_tokens,
           "Configured speculative draft window.");
+    gauge("media_cache_capacity_bytes", media_cache.capacity_bytes,
+          "Maximum retained preprocessed media payload bytes; zero disables reuse.");
+    gauge("media_cache_retained_bytes", media_cache.retained_bytes,
+          "Preprocessed media payload bytes retained for cross-request reuse.");
+    gauge(
+        "media_cache_live_capacity_bytes", media_cache.live_capacity_bytes,
+        "Maximum live preprocessed media payload bytes, including retained and request-held data.");
+    gauge("media_cache_live_bytes", media_cache.live_bytes,
+          "Live preprocessed media payload bytes, including retained and request-held data.");
+    gauge("media_cache_entries", media_cache.entries,
+          "Preprocessed media entries retained for cross-request reuse.");
+    gauge("media_cache_inflight", media_cache.inflight,
+          "Distinct media items currently being preprocessed.");
+    gauge("media_preprocess_tasks_queued", media_cache.queued_tasks,
+          "Media preprocessing tasks waiting for a worker.");
+    gauge("media_preprocess_tasks_active", media_cache.active_tasks,
+          "Media preprocessing tasks currently running.");
+    gauge("media_preprocess_threads", media_cache.preprocess_threads,
+          "Configured media preprocessing worker threads.");
+    counter("media_cache_hits_total", media_cache.hits, std::uint64_t{0},
+            "Preprocessed media lookups served from retained entries.");
+    counter("media_cache_misses_total", media_cache.misses, std::uint64_t{0},
+            "Preprocessed media lookups that started new preprocessing work.");
+    counter("media_cache_singleflight_waits_total", media_cache.singleflight_waits,
+            std::uint64_t{0},
+            "Preprocessed media lookups joined matching work already in progress.");
+    counter("media_cache_evictions_total", media_cache.evictions, std::uint64_t{0},
+            "Retained preprocessed media entries evicted to honor the cache capacity.");
+    counter("media_cache_oversize_bypasses_total", media_cache.oversize_bypasses, std::uint64_t{0},
+            "Preprocessed media results not retained because they exceeded cache capacity.");
 
+    gauge("process_allocator_stats_available", allocator.available ? 1 : 0,
+          "Whether glibc mallinfo2 allocator statistics are available.");
+    gauge("process_allocator_arena_bytes", allocator.arena_bytes,
+          "Bytes obtained by glibc for non-mmap allocation arenas.");
+    gauge("process_allocator_allocated_bytes", allocator.allocated_bytes,
+          "Bytes currently allocated from glibc non-mmap arenas.");
+    gauge("process_allocator_free_bytes", allocator.free_bytes,
+          "Free bytes retained inside glibc non-mmap arenas.");
+    gauge("process_allocator_mmap_bytes", allocator.mmap_bytes,
+          "Bytes currently held in glibc mmap-backed allocation regions.");
+    gauge("process_allocator_mmap_regions", allocator.mmap_regions,
+          "Current glibc mmap-backed allocation region count.");
 #define GAUGE(field, name, help)   gauge(name, stats.field, help)
 #define COUNTER(field, name, help) counter(name, stats.field, baseline_.field, help)
     GAUGE(running_requests, "requests_running", "Resident requests, including prefill and decode.");
@@ -313,3 +392,7 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
 }
 
 } // namespace ninfer::serve
+
+#if defined(NINFER_HAS_MALLINFO2)
+#    undef NINFER_HAS_MALLINFO2
+#endif

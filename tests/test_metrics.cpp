@@ -49,12 +49,14 @@ int test_active_seconds() {
     options.context_cache.device_state_slots = 1;
     Metrics metrics;
     metrics.configure("active-seconds", options, {}, baseline);
+
     struct Scenario {
         const char* name;
         std::uint64_t RuntimeHostWorkStats::* field;
         double prefill;
         double decode;
     };
+
     const Scenario scenarios[] = {
         {"prefill host", &RuntimeHostWorkStats::prefill_host_ns, 1, 0},
         {"prefill wait", &RuntimeHostWorkStats::prefill_device_wait_ns, 1, 0},
@@ -67,16 +69,16 @@ int test_active_seconds() {
         {"engine boundary", &RuntimeHostWorkStats::engine_boundary_ns, 0, 0},
         {"device wait aggregate", &RuntimeHostWorkStats::device_wait_ns, 0, 0},
     };
-    int failures = 0;
+    int failures      = 0;
     const auto expect = [&](const RuntimeStats& stats, double prefill, double decode,
                             const char* name) {
-        const auto text = metrics.render(stats, true);
+        const auto text = metrics.render(stats, {}, true);
         if (std::abs(sample(text, "ninfer_prefill_active_seconds_total") - prefill) > 1e-12 ||
             std::abs(sample(text, "ninfer_decode_active_seconds_total") - decode) > 1e-12) {
             std::cerr << "active seconds mismatch: " << name << '\n';
             ++failures;
         }
-        if (metrics.render(stats, true) != text) {
+        if (metrics.render(stats, {}, true) != text) {
             std::cerr << "active seconds scrape consumed counters: " << name << '\n';
             ++failures;
         }
@@ -90,16 +92,16 @@ int test_active_seconds() {
         expect(current, scenario.prefill, scenario.decode, scenario.name);
     }
     expect(combined, 4, 4, "all work classes");
-    options.max_concurrency = 3;
+    options.max_concurrency                  = 3;
     options.context_cache.device_state_slots = 7;
     RuntimeStats occupied;
     occupied.device_state_occupied_slots = 2;
-    occupied.host_state_occupied_slots = 5;
+    occupied.host_state_occupied_slots   = 5;
     for (std::uint32_t extra : {7U, 0U}) {
         options.context_cache.device_state_slots = extra;
         Metrics capacity;
         capacity.configure("state-capacity", options, {}, {});
-        const auto text = capacity.render(occupied, true);
+        const auto text = capacity.render(occupied, {}, true);
         if (sample(text, "ninfer_device_state_capacity_slots") != 3 + extra ||
             sample(text, "ninfer_device_state_used_slots") != 2 ||
             sample(text, "ninfer_host_state_images") != 5) {
@@ -141,8 +143,23 @@ int main() {
     running.kv_pools = {{0, "text", 2, 8}, {1, "draft", 1, 4}, {2, "index", 3, 6}};
     running.context_transfers.kv.resize(3);
     running.context_transfers.kv[2][1].bytes = 8192;
+    MediaCacheSummary media_cache;
+    media_cache.capacity_bytes      = 1073741824;
+    media_cache.live_capacity_bytes = 2147483648;
+    media_cache.retained_bytes      = 1048576;
+    media_cache.live_bytes          = 1572864;
+    media_cache.entries             = 42;
+    media_cache.inflight            = 1;
+    media_cache.queued_tasks        = 2;
+    media_cache.active_tasks        = 3;
+    media_cache.preprocess_threads  = 16;
+    media_cache.hits                = 7;
+    media_cache.misses              = 114;
+    media_cache.singleflight_waits  = 4;
+    media_cache.evictions           = 72;
+    media_cache.oversize_bypasses   = 5;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
-    const auto live = metrics.render(running, true);
+    const auto live = metrics.render(running, media_cache, true);
     check(live.find("ninfer_generation_tokens_total 5\n") != std::string::npos,
           "live generated count must exclude startup warmup");
     check(live.find("ninfer_spec_decode_draft_tokens_total 6\n") != std::string::npos,
@@ -155,10 +172,37 @@ int main() {
           "TTFT must include preparation and use inclusive histogram buckets");
     check(live.find("model_name=\"custom\\\"model\\\\name\\nline\"") != std::string::npos,
           "model label must escape quotes, backslashes and newlines");
-    check(metrics.render(running, true) == live, "scrapes must not consume or reset counters");
+    check(metrics.render(running, media_cache, true) == live,
+          "scrapes must not consume or reset counters");
     check(live.find("ninfer_host_context_used_bytes 4096\n") != std::string::npos,
           "reserved bytes must not be added to occupancy twice");
+    check(live.find("ninfer_media_cache_capacity_bytes 1073741824\n") != std::string::npos &&
+              live.find("ninfer_media_cache_retained_bytes 1048576\n") != std::string::npos &&
+              live.find("ninfer_media_cache_live_capacity_bytes 2147483648\n") !=
+                  std::string::npos &&
+              live.find("ninfer_media_cache_live_bytes 1572864\n") != std::string::npos &&
+              live.find("ninfer_media_cache_entries 42\n") != std::string::npos,
+          "media cache byte and entry gauges are incomplete");
+    check(live.find("ninfer_media_cache_inflight 1\n") != std::string::npos &&
+              live.find("ninfer_media_preprocess_tasks_queued 2\n") != std::string::npos &&
+              live.find("ninfer_media_preprocess_tasks_active 3\n") != std::string::npos &&
+              live.find("ninfer_media_preprocess_threads 16\n") != std::string::npos,
+          "media preprocessing concurrency gauges are incomplete");
+    check(live.find("ninfer_media_cache_hits_total 7\n") != std::string::npos &&
+              live.find("ninfer_media_cache_misses_total 114\n") != std::string::npos &&
+              live.find("ninfer_media_cache_singleflight_waits_total 4\n") != std::string::npos &&
+              live.find("ninfer_media_cache_evictions_total 72\n") != std::string::npos &&
+              live.find("ninfer_media_cache_oversize_bypasses_total 5\n") != std::string::npos,
+          "media cache outcome counters are incomplete");
 
+    const double allocator_available = sample(live, "ninfer_process_allocator_stats_available");
+    check((allocator_available == 0 || allocator_available == 1) &&
+              sample(live, "ninfer_process_allocator_arena_bytes") >= 0 &&
+              sample(live, "ninfer_process_allocator_allocated_bytes") >= 0 &&
+              sample(live, "ninfer_process_allocator_free_bytes") >= 0 &&
+              sample(live, "ninfer_process_allocator_mmap_bytes") >= 0 &&
+              sample(live, "ninfer_process_allocator_mmap_regions") >= 0,
+          "process allocator gauges are incomplete");
     check(live.find("ninfer_device_kv_used_page_groups{pool_id=\"2\"} 3\n") != std::string::npos &&
               live.find("ninfer_context_transfer_bytes_total{resource=\"kv\",pool_id=\"2\","
                         "direction=\"h2d\"} 8192\n") != std::string::npos,
@@ -180,7 +224,7 @@ int main() {
     metrics.failed(true);
     metrics.failed(false);
     metrics.rejected();
-    const auto final = metrics.render(running, false);
+    const auto final = metrics.render(running, media_cache, false);
     check(final.find("ninfer_engine_ready 0\n") != std::string::npos,
           "unavailable engine must remain observable");
     check(final.find("ninfer_requests_total{outcome=\"completed\"} 400\n") != std::string::npos &&
@@ -202,7 +246,7 @@ int main() {
                                                .mask_positions    = 5,
                                                .mask_upload_bytes = 128};
     metrics.done(outcome);
-    const auto constrained = metrics.render(running, false);
+    const auto constrained = metrics.render(running, media_cache, false);
     check(constrained.find(
               "ninfer_constraint_requests_total{outcome=\"complete_interrupted\"} 1\n") !=
                   std::string::npos &&

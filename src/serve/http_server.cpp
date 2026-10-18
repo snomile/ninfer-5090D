@@ -431,9 +431,10 @@ void HttpServer::register_routes() {
         handle_models(req, res);
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
-        const auto stats = service_->runtime_stats();
+        const auto stats       = service_->runtime_stats();
+        const auto media_cache = service_->media_cache_summary();
         res.set_header("Cache-Control", "no-store");
-        res.set_content(metrics_.render(stats, service_->is_available()),
+        res.set_content(metrics_.render(stats, media_cache, service_->is_available()),
                         "text/plain; version=0.0.4; charset=utf-8");
     });
     server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
