@@ -81,7 +81,7 @@ DeviceContext::DeviceContext(int device_id) : device_(Device::cuda(device_id)) {
 
     // CUDA 12+ cudaSetDevice initializes the primary context. Set mapping and scheduling
     // flags before that initialization, including when the selected device is not ordinal 0.
-    err = cudaInitDevice(device_id, sync_flags | cudaDeviceMapHost, 0);
+    err = cudaInitDevice(device_id, sync_flags | cudaDeviceMapHost, cudaInitDeviceFlagsAreValid);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaInitDevice failed", err));
     }
