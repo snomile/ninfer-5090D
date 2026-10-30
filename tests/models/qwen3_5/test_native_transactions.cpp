@@ -838,10 +838,17 @@ public:
             frontend_.prepare_tokens(std::vector<TokenId>(kPromptTokens, 198)));
         constexpr std::uint32_t suffix = 16;
         prepared.context_cache.semantic_boundaries = {kPromptTokens - suffix};
+        prepared.context_cache.automatic_checkpoints = false;
+        prepared.context_cache.opportunities.push_back(
+            {.kind     = PromptCacheMarkerKind::SharedStablePrefix,
+             .evidence = SharedCandidateEvidence::ExplicitBoundary,
+             .frontier = kPromptTokens - suffix});
         runtime::ResolvedExecutionOptions options;
         options.requested_output_tokens = 8;
         options.allow_prefix_reuse = true;
         auto base = program_.plan_request(std::move(prepared), options);
+        require(base.summary().publish_continuation,
+                "final semantic fixture did not enable capture identity");
         const auto active = bind(base);
         for (unsigned chunk = 0; chunk < 2; ++chunk) {
             reserve(active, q35::ExecutionUnitKind::Prefill);
@@ -853,9 +860,12 @@ public:
         reserve(active, q35::ExecutionUnitKind::Prefill);
         auto device_pressure = fill_capacity(models::context::ContextMemory::Device);
         auto host_pressure = fill_capacity(models::context::ContextMemory::Host);
+        const auto full = program_.physical_usage();
         const auto offered = program_.prepare_capture(active);
-        require(offered && !offered->reserved,
+        require(offered && !offered->reserved && !offered->assessment.ready() &&
+                    offered->frontier == kPromptTokens - suffix,
                 "final semantic fixture did not exhaust optional capture destinations");
+        expect_usage(full, "failed final capture retained an unpublished reservation");
         const auto step = driver_.prefill(active);
         require(step.processed_prompt_tokens == kChunk - suffix &&
                     !step.complete && !step.pending && !step.capture_ready,
