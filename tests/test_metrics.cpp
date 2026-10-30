@@ -32,11 +32,19 @@ int main() {
     baseline.ranks[0].gpu_intervals[0] = {1, 1000, 1000};
     baseline.executions[1].units       = 3;
     baseline.executions[1].rows        = 5;
+    baseline.executions[0].exposure.total.total_ns = 1000000000;
+    baseline.executions[1].exposure.total.total_ns = 2000000000;
+    baseline.executions[2].exposure.total.total_ns = 4000000000;
+    baseline.executions[3].exposure.total.total_ns = 3000000000;
     Metrics metrics;
     metrics.configure("custom\"model\\name\nline", options, description, startup, baseline);
     EngineSnapshot running = baseline;
     running.executions[1].units += 2;
     running.executions[1].rows += 4;
+    running.executions[0].exposure.total.total_ns += 125000000;
+    running.executions[1].exposure.total.total_ns += 250000000;
+    running.executions[2].exposure.total.total_ns += 10000000000;
+    running.executions[3].exposure.total.total_ns += 500000000;
     running.ranks[0].gpu_intervals[0] = {4, 9000, 3000};
     running.runtime.generated_tokens += 5;
     running.runtime.speculative_draft_tokens += 6;
@@ -84,6 +92,11 @@ int main() {
               live.find("ninfer_rank_gpu_interval_samples_total{rank=\"0\",node=\"0\",interval="
                         "\"commit_stream\"} 0\n") != std::string::npos,
           "metrics must distinguish batch/row deltas and measured/unmeasured GPU intervals");
+    check(live.find("ninfer_prefill_active_seconds_total 0.625\n") != std::string::npos &&
+              live.find("ninfer_decode_active_seconds_total 0.75\n") != std::string::npos &&
+              live.find("ninfer_execution_elapsed_seconds_total{kind=\"replay\"} 10\n") !=
+                  std::string::npos,
+          "legacy stage seconds must subtract warmup, include Control and exclude Replay");
     check(live.find("ninfer_generation_tokens_total 5\n") != std::string::npos,
           "live generated count must exclude startup warmup");
     check(live.find("ninfer_spec_decode_draft_tokens_total 6\n") != std::string::npos,

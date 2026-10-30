@@ -399,6 +399,19 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
         emit("execution_elapsed_seconds_total",
              (value.exposure.total.total_ns - old.exposure.total.total_ns) * 1e-9);
     }
+    // Keep the proxy's scalar throughput inputs while using the upstream execution
+    // ledger. Control contributes to both legacy stages; Replay stays separate.
+    const auto elapsed = [&](ExecutionKind kind) {
+        const auto i = static_cast<std::size_t>(kind);
+        return (snapshot.executions[i].exposure.total.total_ns -
+                baseline_.executions[i].exposure.total.total_ns) * 1e-9;
+    };
+    counter("prefill_active_seconds_total",
+            elapsed(ExecutionKind::Prefill) + elapsed(ExecutionKind::Control), 0.0,
+            "Compatibility Prefill/Control accepted-to-retired exposure, excluding Replay.");
+    counter("decode_active_seconds_total",
+            elapsed(ExecutionKind::Decode) + elapsed(ExecutionKind::Control), 0.0,
+            "Compatibility Decode/Control accepted-to-retired exposure, excluding Replay.");
     header("rank_gpu_interval_seconds_total", "counter",
            "Observed stream intervals; overlapping, not kernel-active time.");
     header("rank_gpu_interval_samples_total", "counter",
