@@ -1,12 +1,12 @@
 #pragma once
 
-#include "serve/engine_failure_monitor.h"
 #include "serve/generation_service.h"
+#include "serve/engine_failure_monitor.h"
 #include "serve/metrics.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
-#include "serve/serve_options.h"
+#include "product/config/options.h"
 
 #include <httplib.h>
 
@@ -29,7 +29,7 @@ void write_anthropic_error(httplib::Response& response, const ApiError& error,
 // cpp-httplib invokes the error handler for every application response with status >= 400. Only
 // an empty 413 is its own pre-routing payload-limit rejection; application-authored errors must be
 // left untouched.
-httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions& options,
+httplib::Server::HandlerResponse handle_unrendered_http_error(const product::ServeOptions& options,
                                                               const httplib::Request& request,
                                                               httplib::Response& response);
 
@@ -38,7 +38,7 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 
 class HttpServer {
 public:
-    HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger);
+    HttpServer(product::ServeOptions options, std::shared_ptr<spdlog::logger> logger);
 
     // Reserves the configured address before model loading. The service is attached only after its
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
@@ -103,7 +103,7 @@ private:
     void stop_stats_reporter();
 
     GenerationService* service_ = nullptr;
-    ServeOptions options_;
+    product::ServeOptions options_;
     std::string public_model_id_;
     OpenAIResponsesStore openai_responses_store_;
     OperationalLog operational_log_;

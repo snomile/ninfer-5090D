@@ -15,13 +15,53 @@
 
 namespace ninfer::test {
 void materialization_cuda_errors(DeviceContext& device);
-}
+void materialization_alignment_checks(std::optional<CudaExecutionView>);
+void encoded_slice_checks(std::optional<CudaExecutionView>);
+} // namespace ninfer::test
 
 namespace {
 
 using namespace ninfer;
 using namespace ninfer::artifact;
 using namespace ninfer::test::artifact_fixture;
+
+void mapped_placement() {
+    Fixture fixture;
+    fixture.write();
+    Reader reader(fixture.entry);
+    const auto matrix = reader.find("q5");
+    const auto cuda = Device::cuda(0);
+    const std::array requests{PlacementRequest{matrix, cuda, HostAccess::CudaMapped},
+                              PlacementRequest{matrix, cuda, HostAccess::CudaMapped},
+                              PlacementRequest{matrix, Device::cpu(), HostAccess::CudaTransfer}};
+    const auto plan = plan_materialization(reader, requests);
+    require(plan.mapped_objects.size() == 1 && plan.device_objects.empty() &&
+                plan.device_capacity_bytes == 0 && plan.registered_host_objects.size() == 1 &&
+                plan.registered_host_bytes >= reader.geometry(matrix).bytes,
+            "mapped parent duplicated backing or consumed Device allocation budget");
+    const std::array conflict{requests[0], PlacementRequest{matrix, cuda}};
+    rejects([&] { (void)plan_materialization(reader, conflict); },
+            "mapped and Device residency conflict was accepted");
+    const std::array invalid{PlacementRequest{matrix, Device::cpu(), HostAccess::CudaMapped}};
+    rejects([&] { (void)plan_materialization(reader, invalid); },
+            "mapped Host request without a CUDA destination was accepted");
+}
+
+void mapped_materialization(DeviceContext& device) {
+    Fixture fixture;
+    fixture.write();
+    Reader reader(fixture.entry);
+    const auto matrix = reader.find("q5");
+    const std::array requests{PlacementRequest{matrix, device.device(), HostAccess::CudaMapped}};
+    auto backing = materialize(reader, plan_materialization(reader, requests), device.transfer_view());
+    const auto& parent = backing.device_parent(matrix);
+    std::vector<std::byte> actual(parent.geometry.bytes);
+    CUDA_CHECK(cudaMemcpy(actual.data(), parent.data, actual.size(), cudaMemcpyDeviceToHost));
+    require(std::equal(actual.begin(), actual.end(), fixture.payload.begin() + 256) &&
+                backing.stats().device_capacity_bytes == 0 && backing.stats().h2d_bytes == 0 &&
+                backing.stats().mapped_host_bytes == actual.size(),
+            "mapped materialization changed encoded bytes or performed H2D allocation");
+}
 
 void cpu_materialization() {
     Fixture fixture;
@@ -200,7 +240,8 @@ void failure_and_host_only(DeviceContext& device) {
     Binder binder(reader);
     const auto resource = binder.resource("text", "tokenizer.json");
     auto backing =
-        materialize(reader, plan_materialization(reader, {}, std::move(binder).finish()));
+        materialize(reader, plan_materialization(reader, std::span<const PlacementRequest>{},
+                                                 std::move(binder).finish()));
     require(backing.stats().device_capacity_bytes == 0 && backing.stats().h2d_bytes == 0 &&
                 backing.host_bytes(resource).size() == 5,
             "Host-only demand allocated device weights");
@@ -239,15 +280,16 @@ void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bo
         if (writer_fixture) { requests.push_back({reader.find("nvfp4"), Device::cpu()}); }
         auto plan = plan_materialization(reader, requests, std::move(binder).finish());
         for (const auto& placement : plan.device_objects) {
-            auto bytes = reader.read_object(placement.object);
-            if (writer_fixture && reader.directory().tensor(placement.object).id == "matrix") {
+            const auto object = plan.tensors.at(placement.storage.index).whole_object.value();
+            auto bytes        = reader.read_object(object);
+            if (writer_fixture && reader.directory().tensor(object).id == "matrix") {
                 require(bytes.size() == 130 * 130 * 2, "Python writer changed tensor dimensions");
                 for (std::size_t i = 0; i < bytes.size(); ++i) {
                     require(bytes[i] == std::byte((i * 37 + 11) % 251),
                             "C++ reading differs from known Python writer input bytes");
                 }
             }
-            expected.emplace(placement.object.index, std::move(bytes));
+            expected.emplace(object.index, std::move(bytes));
         }
         storage.emplace(materialize(reader, std::move(plan), device.transfer_view()));
         if (writer_fixture) {
@@ -349,8 +391,11 @@ void staging_reuse(DeviceContext& device) {
 
 int main(int argc, char** argv) {
     try {
+        mapped_placement();
         if (argc == 2 && std::string_view(argv[1]) == "--cpu-only") {
             cpu_materialization();
+            ninfer::test::materialization_alignment_checks({});
+            ninfer::test::encoded_slice_checks({});
             std::cout << "CPU-only tensor and resource materialization passed\n";
             return 0;
         }
@@ -371,6 +416,9 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("expected [--artifact|--writer-fixture PATH]");
         }
         materialization(device);
+        mapped_materialization(device);
+        ninfer::test::materialization_alignment_checks(device.transfer_view());
+        ninfer::test::encoded_slice_checks(device.transfer_view());
         registered_materialization(device);
         failure_and_host_only(device);
         ninfer::test::materialization_cuda_errors(device);

@@ -1,11 +1,12 @@
 #pragma once
 
 #include "models/common/weights.h"
+#include "artifact/schema.h"
 #include "core/layout.h"
 #include "ninfer/ops/weight_input.h"
 
-#include <array>
 #include <algorithm>
+#include <array>
 #include <vector>
 
 namespace ninfer::models {
@@ -84,9 +85,9 @@ struct VisionProfile {
                                         std::uint32_t output_hidden);
 [[nodiscard]] VisionParameters prepare_vision(std::span<const BoundWeight>, const VisionWeights&);
 
-template <class Input>
+template <class Input, class View>
 [[nodiscard]] VisionProfile describe_vision(const VisionWeights& weights, Input&& input,
-                                           bool host_staged = false) {
+                                           View&& view, bool host_staged = false) {
     const auto linear = [&](WeightId id) {
         const auto value = input(id);
         return ops::describe_linear_weight({&value, 1});
@@ -109,8 +110,8 @@ template <class Input>
             (void)phase.add(region.parent->geometry.bytes, 256, "Vision staged payload");
         };
         const auto tensor = [&](WeightId id) {
-            const auto value = input(id);
-            (void)phase.add(weight_element_count(value.weight.shape) * 2,
+            (void)phase.add(artifact::checked_mul(weight_element_count(view(id).shape), 2,
+                                                 "Vision staged tensor"),
                             256, "Vision staged tensor");
         };
         const auto norm = [&](NormWeights n) { tensor(n.weight); tensor(n.bias); };
@@ -124,7 +125,8 @@ template <class Input>
         tensor(weights.position_embedding);
         finish();
         for (const auto& layer : weights.layers) {
-            norm(layer.norm1); norm(layer.norm2);
+            norm(layer.norm1);
+            norm(layer.norm2);
             const std::array qkv{input(layer.query), input(layer.key), input(layer.value)};
             WeightView combined{{0, qkv[0].weight.shape[1]}, {}};
             for (const auto& value : qkv) {
@@ -136,7 +138,7 @@ template <class Input>
                             "Vision staged QKV payload");
             std::size_t bias_bytes = 0;
             for (auto id : {layer.query_bias, layer.key_bias, layer.value_bias})
-                bias_bytes += weight_element_count(input(id).weight.shape) * 2;
+                bias_bytes += weight_element_count(view(id).shape) * 2;
             (void)phase.add(bias_bytes, 256, "Vision staged QKV bias");
             matrix(layer.output); tensor(layer.output_bias);
             matrix(layer.fc1); tensor(layer.fc1_bias);

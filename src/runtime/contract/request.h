@@ -2,14 +2,30 @@
 
 #include "ninfer/types.h"
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::runtime {
 
-// Engine has already selected the model/mode preset, applied every explicit override,
-// and validated these values before constructing the runtime request.
+// A frontend rejected injected tokens before any model execution was submitted.
+class OutputControlError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// A bounded tokenizer or partial media plan supplies a lower bound, not the full prompt length.
+[[nodiscard]] inline std::string context_length_error_message(std::size_t tokens,
+                                                              std::size_t max_context,
+                                                              bool lower_bound = false) {
+    return "maximum context length is " + std::to_string(max_context) +
+           " tokens, but the prepared prompt has " + (lower_bound ? "at least " : "") +
+           std::to_string(tokens) + " tokens";
+}
+
+// Engine has applied explicit overrides to the Frontend-selected preset and validated the result.
 struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
@@ -40,12 +56,6 @@ struct OutputDecision {
     std::optional<std::uint32_t> prefix_execution_split_after;
 
     [[nodiscard]] bool finished() const noexcept { return finish_reason != FinishReason::None; }
-};
-
-// Frontend rejected target-owned output before Program mutation; only this request may be aborted.
-class OutputControlError final : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
 };
 
 // Non-owning cancellation observation used while the worker advances a context transaction. The

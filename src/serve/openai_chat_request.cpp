@@ -817,15 +817,13 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
 }
 
 void parse_thinking_budget(const Json& body, GenerationRequest& output) {
-    const std::optional<int> budget = optional_int(body, "thinking_budget");
-    if (!budget) { return; }
-    if (*budget < 1024) {
+    const auto budget = optional_int(body, "thinking_budget");
+    if (!budget) return;
+    if (*budget < 1024)
         bad_request("thinking_budget must be an integer of at least 1024", "thinking_budget");
-    }
-    if (*budget >= output.max_tokens) {
+    if (*budget >= output.max_tokens)
         bad_request("thinking_budget must be less than the effective output token limit",
                     "thinking_budget");
-    }
     output.thinking_budget = static_cast<std::uint32_t>(*budget);
 }
 

@@ -61,11 +61,4 @@ struct LoadOptions {
             .host_pinned_vision_weights = options.host_pinned_vision_weights};
 }
 
-inline void validate_memory_options(const LoadOptions& options) {
-    if (options.host_mapped_dflash2_codebooks && !options.dflash2())
-        throw std::invalid_argument("Host-mapped codebooks require the DFlash2 backend");
-    if (options.host_pinned_vision_weights && !options.vision)
-        throw std::invalid_argument("Host-pinned Vision weights require Vision");
-}
-
 } // namespace ninfer::models

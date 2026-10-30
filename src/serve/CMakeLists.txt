@@ -1,6 +1,7 @@
 add_library(ninfer_serve STATIC
   http_transport.cpp
   request_validation.cpp
+  request_error.cpp
   openai_chat_request.cpp
   openai_chat_response.cpp
   openai_chat_http.cpp
@@ -14,18 +15,14 @@ add_library(ninfer_serve STATIC
   openai_responses_store.cpp
   translate.cpp
   generation_service.cpp
-  request_error.cpp
   request_events.cpp
   operational_log.cpp
-  operational_log_engine.cpp
   request_log.cpp
-  device_environment.cpp
   metrics.cpp
   http_server.cpp
   openai_responses_http.cpp
-  serve_options.cpp
 )
 ninfer_internal_includes(ninfer_serve)
 target_link_libraries(ninfer_serve
-  PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib
+  PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib ninfer_product_config
   PRIVATE ninfer_media_acquire ninfer_product_logging ninfer_grammar CUDA::cudart)

@@ -6,12 +6,16 @@ ninfer_add_test(ninfer_context_cost_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_context_cost.cpp"
   LIBRARIES ninfer_runtime_support ninfer::json)
 
+ninfer_add_test(ninfer_placement_policy_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_placement_policy.cpp"
+  LIBRARIES ninfer_runtime_support)
+
 ninfer_add_test(ninfer_resource_manager_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_resource_manager.cpp"
   LIBRARIES ninfer_runtime_support)
 
-ninfer_add_test(ninfer_kv_capacity_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_kv_capacity.cpp"
+ninfer_add_test(ninfer_context_capacity_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_context_capacity.cpp"
   LIBRARIES ninfer_runtime_support)
 
 ninfer_add_test(ninfer_sampling_defaults_test
@@ -34,8 +38,6 @@ add_test(NAME ninfer_regex_choice_oracle_test
 ninfer_add_test(ninfer_json_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_json_schema.cpp"
   LIBRARIES ninfer_grammar ninfer::json)
-target_include_directories(ninfer_json_schema_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/third_party/xgrammar/3rdparty/picojson)
 
 add_test(NAME ninfer_json_schema_oracle_test
   COMMAND ${CMAKE_COMMAND} -E env

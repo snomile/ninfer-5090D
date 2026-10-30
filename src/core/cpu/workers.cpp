@@ -1,5 +1,4 @@
 #include "core/cpu/system.h"
-
 #include <condition_variable>
 #include <exception>
 #include <mutex>
@@ -7,23 +6,20 @@
 #include <utility>
 
 namespace ninfer {
-
 std::vector<std::thread> cpu_detail::start_workers(std::uint32_t count,
                                                    std::function<void(std::uint32_t)> initialize,
                                                    WorkerBody body, void* argument) {
     if (count == 0 || !initialize || !body)
         throw std::invalid_argument("invalid CPU worker startup");
-
     struct Startup {
         std::mutex mutex;
         std::condition_variable changed;
-        std::uint32_t ready                                   = 0;
+        std::uint32_t ready = 0;
         enum class Decision { Pending, Run, Cancel } decision = Decision::Pending;
         std::exception_ptr error;
         std::function<void(std::uint32_t)> initialize;
     };
-
-    auto startup        = std::make_shared<Startup>();
+    auto startup = std::make_shared<Startup>();
     startup->initialize = std::move(initialize);
     std::vector<std::thread> threads;
     threads.reserve(count);
@@ -31,9 +27,7 @@ std::vector<std::thread> cpu_detail::start_workers(std::uint32_t count,
         for (std::uint32_t rank = 0; rank < count; ++rank) {
             threads.emplace_back([startup, body, argument, rank]() mutable {
                 std::exception_ptr error;
-                try {
-                    startup->initialize(rank);
-                } catch (...) { error = std::current_exception(); }
+                try { startup->initialize(rank); } catch (...) { error = std::current_exception(); }
                 bool run;
                 {
                     std::unique_lock lock(startup->mutex);
@@ -66,10 +60,8 @@ std::vector<std::thread> cpu_detail::start_workers(std::uint32_t count,
     }
     return threads;
 }
-
 void cpu_detail::join_workers(std::span<std::thread> workers) noexcept {
     for (auto& worker : workers)
         if (worker.joinable()) worker.join();
 }
-
 } // namespace ninfer

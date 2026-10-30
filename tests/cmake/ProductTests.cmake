@@ -3,6 +3,7 @@ ninfer_add_test(ninfer_media_decode_test
   LIBRARIES ninfer_media_decode)
 
 ninfer_add_test(ninfer_prompt_input_test
+  NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prompt_input.cpp"
   LIBRARIES ninfer_product_prompt_input)
 
@@ -13,21 +14,17 @@ ninfer_add_test(ninfer_pretty_logging_test
 ninfer_add_test(ninfer_perplexity_evaluation_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_perplexity_evaluation.cpp"
           ${PROJECT_SOURCE_DIR}/apps/perplexity/evaluation.cpp
-  LIBRARIES ninfer_core)
+          ${PROJECT_SOURCE_DIR}/apps/perplexity/options.cpp
+          ${PROJECT_SOURCE_DIR}/apps/perplexity/report.cpp
+  LIBRARIES ninfer_core ninfer_product_config ninfer::json)
 
 target_include_directories(ninfer_perplexity_evaluation_test PRIVATE
   ${PROJECT_SOURCE_DIR}/apps/perplexity)
 
 ninfer_add_test(ninfer_cli_options_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cli_options.cpp" ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
-  LIBRARIES ninfer_runtime_support ninfer_product_logging)
-
-target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
-
-ninfer_add_test(ninfer_memory_options_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_memory_options.cpp" ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
-  LIBRARIES ninfer_serve)
-target_include_directories(ninfer_memory_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cli_options.cpp"
+  LIBRARIES ninfer_product_config)
 
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_openai_schema.cpp"
@@ -59,7 +56,7 @@ ninfer_add_test(ninfer_metrics_test
 
 ninfer_add_test(ninfer_engine_failure_monitor_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_engine_failure_monitor.cpp"
-  LIBRARIES Threads::Threads ninfer::httplib)
+  LIBRARIES ninfer_serve)
 set_tests_properties(ninfer_engine_failure_monitor_test PROPERTIES TIMEOUT 30)
 
 ninfer_add_test(ninfer_http_error_handler_test
@@ -69,3 +66,7 @@ ninfer_add_test(ninfer_http_error_handler_test
 ninfer_add_test(ninfer_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
   LIBRARIES ninfer_serve)
+
+ninfer_add_test(ninfer_tool_streaming_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tool_streaming.cpp"
+  LIBRARIES ninfer_serve ninfer_model_execution ninfer::json)

@@ -24,13 +24,9 @@ struct MaterializationStats {
     std::uint64_t owned_value_bytes     = 0;
     std::uint64_t peak_staging_bytes    = 0;
     std::uint64_t registered_host_bytes = 0; // Subset of host_capacity_bytes.
+    std::uint64_t mapped_host_bytes     = 0; // Payload subset, not allocated Device memory.
     std::size_t device_object_count     = 0;
     std::size_t host_object_count       = 0; // CPU tensors and retained resources.
-    // Payload bytes excluding alignment; mapped and transfer-only subsets are disjoint.
-    std::uint64_t mapped_host_bytes = 0;
-    std::uint64_t pinned_host_bytes = 0;
-    std::size_t mapped_host_object_count = 0;
-    std::size_t pinned_host_object_count = 0;
     // I/O, CPU copies and upload completion; excludes backing allocation and pinning.
     double upload_seconds            = 0;
     double host_registration_seconds = 0;
@@ -51,6 +47,7 @@ public:
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
     // Empty for an ordinary Host parent. Registration uses materialize's execution device.
     [[nodiscard]] CudaHostView host_transfer_view(ObjectHandle handle) const;
+    [[nodiscard]] const WeightParent& parent(StorageId, Device) const;
 
     [[nodiscard]] const MaterializationStats& stats() const noexcept { return stats_; }
 
@@ -59,18 +56,18 @@ private:
                                             std::optional<CudaExecutionView>,
                                             const StartupObserver*);
 
-    struct ObjectStorage {
-        std::vector<std::byte> host_data;
+    struct TensorStorage {
         std::vector<float> weight_divisors;
         std::optional<WeightParent> device;
         std::optional<WeightParent> host;
-        bool mapped = false;
     };
 
     HostBuffer host_storage_;
     CudaHostRegistration host_registration_;
     DeviceBuffer device_storage_;
-    std::vector<ObjectStorage> objects_;
+    std::vector<std::vector<std::byte>> resources_;
+    std::vector<TensorStorage> tensors_;
+    std::vector<std::optional<StorageId>> object_storage_;
     MaterializationStats stats_;
 };
 

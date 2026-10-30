@@ -1,10 +1,6 @@
 #include "serve/generation_service.h"
 
 #include <charconv>
-#include <cstddef>
-#include <span>
-#include <string>
-#include <string_view>
 
 namespace ninfer::serve {
 
@@ -12,8 +8,8 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
                                     std::string_view constraint_param,
                                     std::span<const std::string> tool_schema_params) {
     ApiError error;
-    error.param   = "messages";
-    error.message = exception.what();
+    error.param           = "messages";
+    error.message         = exception.what();
     const auto tool_param = [&] {
         const std::string_view pointer = exception.pointer();
         const auto split               = pointer.find('/', 1);
@@ -31,6 +27,23 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
         return "tools" + exception.pointer();
     };
     switch (exception.kind()) {
+    case ninfer::RequestErrorKind::ConflictingPromptOptions:
+        error.code  = "conflicting_template_option";
+        error.param = exception.pointer();
+        break;
+    case ninfer::RequestErrorKind::UnsupportedPromptContinuation:
+        error.code = "assistant_prefill_not_supported";
+        break;
+    case ninfer::RequestErrorKind::UnsupportedOutputCombination:
+        error.param =
+            exception.pointer().empty() ? std::string(constraint_param) : exception.pointer();
+        break;
+    case ninfer::RequestErrorKind::InvalidToolOutput:
+        error.status = 500;
+        error.type   = "server_error";
+        error.code   = "invalid_tool_output";
+        error.param.clear();
+        break;
     case ninfer::RequestErrorKind::InvalidToolConstraint:
         error.status = 400;
         error.code   = "invalid_tool_constraint";
@@ -55,11 +68,11 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
         error.param  = exception.source() == RequestErrorSource::Tools
                            ? tool_param()
                            : std::string(constraint_param) + exception.pointer();
-        error.code = exception.kind() == ninfer::RequestErrorKind::InvalidJsonSchema
-                         ? "invalid_json_schema"
-                     : exception.kind() == ninfer::RequestErrorKind::UnsupportedJsonSchema
-                         ? "unsupported_json_schema"
-                         : "unsatisfiable_json_schema";
+        error.code   = exception.kind() == ninfer::RequestErrorKind::InvalidJsonSchema
+                           ? "invalid_json_schema"
+                       : exception.kind() == ninfer::RequestErrorKind::UnsupportedJsonSchema
+                           ? "unsupported_json_schema"
+                           : "unsatisfiable_json_schema";
         break;
     case ninfer::RequestErrorKind::ContextLengthExceeded:
         error.status = 400;

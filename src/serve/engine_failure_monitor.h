@@ -22,7 +22,7 @@ public:
     ~EngineFailureMonitor() { stop(); }
 
     void start(std::function<bool()> is_available, std::function<void()> stop_accepting) {
-        if (thread_.joinable()) { throw std::logic_error("engine monitor is already running"); }
+        if (thread_.joinable()) throw std::logic_error("engine monitor is already running");
         {
             std::lock_guard lock(mutex_);
             stopping_ = false;
@@ -32,31 +32,28 @@ public:
                                stop_accepting = std::move(stop_accepting)] {
             std::unique_lock lock(mutex_);
             for (;;) {
-                if (stopping_) { return; }
+                if (stopping_) return;
                 lock.unlock();
                 const bool available = is_available();
                 lock.lock();
-                if (stopping_) { return; }
+                if (stopping_) return;
                 if (!available) {
                     failed_.store(true, std::memory_order_release);
                     const auto deadline = std::chrono::steady_clock::now() + shutdown_grace_;
                     lock.unlock();
                     stop_accepting();
                     lock.lock();
-                    if (!cv_.wait_until(lock, deadline, [this] { return stopping_; })) {
-                        // Draining HTTP uploads or log writes must not extend the failure bound.
+                    if (!cv_.wait_until(lock, deadline, [this] { return stopping_; }))
                         std::_Exit(EXIT_FAILURE);
-                    }
                     return;
                 }
-                cv_.wait_for(lock, std::chrono::milliseconds(100),
-                             [this] { return stopping_; });
+                cv_.wait_for(lock, std::chrono::milliseconds(100), [this] { return stopping_; });
             }
         });
     }
 
     void stop() {
-        if (!thread_.joinable()) { return; }
+        if (!thread_.joinable()) return;
         {
             std::lock_guard lock(mutex_);
             stopping_ = true;
@@ -69,12 +66,10 @@ public:
         return failed_.load(std::memory_order_acquire);
     }
 
-    // HTTP has drained. Fatal cleanup must not enter unbounded destructors or logging.
     void finish_shutdown() {
-        if (failed()) { std::_Exit(EXIT_FAILURE); }
+        if (failed()) std::_Exit(EXIT_FAILURE);
         stop();
-        // Cover a failure observed between the first check and stop's lock.
-        if (failed()) { std::_Exit(EXIT_FAILURE); }
+        if (failed()) std::_Exit(EXIT_FAILURE);
     }
 
 private:

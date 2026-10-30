@@ -1,6 +1,6 @@
 #pragma once
 
-#include "artifact/schema.h"
+#include "artifact/encoded_slice.h"
 #include "core/layout.h"
 
 #include <span>
@@ -29,6 +29,7 @@ struct PreparedResources {
     std::uint64_t owned_value_bytes = 0;
 };
 
+// CudaMapped requests a CUDA view backed by registered Host memory, without a device copy.
 enum class HostAccess { CpuOnly, CudaTransfer, CudaMapped };
 
 struct PlacementRequest {
@@ -38,9 +39,16 @@ struct PlacementRequest {
 };
 
 struct TensorPlacement {
-    ObjectHandle object;
+    StorageId storage;
     LayoutRegion region;
-    bool mapped = false;
+};
+
+struct TensorRequest {
+    EncodedTensor tensor;
+    Device device;
+    HostAccess host_access = HostAccess::CpuOnly;
+    // Nonzero domains keep separately packed groups from sharing individual matrices.
+    std::uint64_t storage_domain = 0;
 };
 
 struct MaterializationPlan {
@@ -51,10 +59,14 @@ struct MaterializationPlan {
     std::size_t host_capacity_bytes   = 0;
     std::size_t host_alignment        = 256;
     std::size_t registered_host_bytes = 0; // Aligned prefix of the Host backing.
+    std::vector<EncodedTensor> tensors;
+    std::vector<StorageId> requests;
+    std::vector<std::optional<StorageId>> objects;
     std::vector<TensorPlacement> device_objects;
     // Host placements are relative to their respective registered/ordinary regions.
     std::vector<TensorPlacement> ordinary_host_objects;
     std::vector<TensorPlacement> registered_host_objects;
+    std::vector<StorageId> mapped_objects;
     PreparedResources resources;
 };
 
@@ -65,6 +77,10 @@ struct MaterializationPlan {
 // never reads payloads; only already-prepared resource bytes move through this plan.
 [[nodiscard]] MaterializationPlan plan_materialization(const Reader& reader,
                                                        std::span<const PlacementRequest> requests,
+                                                       PreparedResources resources = {});
+
+[[nodiscard]] MaterializationPlan plan_materialization(const Reader&,
+                                                       std::span<const TensorRequest>,
                                                        PreparedResources resources = {});
 
 } // namespace ninfer::artifact

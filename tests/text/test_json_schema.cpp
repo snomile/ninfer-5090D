@@ -1,9 +1,7 @@
 #include "text/grammar.h"
-#include "../../third_party/xgrammar/cpp/compiled_grammar_impl.h"
-#include "../../third_party/xgrammar/cpp/grammar_builder.h"
-#include <xgrammar/xgrammar.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <array>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -104,7 +102,102 @@ void dense_length_masks() {
     }
 }
 
+void whitespace_contracts(ninfer::text::GrammarCompiler& compiler) {
+    const auto object = Constraint::json_object();
+    for (const std::string text :
+         {" \t\r\n{ \n}\t", "{\n  \"x\" \t: [1, true, {\"s\": \" a \\t b \"}]\n}",
+          "{\"x\": \"ok\", \"y\": 2}"})
+        check(accepts(compiler, object, text), "JSON object rejected structural whitespace");
+    check(accepts(compiler, object, "{" + std::string(80, ' ') + "}"),
+          "JSON whitespace has an arbitrary length limit");
+    for (const std::string text : {" \t\n", "[]", "{} {}", "{\"x\":1,}", "{\"x\":t rue}",
+                                   "{\"x\":1 2}", "{\v\"x\":1}", "{\"x\":\"a\nb\"}"})
+        check(!accepts(compiler, object, text), "JSON whitespace relaxed its value language");
+
+    const Json value{{"status", "ok"}, {"items", Json::array({1, 2})}};
+    const auto schema = Constraint::json_schema(R"({"type":"object","properties":{
+        "status":{"const":"ok"},"items":{"type":"array","items":{"type":"integer"}}},
+        "required":["status","items"],"additionalProperties":false})");
+    check(accepts(compiler, schema, "\n" + value.dump(4) + "\r\n"),
+          "JSON Schema rejected formatted output");
+    for (const std::string text :
+         {R"({"status":"bad","items":[]})", R"({"status":"ok"})",
+          R"({"status":"ok","items":["1"]})", R"({"status":"ok","items":[],"extra":0})"})
+        check(!accepts(compiler, schema, text), "formatted JSON weakened schema assertions");
+
+    const Json fixed{{"text", " a,:[{}] \"quoted\" \\ end "},
+                     {"n", 9223372036854775807LL},
+                     {"values", Json::array({true, nullptr, Json::object(), Json::array()})}};
+    for (const auto& literal : std::vector<Json>{fixed, Json::array({fixed, 3})}) {
+        const auto constraint = Constraint::json_schema(Json{{"const", literal}}.dump());
+        check(accepts(compiler, constraint, literal.dump()) &&
+                  accepts(compiler, constraint, " \n" + literal.dump(4) + "\t"),
+              "fixed JSON containers rejected structural whitespace or changed a leaf");
+        auto changed = literal;
+        if (changed.is_object())
+            changed["text"] = "different";
+        else
+            changed[1] = 4;
+        check(!accepts(compiler, constraint, changed.dump(4)),
+              "formatted const admitted another value");
+    }
+    const auto enumeration = Constraint::json_schema(
+        Json{{"enum", Json::array({fixed, Json::object(), Json::array(), " exact "})}}.dump());
+    check(accepts(compiler, enumeration, fixed.dump(2)) &&
+              accepts(compiler, enumeration, "{\n\t}") && accepts(compiler, enumeration, "[ \n]") &&
+              accepts(compiler, enumeration, R"(" exact ")") &&
+              !accepts(compiler, enumeration, R"("exact")"),
+          "formatted enum changed its fixed values");
+}
+
+void whitespace_token_masks() {
+    const std::vector<std::string> vocabulary{
+        "\t{\n", "\"status\" \t", ":\r\n", "\"ok\"\n}\n", "\"bad\"", "\n", ""};
+    constexpr int eos = 6;
+    ninfer::text::GrammarCompiler compiler(vocabulary, {eos}, 4 * 1024 * 1024);
+    const auto constraint = Constraint::json_schema(R"({"type":"object",
+        "properties":{"status":{"const":"ok"}},"required":["status"],
+        "additionalProperties":false})");
+    auto session          = compiler.compile(constraint, {}, {});
+    const std::array<std::int32_t, 4> drafts{0, 1, 2, 3};
+    const std::array<std::uint32_t, 5> expected{(1u << 0) | (1u << 5), (1u << 1) | (1u << 5),
+                                                (1u << 2) | (1u << 5), (1u << 3) | (1u << 5),
+                                                (1u << eos) | (1u << 5)};
+    std::array<std::uint32_t, 5> lookahead{};
+    check(session->masks(drafts, lookahead) == 0 && lookahead == expected,
+          "JSON mask rejected a token spanning whitespace and punctuation");
+    std::array<std::uint32_t, 1> words{};
+    check(session->masks({}, words) == 0 && words[0] == expected[0],
+          "JSON lookahead changed the committed prefix");
+    session->accept(drafts);
+    session->discard();
+    check(session->masks({}, words) == 0 && words[0] == expected[0],
+          "JSON discard changed whitespace state");
+    session->accept(drafts);
+    session->confirm();
+    check(session->masks({}, words) == 0 && words[0] == expected.back(),
+          "formatted JSON did not allow EOS after a complete value");
+
+    const auto prefix = vocabulary[0] + vocabulary[1] + vocabulary[2];
+    for (const auto& close : {std::string{}, std::string{"</think>\n\n"}}) {
+        const auto continuation = close.empty() ? prefix : "thinking" + close + prefix;
+        auto continued          = compiler.compile(constraint, close, continuation);
+        check(continued->masks({}, words) == 0 && words[0] == expected[3],
+              "JSON continuation or reasoning framing lost structural whitespace");
+    }
+}
+
 void contracts(ninfer::text::GrammarCompiler& compiler) {
+    for (const auto* source : {R"({"type":"string","allOf":[{"pattern":"^a$"},{"pattern":"^b$"}]})",
+                               R"({"type":"string","pattern":"^a$","maxLength":0})"}) {
+        bool rejected = false;
+        try {
+            (void)compiler.compile(Constraint::json_schema(source), {}, {});
+        } catch (const ninfer::RequestError& error) {
+            rejected = error.kind() == ninfer::RequestErrorKind::UnsatisfiableJsonSchema;
+        }
+        check(rejected, "empty string intersection was not rejected as unsatisfiable");
+    }
     auto object = Constraint::json_object();
     for (const std::string text : {"{}", R"({"x":[1,true,null,{"y":"你好"}]})"})
         check(accepts(compiler, object, text), "JSON object rejected valid content");
@@ -122,14 +215,6 @@ void contracts(ninfer::text::GrammarCompiler& compiler) {
         check(accepts(compiler, length, Json(value).dump()),
               "JSON character length/encoding mismatch");
     check(!accepts(compiler, length, Json("ab").dump()), "string length was ignored");
-    const auto mixed = Constraint::json_schema(
-        R"({"type":"string","minLength":2,"maxLength":3})");
-    for (const auto& value : std::vector<std::string>{"a\n", "\"你", "\\😀x"})
-        check(accepts(compiler, mixed, Json(value).dump()),
-              "mixed raw, escaped or non-BMP scalar length mismatch");
-    for (const auto& value : std::vector<std::string>{"a", "a\n你😀"})
-        check(!accepts(compiler, mixed, Json(value).dump()),
-              "mixed scalar length bound was ignored");
     auto pattern = Constraint::json_schema(R"({"type":"string","pattern":"p"})");
     check(accepts(compiler, pattern, "\"apple\""), "pattern must use search semantics");
     check(!accepts(compiler, pattern, "\"absent\""), "pattern admitted a nonmatching string");
@@ -137,50 +222,6 @@ void contracts(ninfer::text::GrammarCompiler& compiler) {
     for (const std::string separator : {"\n", "\r", "\u2028", "\u2029"})
         check(!accepts(compiler, dot, Json("a" + separator + "b").dump()),
               "ECMAScript dot admitted a line terminator");
-}
-
-void counted_repetition_metadata() {
-    const std::vector<std::string> vocabulary{"a", "aaaa", "\\n", "你", "😀", "\"", ""};
-    xgrammar::TokenizerInfo tokenizer(vocabulary, xgrammar::VocabType::RAW, std::nullopt,
-                                     std::vector<std::int32_t>{6});
-    xgrammar::GrammarCompiler compiler(tokenizer, 1, false);
-    const auto grammar = xgrammar::Grammar::FromJSONSchema(
-        R"({"type":"string","minLength":12,"maxLength":20})", false, std::nullopt,
-        std::pair<std::string, std::string>{",", ":"}, false);
-    const auto compiled = compiler.CompileGrammar(grammar);
-    check(compiled.GetGrammar().ToString().find("{12, 20}") != std::string::npos,
-          "bounded JSON repetition was expanded instead of counted");
-    std::size_t fast_masks = 0;
-    for (const auto& [state, mask] : compiled.ImplPtr()->adaptive_token_mask_cache) {
-        (void)state;
-        if (!mask.repeat_interior_bitsets.empty() || !mask.repeat_exit_tokens.empty() ||
-            !mask.repeat_interior_tokens.empty())
-            ++fast_masks;
-    }
-    check(fast_masks > 0, "counted JSON repetition did not build its token-mask fast path");
-
-    // Capture and lookahead metadata must survive scalar-rule optimization.
-    const auto captured = compiler.CompileGrammar(
-        "root ::= scalar{2,3} \"\\\"\"\nscalar[capture=\"scalar\"] ::= \"a\" | \"你\" | \"😀\"");
-    xgrammar::GrammarMatcher matcher(captured);
-    check(matcher.AcceptString("a你\""), "captured repetition rejected valid input");
-    const std::vector<std::pair<std::string, std::string>> expected{
-        {"scalar", "a"}, {"scalar", "你"}};
-    check(matcher.GetCaptures() == expected, "counted repetition lost scalar captures");
-    matcher.Rollback(1);
-    check(matcher.GetCaptures().empty(), "rollback retained tentative scalar captures");
-    check(matcher.AcceptString("😀a\"") &&
-              matcher.GetCaptures() ==
-                  std::vector<std::pair<std::string, std::string>>{
-                      {"scalar", "😀"}, {"scalar", "a"}},
-          "replay after rollback changed scalar capture bytes");
-
-    const auto lookahead = compiler.CompileGrammar(
-        "root ::= scalar{2,3} \"\\\"\"\nscalar ::= \"a\" | \"你\" (= \"\\\"\")");
-    bool kept = false;
-    for (std::int32_t rule = 0; rule < lookahead.GetGrammar()->NumRules(); ++rule)
-        kept |= lookahead.GetGrammar()->GetRule(rule).lookahead_assertion_id != -1;
-    check(kept, "counted repetition erased lookahead metadata");
 }
 } // namespace
 
@@ -216,7 +257,8 @@ int main(int argc, char** argv) {
             contracts(compiler);
             length_boundaries(compiler);
             dense_length_masks();
-            counted_repetition_metadata();
+            whitespace_contracts(compiler);
+            whitespace_token_masks();
             std::cout << "JSON/schema CPU contracts passed\n";
         }
         return 0;

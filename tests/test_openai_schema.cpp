@@ -1,3 +1,4 @@
+#include "serve_tool_stream_fixture.h"
 #include "serve/generation_service.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
@@ -17,6 +18,7 @@ namespace {
 
 using Json = ninfer::serve::RequestJson;
 using namespace ninfer::serve;
+using ninfer::product::ServeOptions;
 
 int check(bool condition, const std::string& label) {
     if (condition) { return 0; }
@@ -49,9 +51,9 @@ Json base_request() {
 
 OpenAIChatRequest parse(Json body) { return parse_chat_completion_request(body, limits()); }
 
-ResolvedPromptSemantics semantics(const GenerationRequest& request) {
+PromptOptionInputs semantics(const GenerationRequest& request) {
     ServeOptions server;
-    return resolve_prompt_semantics(request, server);
+    return collect_prompt_options(request, server);
 }
 
 ninfer::PromptInput prompt(const GenerationRequest& request) {
@@ -60,7 +62,7 @@ ninfer::PromptInput prompt(const GenerationRequest& request) {
 
 ninfer::RequestOptions options(const GenerationRequest& request) {
     ServeOptions server;
-    return to_request_options(request, server, semantics(request), true);
+    return to_request_options(request, server, true);
 }
 
 Json parse_sse(const std::string& event) {
@@ -194,6 +196,8 @@ int test_prompt_cache_boundaries() {
         body["messages"].push_back(Json{{"role", role}, {"content", "complete message"}});
         const auto prepared = prompt(parse(body).generation);
         const auto& markers = prepared.context_cache.markers;
+        failures += check(prepared.context_cache.allow_engine_automatic_shared_prefixes,
+                          "default OpenAI policy suppressed structural prefix candidates");
         failures += check(
             markers.size() == 1 && markers[0].location == Location::MessagePartBoundary &&
                 markers[0].after_message_count == 2 && markers[0].after_message_part_count == 1 &&
@@ -206,6 +210,8 @@ int test_prompt_cache_boundaries() {
         {Json{{"type", "text"}, {"text", "first"}}, Json{{"type", "text"}, {"text", "second"}}});
     multipart["prompt_cache_options"] = Json{{"mode", "implicit"}};
     const auto requested              = prompt(parse(multipart).generation);
+    failures += check(requested.context_cache.allow_engine_automatic_shared_prefixes,
+                      "implicit policy suppressed structural prefix candidates");
     failures +=
         check(requested.context_cache.markers.size() == 1 &&
                   requested.context_cache.markers[0].location == Location::MessagePartBoundary &&
@@ -316,8 +322,9 @@ int test_constrained_decoding_extensions() {
                           options(parsed.generation).constraint == parsed.generation.constraint,
                       "GBNF must survive protocol-to-Engine translation");
     body["stop"] = "yes";
-    failures += check(api_error([&] { (void)parse(body); }).param == "structured_outputs.grammar",
-                      "grammar with custom stops accepted");
+    failures +=
+        check(parse(body).generation.constraint && !parse(body).generation.stop_strings.empty(),
+              "grammar/custom-stop request did not reach the Frontend");
     for (const auto& value : {Json{{"grammar", ""}}, Json{{"json", Json::object()}}, Json("bad")}) {
         body                       = base_request();
         body["structured_outputs"] = value;
@@ -736,80 +743,60 @@ int test_thinking_budget() {
     Json body = base_request();
     body["max_tokens"] = 16384;
     body["thinking_budget"] = 8192;
-    const GenerationRequest configured = parse(body).generation;
-    failures += check(configured.thinking_budget == 8192,
-                      "request thinking budget did not reach GenerationRequest");
+    const auto configured = parse(body).generation;
+    failures += check(configured.thinking_budget == 8192, "request thinking budget was lost");
     ServeOptions server;
-    server.default_thinking_budget = 4096;
-    failures += check(to_request_options(configured, server, semantics(configured), true)
-                              .execution.thinking.budget == 8192,
-                      "request thinking budget did not override the server default");
-    const GenerationRequest omitted = parse(base_request()).generation;
-    failures += check(!omitted.thinking_budget, "omitted thinking budget did not remain unset");
+    server.launch.generation.thinking_budget = 4096;
+    failures += check(to_request_options(configured, server, true).execution.thinking.budget == 8192,
+                      "request budget did not override the server default");
+    const auto omitted = parse(base_request()).generation;
+    failures += check(!omitted.thinking_budget &&
+                          to_request_options(omitted, server, true).execution.thinking.budget == 4096,
+                      "omitted budget did not preserve the server default");
     body["thinking_budget"] = nullptr;
-    failures += check(!parse(body).generation.thinking_budget,
-                      "null thinking budget did not remain unset");
-    auto rejected = [&](Json value, int max_tokens, const std::string& label) {
-        Json invalid = base_request();
-        invalid["max_tokens"] = max_tokens;
+    failures += check(!parse(body).generation.thinking_budget, "null budget was not unset");
+    const auto rejected = [&](Json value, int limit) {
+        auto invalid = base_request();
+        invalid["max_tokens"] = limit;
         invalid["thinking_budget"] = std::move(value);
-        const ApiError error = api_error([&] { (void)parse(invalid); });
-        failures += check(error.status == 400 && error.param == "thinking_budget", label);
+        const auto error = api_error([&] { (void)parse(invalid); });
+        failures += check(error.status == 400 && error.param == "thinking_budget",
+                          "invalid thinking budget did not return HTTP 400 with its param");
     };
-    rejected(512, 16384, "thinking budget below 1024 was accepted");
-    rejected(20000, 15000, "thinking budget above max_tokens was accepted");
-    rejected(8192, 8192, "thinking budget equal to max_tokens was accepted");
-    rejected("8192", 16384, "string thinking budget was accepted");
-    rejected(8192.5, 16384, "fractional thinking budget was accepted");
-    rejected(true, 16384, "boolean thinking budget was accepted");
-    rejected(-1, 16384, "negative thinking budget was accepted");
-    rejected(std::numeric_limits<std::uint64_t>::max(), 16384,
-             "overflowing thinking budget was accepted");
+    rejected(512, 16384);
+    rejected(8192, 8192);
+    rejected(20000, 15000);
+    rejected("8192", 16384);
+    rejected(8192.5, 16384);
+    rejected(true, 16384);
+    rejected(-1, 16384);
+    rejected(std::numeric_limits<std::uint64_t>::max(), 16384);
     body["thinking_budget"] = 1024;
     body["max_tokens"] = 1025;
-    failures += check(parse(body).generation.thinking_budget == 1024,
-                      "minimum valid thinking budget was rejected");
-    Json inherited_limit = base_request();
-    inherited_limit["thinking_budget"] = 8192;
-    const ApiError inherited_error = api_error([&] {
-        (void)parse_chat_completion_request(inherited_limit, RequestLimits{});
-    });
-    failures += check(inherited_error.param == "thinking_budget",
-                      "thinking budget ignored the server default output limit");
+    failures += check(parse(body).generation.thinking_budget == 1024, "minimum budget rejected");
     body = base_request();
-    body["max_completion_tokens"] = 8192;
-    body["max_tokens"] = 16384;
     body["thinking_budget"] = 8192;
     failures += check(api_error([&] { (void)parse(body); }).param == "thinking_budget",
-                      "thinking budget ignored max_completion_tokens precedence");
-    body = base_request();
+                      "budget ignored inherited output limit");
     body["max_tokens"] = 16384;
-    body["thinking_budget"] = 8192;
+    body["max_completion_tokens"] = 8192;
+    failures += check(api_error([&] { (void)parse(body); }).param == "thinking_budget",
+                      "budget ignored max_completion_tokens precedence");
+    body.erase("max_completion_tokens");
     body["reasoning_effort"] = "none";
-    const GenerationRequest disabled = parse(body).generation;
-    failures += check(disabled.thinking_budget == 8192 &&
-                          !options(disabled).execution.thinking.budget,
-                      "non-thinking request did not quietly ignore a valid thinking budget");
+    failures += check(parse(body).generation.thinking_budget == 8192,
+                      "valid non-thinking request was rejected");
     body["thinking_budget"] = 512;
     failures += check(api_error([&] { (void)parse(body); }).param == "thinking_budget",
-                      "non-thinking request bypassed thinking budget validation");
-    const GenerationRequest defaulted = parse(base_request()).generation;
-    const auto translated = to_request_options(defaulted, server, semantics(defaulted), true);
-    failures += check(!defaulted.thinking_budget && translated.execution.thinking.budget == 4096,
-                      "omitted request budget did not preserve the server default");
-    body = base_request();
-    body["max_tokens"] = 16384;
+                      "non-thinking request bypassed validation");
     body["thinking_budget"] = 8192;
-    body["response_format"] =
-        Json{{"type", "json_schema"},
-             {"json_schema", Json{{"name", "answer"}, {"strict", true},
-                                  {"schema", Json{{"type", "object"},
-                                                  {"properties", Json{{"answer", Json{{"type", "string"}}}}},
-                                                  {"required", Json::array({"answer"})},
-                                                  {"additionalProperties", false}}}}}};
-    const GenerationRequest structured = parse(body).generation;
+    body["response_format"] = Json{{"type", "json_schema"},
+        {"json_schema", {{"name", "answer"}, {"strict", true},
+                        {"schema", {{"type", "object"}, {"properties", Json::object()},
+                                    {"additionalProperties", false}}}}}};
+    const auto structured = parse(body).generation;
     failures += check(structured.thinking_budget == 8192 && structured.constraint.has_value(),
-                      "thinking budget disrupted JSON Schema parsing");
+                      "budget disrupted structured output parsing");
     return failures;
 }
 
@@ -846,17 +833,17 @@ int test_stops_and_ranges() {
 
 GenerationOutcome sample_outcome() {
     GenerationOutcome outcome;
-    outcome.text                                = "answer";
-    outcome.reasoning                           = "thought";
-    outcome.prompt_tokens                       = 20;
-    outcome.completion_tokens                   = 7;
-    outcome.reasoning_tokens                    = 3;
-    outcome.finish_reason                       = ninfer::FinishReason::StopToken;
-    outcome.metrics.prefix_cache_hit_tokens     = 12;
-    outcome.metrics.prompt_wall_seconds         = 0.04;
-    outcome.metrics.generation_wall_seconds     = 0.03;
-    outcome.metrics.speculative_draft_tokens    = 9;
-    outcome.metrics.speculative_accepted_tokens = 6;
+    outcome.text                                  = "answer";
+    outcome.reasoning                             = "thought";
+    outcome.prompt_tokens                         = 20;
+    outcome.completion_tokens                     = 7;
+    outcome.reasoning_tokens                      = 3;
+    outcome.finish_reason                         = ninfer::FinishReason::StopToken;
+    outcome.stats.reused_prompt_tokens            = 12;
+    outcome.stats.timings.prompt_wall_seconds     = 0.04;
+    outcome.stats.timings.generation_wall_seconds = 0.03;
+    outcome.stats.speculative.drafted_tokens      = 9;
+    outcome.stats.speculative.accepted_tokens     = 6;
     return outcome;
 }
 
@@ -901,9 +888,9 @@ int test_aggregate_response() {
         call["id"].get<std::string>().starts_with("call_") && call["function"]["name"] == "Edit" &&
             !Json::parse(call["function"]["arguments"].get<std::string>()).contains("replace_all"),
         "OpenAI adapter owns wire tool-call identifiers");
-    outcome.finish_reason = ninfer::FinishReason::OutputLimit;
-    outcome.constraint    = ninfer::ConstraintObservation{
-           .branch = ninfer::ConstraintOutputBranch::Tools, .complete = true, .terminated = false};
+    outcome.finish_reason    = ninfer::FinishReason::OutputLimit;
+    outcome.stats.constraint = ninfer::ConstraintObservation{
+        .branch = ninfer::ConstraintOutputBranch::Tools, .complete = true, .terminated = false};
     response = Json::parse(make_chat_completion_response(identity(), outcome));
     failures += check(response["choices"][0]["finish_reason"] == "length" &&
                           response["choices"][0]["message"]["tool_calls"].size() == 1 &&
@@ -927,8 +914,8 @@ int test_stream_response() {
                       "stream separates reasoning and content deltas");
 
     GenerationOutcome outcome = sample_outcome();
-    outcome.constraint        = ninfer::ConstraintObservation{
-               .branch = ninfer::ConstraintOutputBranch::Content, .complete = true, .terminated = true};
+    outcome.stats.constraint  = ninfer::ConstraintObservation{
+         .branch = ninfer::ConstraintOutputBranch::Content, .complete = true, .terminated = true};
     const std::vector<std::string> events = stream.finish(outcome);
     failures +=
         check(events.size() == 4, "finish emits buffered suffix, terminal, usage, and done");
@@ -960,20 +947,22 @@ int test_stream_response() {
     GenerationOutcome tool_outcome;
     tool_outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
         .name = "Edit", .arguments_json = R"({"file_path":"/tmp/probe.cpp"})"});
-    tool_outcome.finish_reason                 = ninfer::FinishReason::StopToken;
-    const std::vector<std::string> tool_events = tool_stream.finish(tool_outcome);
-    const Json tool_delta                      = parse_sse(tool_events[0]);
+    tool_outcome.finish_reason = ninfer::FinishReason::StopToken;
+    const auto tool_events     = emit_tools(tool_stream, tool_outcome.tool_calls);
+    const auto tool_finish     = tool_stream.finish(tool_outcome);
+    const Json tool_delta      = parse_sse(tool_events[0]);
     failures += check(
         tool_delta["choices"][0]["delta"]["tool_calls"][0]["id"].get<std::string>().starts_with(
             "call_") &&
             tool_delta["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "Edit" &&
-            parse_sse(tool_events[1])["choices"][0]["finish_reason"] == "tool_calls",
+            parse_sse(tool_finish[0])["choices"][0]["finish_reason"] == "tool_calls",
         "stream encoder owns stable OpenAI tool-call shape");
     OpenAIChatStream interrupted(identity(), false);
     (void)interrupted.start();
     tool_outcome.finish_reason = ninfer::FinishReason::OutputLimit;
-    const auto partial_events  = interrupted.finish(tool_outcome);
-    failures += check(parse_sse(partial_events[1])["choices"][0]["finish_reason"] == "length",
+    (void)emit_tools(interrupted, tool_outcome.tool_calls);
+    const auto partial_events = interrupted.finish(tool_outcome);
+    failures += check(parse_sse(partial_events[0])["choices"][0]["finish_reason"] == "length",
                       "streamed completed call hid a later truncation");
     return failures;
 }

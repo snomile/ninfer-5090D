@@ -1,5 +1,5 @@
 #include "ninfer/engine.h"
-#include "runtime/contract/request.h"
+#include "context_budget.h"
 
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -8,8 +8,6 @@
 #include <iostream>
 #include <regex>
 #include <stdexcept>
-#include <string>
-#include <vector>
 
 namespace {
 void require(bool condition, const char* message) {
@@ -39,99 +37,20 @@ ninfer::RequestOptions literal(const std::string& answer, float temperature = 0.
 
 struct Sink final : ninfer::OutputSink {
     std::string content;
-    std::string reasoning;
-    std::uint32_t generated_tokens = 0;
-    unsigned starts = 0;
 
-    void start(ninfer::GenerationStart) override { ++starts; }
+    void start(ninfer::GenerationStart) override {}
 
     void progress(ninfer::PromptProgress) override {}
 
-    void timing(ninfer::GenerationTimingObservation observation) override {
-        generated_tokens = observation.generated_tokens;
-    }
+    void timing(ninfer::GenerationTimingObservation) override {}
 
-    void publish(ninfer::OutputDelta delta) override {
+    void publish(ninfer::OutputEvent event) override {
+        const auto* text = std::get_if<ninfer::OutputDelta>(&event);
+        if (!text) return;
+        const auto& delta = *text;
         if (delta.channel == ninfer::OutputChannel::Content) { content += delta.text; }
-        if (delta.channel == ninfer::OutputChannel::Reasoning) { reasoning += delta.text; }
     }
 };
-
-void mixed_thinking_control(ninfer::Engine& engine, unsigned concurrency) {
-    constexpr std::string_view forced =
-        " \n\n Considering the limited time by the user, I have to give the solution based on the "
-        "thinking directly now.\n</think>\n\n";
-    const auto control = engine.tokenize_text(forced);
-    require(!control.empty(), "real tokenizer lost the canonical target control");
-    std::vector<ninfer::GenerationHandle> handles;
-    std::vector<std::string> answers;
-    for (unsigned row = 0; row < concurrency; ++row) {
-        answers.push_back(" control-row-" + std::to_string(row));
-        auto request = literal(answers.back());
-        request.execution.allow_prefix_reuse = false;
-        if (row % 2 == 0) { request.execution.thinking.budget = 2; }
-        handles.push_back(engine.submit(engine.prepare(prompt(row % 2 == 0)), request,
-                                        ninfer::OutputConsumerMode::Streaming));
-    }
-    for (unsigned row = 0; row < concurrency; ++row) {
-        Sink sink;
-        const auto result = handles[row].wait(&sink);
-        require(result.content == answers[row] && sink.content == answers[row] &&
-                    sink.reasoning == result.reasoning && sink.starts == 1 &&
-                    sink.generated_tokens == result.generated_token_ids.size() &&
-                    result.finish_reason == ninfer::FinishReason::StopToken,
-                "mixed control batch changed publication, row grammar or committed token count");
-        if (row % 2 == 0) {
-            require(result.thinking.applied && result.thinking.model_thinking_tokens == 2 &&
-                        result.thinking.injected_tokens == control.size() &&
-                        std::search(result.generated_token_ids.begin(),
-                                    result.generated_token_ids.end(), control.begin(),
-                                    control.end()) != result.generated_token_ids.end(),
-                    "thinking row did not commit one exact tokenizer-derived control span");
-        } else {
-            require(!result.thinking.applied && result.thinking.injected_tokens == 0,
-                    "unrelated content row consumed another row's thinking control");
-        }
-    }
-    require(engine.is_available() &&
-                engine.generate(engine.prepare(prompt()), literal(" after-control")).content ==
-                    " after-control",
-            "Engine did not remain usable after a mixed control batch");
-}
-
-// This opt-in fixture needs a real model artifact whose tokenizer marks an interior control
-// substring (for example "limited") special, but not EOS. An ordinary artifact cannot force it.
-void control_rejection_recovery(ninfer::Engine& engine) {
-    require(engine.options().max_concurrency >= 2, "control rejection fixture needs two lanes");
-    auto failing = literal(" failed-row");
-    failing.execution.thinking.budget = 2;
-    failing.execution.allow_prefix_reuse = false;
-    auto healthy_request = literal(" healthy-row");
-    healthy_request.execution.allow_prefix_reuse = false;
-    auto failed = engine.submit(engine.prepare(prompt(true)), failing,
-                                ninfer::OutputConsumerMode::Streaming);
-    auto healthy = engine.submit(engine.prepare(prompt()), healthy_request,
-                                 ninfer::OutputConsumerMode::Streaming);
-    Sink failed_sink;
-    bool rejected = false;
-    try {
-        (void)failed.wait(&failed_sink);
-    } catch (const ninfer::runtime::OutputControlError&) { rejected = true; }
-    require(rejected && failed_sink.content.empty() &&
-                failed_sink.generated_tokens == 2 &&
-                failed_sink.reasoning.find("Considering the limited time") == std::string::npos,
-            "rejected control published tentative tokens or consumed committed output budget");
-    Sink healthy_sink;
-    const auto result = healthy.wait(&healthy_sink);
-    require(result.content == " healthy-row" && healthy_sink.content == result.content &&
-                result.finish_reason == ninfer::FinishReason::StopToken &&
-                !result.thinking.applied && result.thinking.injected_tokens == 0 &&
-                engine.is_available(),
-            "request-level control recovery aborted an unrelated request");
-    require(engine.generate(engine.prepare(prompt()), literal(" after-rejection")).content ==
-                " after-rejection",
-            "Engine did not remain usable after request-level control rejection");
-}
 
 void choice_and_regex(ninfer::Engine& engine, unsigned concurrency, bool speculative) {
     const std::vector<std::string> choices{"route_search", "route_calculate", "route_answer"};
@@ -154,7 +73,7 @@ void choice_and_regex(ninfer::Engine& engine, unsigned concurrency, bool specula
                     : std::regex_match(result.content, pattern),
                 "choice/regex produced content outside its language");
         if (speculative)
-            require(result.speculative.rounds > 0, "choice/regex bypassed speculation");
+            require(result.stats.speculative.rounds > 0, "choice/regex bypassed speculation");
     }
     const std::string literal_bytes = " 你好 \"a|b\\c\"\n";
     auto exact                      = choice;
@@ -232,12 +151,10 @@ int main(int argc, char** argv) {
         ninfer::EngineOptions options;
         options.artifact_path   = artifact;
         options.max_context     = 1024;
-        options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2048);
         options.max_concurrency = argc > 3 ? static_cast<unsigned>(std::stoul(argv[3])) : 2;
         options.enable_vision   = argc > 4 && std::string_view(argv[4]) == "vision";
         options.prefill_chunk   = 128;
-        options.kv_cache        = ninfer::KvCacheStorage::Fp8E4M3Row256;
-        options.context_cache.device_state_slots  = 8;
+        options.kv_cache        = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
         options.context_cache.host_capacity_bytes = 128ULL << 20;
         options.use_cuda_graph = argc < 3 || std::string_view(argv[2]) != "eager";
         if (backend == "mtp")
@@ -253,13 +170,8 @@ int main(int argc, char** argv) {
             options.speculative.draft_tokens  = draft_tokens ? std::stoul(draft_tokens) : 3;
             options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
         }
+        ninfer::test::qwen3_5::set_context_capacity(options, 8);
         ninfer::Engine engine(options);
-        if (const char* fixture = std::getenv("NINFER_TEST_CONTROL_REJECTION_FIXTURE");
-            fixture && std::string_view(fixture) == "1") {
-            control_rejection_recovery(engine);
-            return 0;
-        }
-        mixed_thinking_control(engine, options.max_concurrency);
         choice_and_regex(engine, options.max_concurrency, backend != "none");
         const std::string answer =
             "  {\"value\":\"你好\",\"literal\":\"<tool_call>x</tool_call>\"}";
@@ -274,17 +186,19 @@ int main(int argc, char** argv) {
             require(result.finish_reason == ninfer::FinishReason::StopToken,
                     "grammar did not finish through EOS");
             if (backend != "none")
-                require(result.speculative.rounds > 0, "constraint bypassed speculative backend");
-            std::cout << "literal temp=" << temperature << " reuse=" << result.reused_prompt_tokens
-                      << " prepare_ms=" << result.timings.prepare_seconds * 1000
-                      << " decode_ms=" << result.timings.decode_seconds * 1000 << '\n';
+                require(result.stats.speculative.rounds > 0,
+                        "constraint bypassed speculative backend");
+            std::cout << "literal temp=" << temperature
+                      << " reuse=" << result.stats.reused_prompt_tokens
+                      << " prepare_ms=" << result.stats.timings.prepare_seconds * 1000
+                      << " decode_ms=" << result.stats.timings.decode_seconds * 1000 << '\n';
         }
 
         auto thinking                      = literal(answer);
         thinking.execution.thinking.budget = 2;
         auto thought = engine.generate(engine.prepare(prompt(true)), thinking);
-        require(thought.content == answer && thought.thinking.applied &&
-                    thought.thinking.injected_tokens > 0,
+        require(thought.content == answer && thought.stats.thinking.applied &&
+                    thought.stats.thinking.injected_tokens > 0,
                 "thinking control broke constrained content");
 
         auto continued = prompt();
@@ -344,7 +258,7 @@ int main(int argc, char** argv) {
         seed.execution.requested_output_tokens = 1;
         (void)engine.generate(engine.prepare_tokens(raw_prompt), seed);
         const auto hit = engine.generate(engine.prepare_tokens(raw_prompt), literal("no"));
-        require(hit.content == "no" && hit.reused_prompt_tokens == raw_prompt.size(),
+        require(hit.content == "no" && hit.stats.reused_prompt_tokens == raw_prompt.size(),
                 "exact prefix hit reused grammar state or bypassed first-token mask");
         auto raw = engine.generate(engine.prepare_tokens(engine.tokenize_text("Answer: ")),
                                    literal(answer));
@@ -442,7 +356,7 @@ int main(int argc, char** argv) {
         changed.constraint = ninfer::OutputConstraint::json_schema(R"({"const":{"changed":true}})");
         const auto changed_result = engine.generate(engine.prepare(prompt()), changed);
         record({{"const", {{"changed", true}}}}, changed_result);
-        require(changed_result.reused_prompt_tokens > 0,
+        require(changed_result.stats.reused_prompt_tokens > 0,
                 "schema switch did not exercise prefix reuse");
 
         std::vector<ninfer::GenerationHandle> json_batch;

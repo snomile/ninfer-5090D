@@ -62,13 +62,6 @@ DeviceAllocationError::DeviceAllocationError(const char* operation, std::size_t 
     : std::runtime_error(std::string(operation) + ": insufficient Device memory"),
       requested_bytes_(requested_bytes) {}
 
-DeviceMemorySnapshot device_memory_snapshot(Device device) {
-    CudaDeviceScope scope(device);
-    DeviceMemorySnapshot snapshot;
-    CUDA_CHECK(cudaMemGetInfo(&snapshot.free_bytes, &snapshot.total_bytes));
-    return snapshot;
-}
-
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     if (err == cudaSuccess) { return; }
     std::fprintf(stderr, "%s:%d: CUDA_CHECK(%s) failed: %s: %s\n", file, line, expr,
@@ -86,9 +79,9 @@ DeviceContext::DeviceContext(int device_id) : device_(Device::cuda(device_id)) {
     if (count <= 0) { throw std::runtime_error("no CUDA devices available"); }
     if (device_id >= count) { throw std::invalid_argument("invalid CUDA device id"); }
 
-    // Set primary-context flags before cudaSetDevice can initialize that context.
-    err = cudaInitDevice(device_id, sync_flags | cudaDeviceMapHost,
-                         cudaInitDeviceFlagsAreValid);
+    // CUDA 12+ cudaSetDevice initializes the primary context. Set mapping and scheduling
+    // flags before that initialization, including when the selected device is not ordinal 0.
+    err = cudaInitDevice(device_id, sync_flags | cudaDeviceMapHost, cudaInitDeviceFlagsAreValid);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaInitDevice failed", err));
     }
@@ -351,6 +344,14 @@ void CudaCompletionEvent::record_external(cudaStream_t stream) {
     if (status != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaEventRecordWithFlags failed", status));
     }
+}
+
+void CudaCompletionEvent::wait_external(cudaStream_t stream) const {
+    if (event_ == nullptr || stream == nullptr)
+        throw std::logic_error("CUDA completion event is not waitable");
+    const auto status = cudaStreamWaitEvent(stream, event_, cudaEventWaitExternal);
+    if (status != cudaSuccess)
+        throw std::runtime_error(cuda_error_message("cudaStreamWaitEvent external failed", status));
 }
 
 bool CudaCompletionEvent::ready() const {

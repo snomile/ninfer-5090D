@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/memory.h"
+#include "core/device_memory.h"
 
 #include <cuda_runtime.h>
 
@@ -20,14 +21,6 @@ public:
 private:
     std::size_t requested_bytes_;
 };
-
-struct DeviceMemorySnapshot {
-    std::size_t free_bytes = 0, total_bytes = 0;
-};
-
-[[nodiscard]] DeviceMemorySnapshot device_memory_snapshot(Device);
-[[nodiscard]] std::int64_t device_memory_growth(DeviceMemorySnapshot before,
-                                                DeviceMemorySnapshot after);
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
@@ -160,6 +153,8 @@ public:
     // Only call during stream capture; this event must outlive every graph referencing it.
     void record_external(cudaStream_t stream);
     void wait(cudaStream_t stream) const;
+    // Capture an external dependency. Record the current producer generation before replay.
+    void wait_external(cudaStream_t stream) const;
     [[nodiscard]] bool ready() const;
     void synchronize() const;
 
