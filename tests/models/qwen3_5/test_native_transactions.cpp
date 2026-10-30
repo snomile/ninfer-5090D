@@ -176,7 +176,7 @@ public:
     runtime::BeginSummary finish_prefill(q35::SequenceHandle sequence, std::uint32_t remaining,
                                          bool terminal) {
         std::uint32_t processed = 0;
-        for (unsigned iteration = 0; iteration < remaining / (kChunk / 4) + 4; ++iteration) {
+        for (unsigned iteration = 0; iteration < remaining / (kChunk / 8) + 4; ++iteration) {
             const bool recovering = program_.recovery_pending(sequence);
             reserve(sequence, q35::ExecutionUnitKind::Prefill);
             auto step = driver_.prefill(sequence);
@@ -245,7 +245,7 @@ public:
         const auto sequence = bind(long_base, 1);
         reserve(sequence, q35::ExecutionUnitKind::Prefill);
         const auto bounded = driver_.prefill(sequence);
-        require(bounded.processed_prompt_tokens == kChunk / 4 && !bounded.complete &&
+        require(bounded.processed_prompt_tokens == kChunk / 8 && !bounded.complete &&
                     !bounded.pending && !bounded.capture_ready,
                 "long prefill did not yield before blocking an active output lane");
         require(driver_.abort(peer).status == runtime::ConsumeStatus::Consumed,

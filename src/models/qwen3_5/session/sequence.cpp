@@ -124,7 +124,7 @@ std::uint32_t SessionImpl::window_end(const SequenceState& state, const RequestC
         })) {
         // Bound the non-preemptible forward pass while another lane can publish output.
         // Demand and execution use this same window, and pure prefill keeps the full chunk.
-        end = std::min(end, begin + std::max(1U, prefill_chunk / 4));
+        end = std::min(end, begin + std::max(1U, prefill_chunk / 8));
     }
     if (request.capture_reservation) end = std::min(end, request.capture_reservation->frontier);
     if (begin < request.base->summary.prompt_tokens)
