@@ -121,6 +121,15 @@ std::uint32_t SessionImpl::window_end(const SequenceState& state, const RequestC
     if (request.capture_reservation) end = std::min(end, request.capture_reservation->frontier);
     if (begin < request.base->summary.prompt_tokens)
         end = std::min(end, request.base->summary.prompt_tokens);
+    if (request.lifecycle == Lifecycle::Prefilling && request.base->capture_backing &&
+        end == request.base->summary.prompt_tokens) {
+        // Keep the final semantic suffix a separate scheduling unit even when an optional
+        // checkpoint has no backing. Otherwise one lane can publish its first token while
+        // its peer still has a whole nominal prefill chunk to execute.
+        const auto& boundaries = request.base->context_cache.semantic_boundaries;
+        const auto next = std::upper_bound(boundaries.begin(), boundaries.end(), begin);
+        if (next != boundaries.end()) end = std::min(end, *next);
+    }
     if (request.lifecycle == Lifecycle::Replaying) {
         const auto frontiers = state.prefix_identity.execution_frontiers();
         const auto next      = std::upper_bound(frontiers.begin(), frontiers.end(), begin);

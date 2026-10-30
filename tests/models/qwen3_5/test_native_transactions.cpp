@@ -833,6 +833,41 @@ public:
         next_request();
     }
 
+    void final_semantic_suffix_without_destination() {
+        auto prepared = models::qwen::PreparedPromptAccess::take(
+            frontend_.prepare_tokens(std::vector<TokenId>(kPromptTokens, 198)));
+        constexpr std::uint32_t suffix = 16;
+        prepared.context_cache.semantic_boundaries = {kPromptTokens - suffix};
+        runtime::ResolvedExecutionOptions options;
+        options.requested_output_tokens = 8;
+        options.allow_prefix_reuse = true;
+        auto base = program_.plan_request(std::move(prepared), options);
+        const auto active = bind(base);
+        for (unsigned chunk = 0; chunk < 2; ++chunk) {
+            reserve(active, q35::ExecutionUnitKind::Prefill);
+            const auto step = driver_.prefill(active);
+            require(step.processed_prompt_tokens == kChunk && !step.complete &&
+                        !step.capture_ready,
+                    "final semantic boundary changed an earlier nominal prefill unit");
+        }
+        reserve(active, q35::ExecutionUnitKind::Prefill);
+        auto device_pressure = fill_capacity(models::context::ContextMemory::Device);
+        auto host_pressure = fill_capacity(models::context::ContextMemory::Host);
+        const auto offered = program_.prepare_capture(active);
+        require(offered && !offered->reserved,
+                "final semantic fixture did not exhaust optional capture destinations");
+        const auto step = driver_.prefill(active);
+        require(step.processed_prompt_tokens == kChunk - suffix &&
+                    !step.complete && !step.pending && !step.capture_ready,
+                "missing optional backing merged the final semantic suffix into its peer's unit");
+        require(driver_.abort(active).status == runtime::ConsumeStatus::Consumed,
+                "semantic suffix pressure retained its active writer");
+        device_pressure.clear();
+        host_pressure.clear();
+        expect_empty("semantic suffix pressure retained physical resources");
+        next_request();
+    }
+
     void cancel_gpu_binding() {
         auto base         = request(65, true);
         const auto source = checkpoint(base);
@@ -2033,6 +2068,7 @@ int main(int argc, char** argv) {
             fixture.recovery_capacity_and_progress();
             fixture.restore_own_snapshot();
             fixture.capture_without_destination();
+            fixture.final_semantic_suffix_without_destination();
             fixture.private_move();
             fixture.capture_retry_after_reclaim();
         }
