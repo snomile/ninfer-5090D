@@ -66,7 +66,17 @@ public:
     }
 
     [[nodiscard]] std::optional<runtime::ExecutionEvent<q35::ExecutionTypes>> poll() {
+        if (!deferred_.empty() && (!defer_event || !defer_event(deferred_.front()))) {
+            auto event = std::move(deferred_.front());
+            deferred_.pop_front();
+            if (observed) observed(event);
+            return event;
+        }
         auto event = implementation.poll();
+        if (event && defer_event && defer_event(*event)) {
+            deferred_.push_back(std::move(*event));
+            return {};
+        }
         if (event && observed) observed(*event);
         return event;
     }
@@ -83,6 +93,10 @@ public:
     std::function<void(const runtime::ExecutionRequest<q35::ExecutionTypes>&)> submitted;
     std::function<void(const runtime::ExecutionEvent<q35::ExecutionTypes>&)> observed;
     std::function<void(runtime::ExecutionTicket, const q35::Commit&)> committed;
+    std::function<bool(const runtime::ExecutionEvent<q35::ExecutionTypes>&)> defer_event;
+
+private:
+    std::deque<runtime::ExecutionEvent<q35::ExecutionTypes>> deferred_;
 };
 
 // Reuses immutable loaded weights across test geometries. Each worker still owns its complete

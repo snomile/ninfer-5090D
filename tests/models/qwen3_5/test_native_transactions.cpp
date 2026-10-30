@@ -3,6 +3,8 @@
 #include "models/common/qwen/frontend/prepared_prompt.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/execution/profile.h"
+#include "models/qwen3_5/runtime_types.h"
+#include "runtime/engine/engine_core.h"
 #include "native_fixture.h"
 
 #include <algorithm>
@@ -2069,6 +2071,106 @@ void fresh_scoring(const char* artifact) {
     require(starts == 2 && completed == 2, "fresh scoring observation is incomplete");
 }
 
+void engine_decode_during_capture(std::shared_ptr<const q35::ModelDefinition> definition,
+                                 std::shared_ptr<const q35::ModelShard> model,
+                                 std::shared_ptr<const q35::execution::ModelProfile> profile,
+                                 models::qwen::Frontend& frontend, EngineOptions options) {
+    native::NativeRankFixture rank(definition, model, profile, options);
+    q35::Session session(q35::prepare_session(definition, std::move(rank.session_plan)),
+                         rank.executor());
+    struct Instance {
+        using ModelContract = q35::RuntimeTypes;
+        models::qwen::Frontend& frontend;
+        runtime::Executor<q35::ExecutionTypes>* executor;
+        q35::Session* session;
+    } instance{frontend, &rank.executor(), &session};
+    std::atomic<bool> release{false}, deferred{false};
+    std::atomic<unsigned> decoded{0}, decoded_at_capture{0};
+    std::optional<runtime::ExecutionTicket> capture;
+    rank.observer().submitted = [&](const auto& request) {
+        const auto* context = std::get_if<q35::ContextWork>(&request.work.operation);
+        if (context && context->bindings.empty() && context->releases.empty() && !capture) {
+            for (const auto& action : request.work.context.operations) {
+                const auto* copy = std::get_if<models::context::RecordCopy>(&action);
+                if (copy && copy->resource.is_state()) {
+                    capture = request.ticket;
+                    break;
+                }
+            }
+        }
+        if (capture && !release.load(std::memory_order_acquire) &&
+            request.ticket.frame.kind == runtime::FrameKind::Compute) {
+            const auto* decode = std::get_if<q35::DecodeWork>(&request.work.operation);
+            require(decode && decode->rows.size() == 1 &&
+                        decode->rows.front().binding.member.residency.lane.value == 0,
+                    "held capture allowed its owner to execute");
+        }
+    };
+    rank.observer().defer_event = [&](const auto& event) {
+        const auto ticket = std::visit([](const auto& value) { return value.ticket; }, event);
+        if (!capture || ticket != *capture || release.load(std::memory_order_acquire)) return false;
+        if (!deferred.load(std::memory_order_relaxed)) {
+            decoded_at_capture.store(decoded.load(), std::memory_order_relaxed);
+            deferred.store(true, std::memory_order_release);
+        }
+        return true;
+    };
+    rank.observer().observed = [&](const auto& event) {
+        const auto* ready = std::get_if<runtime::ResultReady<q35::ExecutionTypes>>(&event);
+        if (ready && std::holds_alternative<q35::GeneratedResult>(ready->result.output))
+            decoded.fetch_add(1, std::memory_order_release);
+    };
+    const auto wait_until = [](auto condition) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!condition()) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::yield();
+        }
+        return true;
+    };
+    bool captured = false, peer_progressed = false;
+    {
+        runtime::EngineCore engine(instance, options, runtime::generic_context_machine_cost_model());
+        struct ReleaseGuard {
+            std::atomic<bool>& release;
+            ~ReleaseGuard() { release.store(true, std::memory_order_release); }
+        } guard{release};
+        const auto submit = [&](std::uint32_t tokens, std::uint32_t output, bool history) {
+            std::vector<TokenId> ids(tokens, 198);
+            ids.front() = history ? 1001 : 1000;
+            auto prompt = frontend.prepare_tokens(std::move(ids));
+            const auto summary = prompt.summary();
+            runtime::ResolvedRequestOptions request;
+            request.execution.requested_output_tokens = output;
+            request.execution.allow_prefix_reuse = history;
+            request.stop.include_model_defaults = false;
+            return engine.submit(std::move(prompt), summary, 0.0, std::move(request),
+                                 OutputConsumerMode::Aggregate, {});
+        };
+        auto peer = submit(64, 384, false);
+        require(wait_until([&] { return decoded.load(std::memory_order_acquire) >= 2; }),
+                "engine peer did not reach decode");
+        auto owner = submit(384, 8, true);
+        captured = wait_until([&] { return deferred.load(std::memory_order_acquire); });
+        if (captured) {
+            peer_progressed = wait_until([&] {
+                return decoded.load(std::memory_order_acquire) >= decoded_at_capture.load() + 3;
+            });
+        }
+        // Release the genuine native events before waiting or unwinding the engine.
+        release.store(true, std::memory_order_release);
+        const auto peer_result = peer.wait(nullptr, {});
+        const auto owner_result = owner.wait(nullptr, {});
+        require(peer_result.generated_token_ids.size() == 384 &&
+                    owner_result.generated_token_ids.size() == 8,
+                "capture overlap lost or duplicated generated tokens");
+    }
+    require(captured, "engine regression did not exercise a native capture");
+    require(peer_progressed, "independent decode stalled behind a held Context capture");
+    require(!session.has_context_operation() && !rank.executor().has_pending_work(),
+            "engine overlap left native work pending");
+}
+
 SpeculativeBackend selected_backend(std::string_view name) {
     if (name == "none") { return SpeculativeBackend::None; }
     if (name == "mtp") { return SpeculativeBackend::Mtp; }
@@ -2150,6 +2252,7 @@ int main(int argc, char** argv) {
         }
         shared_capture_alignment(definition, model, profile, frontend, options);
         replay_sampling_counts(definition, model, profile, frontend, options);
+        engine_decode_during_capture(definition, model, profile, frontend, options);
         if (backend == SpeculativeBackend::None) {
             model.reset();
             fresh_scoring(artifact);
