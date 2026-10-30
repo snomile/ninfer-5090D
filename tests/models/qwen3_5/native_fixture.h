@@ -51,6 +51,7 @@ public:
 
     void supply(runtime::ExecutionTicket ticket, runtime::CommandSequence command,
                 runtime::DecisionInput&& input) {
+        if (supplied) supplied(ticket, input);
         implementation.supply(ticket, command, std::move(input));
     }
 
@@ -91,6 +92,7 @@ public:
 
     q35::detail::RankProgramImpl implementation;
     std::function<void(const runtime::ExecutionRequest<q35::ExecutionTypes>&)> submitted;
+    std::function<void(runtime::ExecutionTicket, const runtime::DecisionInput&)> supplied;
     std::function<void(const runtime::ExecutionEvent<q35::ExecutionTypes>&)> observed;
     std::function<void(runtime::ExecutionTicket, const q35::Commit&)> committed;
     std::function<bool(const runtime::ExecutionEvent<q35::ExecutionTypes>&)> defer_event;

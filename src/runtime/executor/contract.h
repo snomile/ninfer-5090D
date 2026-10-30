@@ -114,6 +114,9 @@ struct DecisionConsumed {
     ExecutionTicket ticket;
     std::uint32_t stage = 0;
     std::vector<Row> rows;
+    // Local ranks return ordinary CPU masks after copying them to frame-owned pinned storage.
+    // This ownership handoff is not serialized; remote consumers keep the existing wire format.
+    std::vector<DecisionInput::Row> reusable_rows;
 };
 
 template <class Types>

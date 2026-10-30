@@ -604,7 +604,7 @@ private:
 
     void supply_decision(ExecutionTicket ticket, const DecisionRequest& decision);
 
-    void record_decision_upload(const DecisionConsumed& consumed);
+    void record_decision_upload(DecisionConsumed& consumed);
 
     [[nodiscard]] bool poll_execution(HostPhaseMeasurement& boundary);
 
@@ -648,6 +648,9 @@ private:
     Scheduling scheduler_;
     std::optional<ComputeFlight> compute_;
     std::optional<ComputeFlight> retiring_;
+    // Compact members reuse their largest mask allocation across units and request boundaries.
+    // A rank returns each buffer only after copying all words into its owned upload frame.
+    std::array<std::vector<std::uint32_t>, kMaximumConcurrency> decision_masks_;
     CycleStep cycle_step_ = CycleStep::Boundary;
     std::array<bool, kMaximumConcurrency> control_executed_{};
     std::array<std::optional<UnitPermit>, kMaximumConcurrency> reserved_units_{};

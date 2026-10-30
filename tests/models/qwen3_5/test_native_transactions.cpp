@@ -2171,6 +2171,87 @@ void engine_decode_during_capture(std::shared_ptr<const q35::ModelDefinition> de
             "engine overlap left native work pending");
 }
 
+void engine_reuses_decision_masks(std::shared_ptr<const q35::ModelDefinition> definition,
+                                 std::shared_ptr<const q35::ModelShard> model,
+                                 std::shared_ptr<const q35::execution::ModelProfile> profile,
+                                 models::qwen::Frontend& frontend, EngineOptions options) {
+    options.context_cache = {.enabled = false, .host_capacity_bytes = 0};
+    native::NativeRankFixture rank(definition, model, profile, options);
+    q35::Session session(q35::prepare_session(definition, std::move(rank.session_plan)),
+                         rank.executor());
+    struct Instance {
+        using ModelContract = q35::RuntimeTypes;
+        models::qwen::Frontend& frontend;
+        runtime::Executor<q35::ExecutionTypes>* executor;
+        q35::Session* session;
+    } instance{frontend, &rank.executor(), &session};
+    const auto empty = session.physical_usage();
+    struct Buffer {
+        const std::uint32_t* data = nullptr;
+        std::size_t capacity = 0;
+    };
+    std::array<Buffer, 2> buffers;
+    unsigned supplied = 0, returned = 0, reused = 0, batched = 0;
+    rank.observer().supplied = [&](auto, const runtime::DecisionInput& input) {
+        if (input.rows.size() == 2) ++batched;
+        for (const auto& row : input.rows) {
+            auto& prior = buffers.at(row.member);
+            if (prior.capacity >= row.words.size()) {
+                require(prior.data == row.words.data(),
+                        "engine allocated a mask despite a returned buffer with capacity");
+                ++reused;
+            }
+            prior = {row.words.data(), row.words.capacity()};
+            ++supplied;
+        }
+    };
+    rank.observer().observed = [&](const auto& event) {
+        const auto* consumed = std::get_if<runtime::DecisionConsumed>(&event);
+        if (!consumed) return;
+        require(consumed->reusable_rows.size() == consumed->rows.size() &&
+                    !rank.rank().compute->decision,
+                "rank retained CPU masks after copying them into its upload frame");
+        for (const auto& row : consumed->reusable_rows) {
+            const auto host = rank.rank().resources.frame.host_masks.slice(2, row.member, 1);
+            require(std::equal(row.words.begin(), row.words.end(),
+                               static_cast<const std::uint32_t*>(host.data)),
+                    "rank returned a mask before preserving every upload word");
+            ++returned;
+        }
+    };
+    {
+        runtime::EngineCore engine(instance, options, runtime::generic_context_machine_cost_model());
+        for (const unsigned concurrency : {2U, 1U, 2U}) {
+            std::vector<std::string> expected;
+            std::vector<decltype(engine)::Submission> handles;
+            for (unsigned lane = 0; lane < concurrency; ++lane) {
+                auto& literal = expected.emplace_back(lane ? "second:" : "first:");
+                for (unsigned i = 0; i < 48; ++i)
+                    literal += " " + std::to_string(lane ? 47 - i : i);
+                auto prompt = frontend.prepare_tokens(std::vector<TokenId>(32, 198));
+                const auto summary = prompt.summary();
+                runtime::ResolvedRequestOptions request;
+                request.constraint = OutputConstraint::choice({literal});
+                request.execution.requested_output_tokens = 192;
+                request.execution.allow_prefix_reuse = false;
+                handles.push_back(engine.submit(std::move(prompt), summary, 0.0, std::move(request),
+                                                OutputConsumerMode::Aggregate, {}));
+            }
+            for (unsigned lane = 0; lane < concurrency; ++lane) {
+                const auto result = handles[lane].wait(nullptr, {});
+                require(result.content == expected[lane] && result.stats.constraint &&
+                            result.stats.constraint->complete &&
+                            result.finish_reason == FinishReason::StopToken,
+                        "reused masks changed another request's complete constrained output");
+            }
+        }
+    }
+    require(supplied == returned && reused >= 10 && batched > 0,
+            "mask recycling did not cover repeated units and changing batch membership");
+    require(!rank.executor().has_pending_work() && same_ownership(session.physical_usage(), empty),
+            "mask recycling left native execution or Context ownership");
+}
+
 SpeculativeBackend selected_backend(std::string_view name) {
     if (name == "none") { return SpeculativeBackend::None; }
     if (name == "mtp") { return SpeculativeBackend::Mtp; }
@@ -2253,6 +2334,7 @@ int main(int argc, char** argv) {
         shared_capture_alignment(definition, model, profile, frontend, options);
         replay_sampling_counts(definition, model, profile, frontend, options);
         engine_decode_during_capture(definition, model, profile, frontend, options);
+        engine_reuses_decision_masks(definition, model, profile, frontend, options);
         if (backend == SpeculativeBackend::None) {
             model.reset();
             fresh_scoring(artifact);

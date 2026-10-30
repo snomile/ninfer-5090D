@@ -129,6 +129,8 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
             operation.dead_positions[row] = input.dead_positions;
             consumed.rows.push_back({input.member, bytes});
         }
+        consumed.reusable_rows = std::move(operation.decision->rows);
+        operation.decision.reset();
         events.emplace_back(std::move(consumed));
     }
     resources.work.reset();

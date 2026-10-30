@@ -472,6 +472,7 @@ void EngineCore<Instance>::supply_decision(ExecutionTicket ticket,
         auto& result     = input.rows.emplace_back();
         result.member    = row.member;
         result.positions = static_cast<std::uint32_t>(row.drafts.size() + 1);
+        result.words.swap(decision_masks_[row.member]);
         result.words.resize(words_per_position * result.positions);
         result.dead_positions = request->output.grammar_masks(row.drafts, result.words);
     }
@@ -481,7 +482,7 @@ void EngineCore<Instance>::supply_decision(ExecutionTicket ticket,
 }
 
 template <class Instance>
-void EngineCore<Instance>::record_decision_upload(const DecisionConsumed& consumed) {
+void EngineCore<Instance>::record_decision_upload(DecisionConsumed& consumed) {
     if (!compute_ || compute_->ticket != consumed.ticket) {
         throw std::logic_error("decision upload does not belong to an active execution");
     }
@@ -490,6 +491,17 @@ void EngineCore<Instance>::record_decision_upload(const DecisionConsumed& consum
             throw std::logic_error("decision upload has invalid compact membership");
         }
         compute_->requests[row.member]->output.constraint_uploaded(row.bytes);
+    }
+    std::array<bool, kMaximumConcurrency> returned{};
+    for (auto& row : consumed.reusable_rows) {
+        if (row.member >= compute_->requests.size() || returned[row.member] ||
+            std::none_of(consumed.rows.begin(), consumed.rows.end(), [&](const auto& uploaded) {
+                return uploaded.member == row.member &&
+                       uploaded.bytes == row.words.size() * sizeof(std::uint32_t);
+            }))
+            throw std::logic_error("reusable decision mask does not match its upload");
+        returned[row.member] = true;
+        row.words.swap(decision_masks_[row.member]);
     }
 }
 
@@ -512,7 +524,7 @@ template <class Instance>
             supply_decision(event->ticket, *decision);
             continue;
         }
-        if (const auto* consumed = std::get_if<DecisionConsumed>(&event->result)) {
+        if (auto* consumed = std::get_if<DecisionConsumed>(&event->result)) {
             record_decision_upload(*consumed);
             continue;
         }
