@@ -146,12 +146,8 @@ public:
         out.host_staged = out.patch_embedding.weight.device == Device::cpu();
         if (out.host_staged) {
             const auto profile = describe_vision(
-                w, [&](WeightId id) {
-                    const auto& parameter = weight(id);
-                    if (parameter.uses.empty())
-                        return ops::WeightInput{parameter.view, ops::LinearPolicy::A16Only, {}};
-                    return weight_input(weights_, id);
-                }, true);
+                w, [&](WeightId id) { return weight_input(weights_, id); },
+                [&](WeightId id) -> const WeightView& { return weight(id).view; }, true);
             out.weight_staging_slot_bytes = profile.weight_staging_slot_bytes;
         }
         return out;

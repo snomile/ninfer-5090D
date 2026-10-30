@@ -96,6 +96,9 @@ public:
 
     qwen::VisionProfile vision(const qwen::VisionWeights& weights) const {
         return qwen::describe_vision(weights, [&](WeightId id) { return plan_.input(id); },
+                                     [&](WeightId id) -> const WeightView& {
+                                         return plan_.weight_data()[id.index].view;
+                                     },
                                      plan_.options().host_pinned_vision_weights);
     }
 

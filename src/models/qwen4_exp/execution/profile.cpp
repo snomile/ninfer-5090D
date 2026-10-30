@@ -136,7 +136,10 @@ std::shared_ptr<const ModelProfile> describe(const ModelDefinition& source,
     }
     if (w.vision)
         out->vision = qwen::describe_vision(*w.vision,
-                                            [&](WeightId id) { return weight_input(weights, id); });
+                                            [&](WeightId id) { return weight_input(weights, id); },
+                                            [&](WeightId id) -> const WeightView& {
+                                                return weights[id.index].view;
+                                            });
     if (rank.size == 1)
         for (const auto& b : source.expert_banks())
             out->banks.push_back({b.gate_up.layout, b.down.layout});

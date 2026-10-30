@@ -32,6 +32,9 @@ int main() {
                 "Vision capacity must follow its budget, not text context length");
         selected.host_pinned_vision_weights = true;
         const auto staged_definition = q35::read_definition(reader, selected);
+        if (!staged_definition->uses(
+                staged_definition->weights().vision->patch_embedding_bias).empty())
+            throw std::runtime_error("Vision bias must remain a direct parameter without a Use");
         const auto staged_profile = q35::execution::describe_model(*staged_definition);
         const auto capped = plan(2048, budget);
         const auto staged = ninfer::models::qwen::VisionContext::plan_resources(

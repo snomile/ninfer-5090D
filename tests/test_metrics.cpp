@@ -1,6 +1,7 @@
 #include "serve/metrics.h"
 
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -95,7 +96,17 @@ int main() {
           "TTFT must include preparation and use inclusive histogram buckets");
     check(live.find("model_name=\"custom\\\"model\\\\name\\nline\"") != std::string::npos,
           "model label must escape quotes, backslashes and newlines");
-    check(metrics.render(running, true) == live, "scrapes must not consume or reset counters");
+    const auto stable_snapshot = [](const std::string& text) {
+        std::istringstream lines(text);
+        std::string line, result;
+        while (std::getline(lines, line)) {
+            // mallinfo2 observes this process, including allocations made by the scrape itself.
+            if (!line.starts_with("ninfer_process_allocator_")) result += line + '\n';
+        }
+        return result;
+    };
+    check(stable_snapshot(metrics.render(running, true)) == stable_snapshot(live),
+          "scrapes must not consume or reset counters");
     check(
         live.find("ninfer_context_pool_bytes{rank=\"0\",domain=\"host\",kind=\"live\"} 3072\n") !=
                 std::string::npos &&
