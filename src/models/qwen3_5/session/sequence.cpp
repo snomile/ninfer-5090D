@@ -119,10 +119,12 @@ std::uint32_t SessionImpl::window_end(const SequenceState& state, const RequestC
                                       const vision::Window& window) const {
     end = std::min(end, begin + prefill_chunk);
     if (request.lifecycle == Lifecycle::Prefilling &&
+        request.base->summary.prompt_tokens > 2ULL * prefill_chunk &&
         std::any_of(requests.begin(), requests.end(), [&](const auto& peer) {
             return &peer != &request && peer.lifecycle == Lifecycle::Active;
         })) {
         // Bound the non-preemptible forward pass while another lane can publish output.
+        // Keep requests fitting two nominal chunks intact to avoid extra short-tail passes.
         // Demand and execution use this same window, and pure prefill keeps the full chunk.
         end = std::min(end, begin + std::max(1U, prefill_chunk / 8));
     }

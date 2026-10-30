@@ -260,6 +260,24 @@ public:
         expect_empty("bounded peer prefill retained Context ownership");
     }
 
+    void short_prefill_keeps_full_chunks() {
+        auto peer_base = request(32);
+        const auto peer = bind(peer_base);
+        finish_prefill(peer, 32, false);
+        auto short_base = request(2 * kChunk);
+        const auto sequence = bind(short_base, 1);
+        reserve(sequence, q35::ExecutionUnitKind::Prefill);
+        const auto ordinary = driver_.prefill(sequence);
+        require(ordinary.processed_prompt_tokens == kChunk && !ordinary.complete &&
+                    !ordinary.pending && !ordinary.capture_ready,
+                "short prefill added forward passes while a peer was active");
+        finish_prefill(sequence, kChunk, false);
+        decode_and_finish(sequence);
+        require(driver_.abort(peer).status == runtime::ConsumeStatus::Consumed,
+                "short-prefill peer did not release its execution lane");
+        expect_empty("short peer prefill retained Context ownership");
+    }
+
     void rewrite_segments_share_prefill_unit() {
         PromptInput input;
         ChatMessage user;
@@ -2092,6 +2110,7 @@ int main(int argc, char** argv) {
             fixture.active_input_zero_growth_binding();
             fixture.consecutive_decode_terminal();
             fixture.prefill_yields_to_active_peer();
+            fixture.short_prefill_keeps_full_chunks();
             fixture.rewrite_segments_share_prefill_unit();
             fixture.replay_carries_independent_input();
             fixture.retained_input_host_suffix();
