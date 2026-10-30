@@ -173,8 +173,17 @@ void ContextMigration::enqueue(const ContextActions& actions, CudaExecutionView 
         source_ready_.record(device_->stream());
         source_ready_.wait(execution.stream());
     }
-    auto staging        = mapping_.span();
-    std::size_t segment = 0;
+    pending_actions_ = &actions;
+    next_operation_ = copy_offset_ = mapping_offset_ = next_segment_ = 0;
+    enqueue_window();
+}
+
+void ContextMigration::enqueue_window() {
+    const auto& actions = *pending_actions_;
+    const auto execution = execution_;
+    auto& segment = next_segment_;
+    auto remaining = copy_window_bytes_ ? copy_window_bytes_ : SIZE_MAX;
+    window_pending_ = false;
     copies_.clear();
     const auto flush = [&] {
         if (!copies_.size()) return;
@@ -184,36 +193,47 @@ void ContextMigration::enqueue(const ContextActions& actions, CudaExecutionView 
                 static_cast<std::uint32_t>(copies_.size());
         copies_.clear();
     };
-    for (std::size_t i = 0; i < actions.operations.size(); ++i) {
-        if (segment < segments_.size() && segments_[segment].begin == i) {
+    while (next_operation_ < actions.operations.size() && remaining) {
+        const auto i = next_operation_;
+        if (segment < segments_.size() && segments_[segment].begin == i && !copy_offset_) {
             segments_[segment].observed.work.copy_operations = 0;
             timers_[segment].start();
         }
         if (const auto* copy = std::get_if<RecordCopy>(&actions.operations[i])) {
-            if (!copies_.try_append(storage_->range(copy->destination),
-                                    storage_->range(copy->source))) {
-                flush();
-                if (!copies_.try_append(storage_->range(copy->destination),
-                                        storage_->range(copy->source))) {
-                    throw std::logic_error("Context copy cannot fit an empty batch");
+            if (copy->source != copy->destination && copy->source.bytes) {
+                const auto bytes = std::min(remaining, copy->source.bytes - copy_offset_);
+                const auto destination =
+                    storage_->range(copy->destination).subspan(copy_offset_, bytes);
+                const auto source = storage_->range(copy->source).subspan(copy_offset_, bytes);
+                if (!copies_.try_append(destination, source)) {
+                    flush();
+                    if (!copies_.try_append(destination, source))
+                        throw std::logic_error("Context copy cannot fit an empty batch");
                 }
+                remaining -= bytes;
+                copy_offset_ += bytes;
+                if (copy_offset_ < copy->source.bytes) break;
             }
         } else if (const auto* peer = std::get_if<PeerCopy>(&actions.operations[i])) {
             flush();
             segments_[segment].observed.work.copy_operations += enqueue_peer(*peer, execution);
         } else {
             flush();
-            const auto consumed = storage_->execute(actions.operations[i], staging, execution);
-            if (consumed) staging = staging.subspan(consumed);
+            mapping_offset_ += storage_->execute(
+                actions.operations[i], mapping_.span().subspan(mapping_offset_), execution);
         }
+        copy_offset_ = 0;
+        ++next_operation_;
         if (segment < segments_.size() && segments_[segment].end == i + 1) {
             flush();
             timers_[segment].record_stop();
             ++segment;
         }
     }
+    flush();
     completed_.record(execution.stream());
-    fenced_ = true;
+    window_pending_ = true;
+    fenced_ = next_operation_ == actions.operations.size();
 }
 
 std::uint32_t ContextMigration::enqueue_peer(const PeerCopy& action, CudaExecutionView execution) {
@@ -277,9 +297,16 @@ std::uint32_t ContextMigration::enqueue_peer(const PeerCopy& action, CudaExecuti
 #endif
 }
 
-void ContextMigration::submit(const ContextActions& actions) {
+void ContextMigration::submit(const ContextActions& actions, std::size_t copy_window_bytes) {
+    if (copy_window_bytes && execution_.stream() == device_->stream())
+        throw std::invalid_argument("incremental Context copies require an independent stream");
     prepare(actions);
+    copy_window_bytes_ = copy_window_bytes;
     enqueue(actions, execution_);
+}
+
+void ContextMigration::advance() {
+    if (occupied_ && !fenced_ && window_pending_ && completed_.ready()) enqueue_window();
 }
 
 bool ContextMigration::ready() const {
@@ -319,6 +346,8 @@ void ContextMigration::finish() {
         throw std::logic_error("cannot reuse an unfinished context action slot");
     occupied_ = false;
     fenced_   = false;
+    pending_actions_ = nullptr;
+    window_pending_ = false;
     segments_.clear();
     observations_.clear();
 }
@@ -327,6 +356,10 @@ void ContextMigration::drain() {
     if (!occupied_) return;
     std::exception_ptr error;
     try {
+        while (!fenced_ && window_pending_) {
+            completed_.synchronize();
+            enqueue_window();
+        }
         if (fenced_ && submitted_stream_)
             completed_.synchronize();
         else if (!fenced_ && submitted_stream_) {
@@ -338,6 +371,8 @@ void ContextMigration::drain() {
     } catch (...) { error = std::current_exception(); }
     occupied_ = false;
     fenced_   = false;
+    pending_actions_ = nullptr;
+    window_pending_ = false;
     segments_.clear();
     observations_.clear();
     if (error) std::rethrow_exception(error);

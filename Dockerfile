@@ -60,7 +60,7 @@ RUN set -eu; \
     cmake --build /build --parallel "$JOBS" --target ninfer ninfer-serve; \
     if [ "$NINFER_BUILD_TESTS" = ON ]; then \
         cmake --build /build --parallel "$JOBS" --target \
-            ninfer_device_test ninfer_cpu_system_test ninfer_context_pool_test \
+            ninfer_device_test ninfer_cpu_system_test ninfer_context_pool_test ninfer_kv_cache_test \
             ninfer_artifact_materialization_test ninfer_qwen3_5_vision_workspace_test \
             ninfer_qwen3_5_native_transactions_test ninfer_qwen3_5_state_image_test \
             ninfer_qwen_frontend_test ninfer_qwen_tool_constraints_test \

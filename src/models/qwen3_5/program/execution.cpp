@@ -7,7 +7,15 @@
 namespace ninfer::models::qwen3_5::detail {
 
 void RankProgramImpl::progress() {
-    if (context_operation && context_ready.ready()) {
+    if (context_operation && !context_operation->bindings_submitted) {
+        context_actions->advance();
+        if (context_actions->ready()) {
+            install_residencies(std::get<ContextWork>(context_operation->request.work.operation));
+            context_ready.record(device.transfer_stream());
+            context_operation->bindings_submitted = true;
+        }
+    }
+    if (context_operation && context_operation->bindings_submitted && context_ready.ready()) {
         const auto ticket    = context_operation->request.ticket;
         const auto command   = context_operation->last_command;
         const auto transfers = context_actions->observations();

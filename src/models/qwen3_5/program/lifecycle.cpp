@@ -99,9 +99,9 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
         context_operation =
             std::make_unique<ContextOperation>(ContextOperation{std::move(request), {}});
         context_operation->last_command = context_operation->request.command;
-        context_actions->submit(context_operation->request.work.context);
-        install_residencies(std::get<ContextWork>(context_operation->request.work.operation));
-        context_ready.record(device.transfer_stream());
+        // Submitting the entire snapshot monopolizes D2H and stalls speculative ID readback,
+        // even on distinct streams. Only one bounded window may be queued at a time.
+        context_actions->submit(context_operation->request.work.context, 8ULL << 20);
     } else {
         if (compute) throw std::logic_error("Qwen3.5 compute frame is occupied");
         gpu_timer.begin();

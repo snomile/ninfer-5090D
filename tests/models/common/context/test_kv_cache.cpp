@@ -6,12 +6,14 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -317,6 +319,103 @@ void check_record_execution(DeviceContext& device) {
                        [](auto value) { return value == std::byte{0}; }),
            "Host clear did not follow Host copy");
 }
+
+void check_incremental_execution(DeviceContext& device) {
+    // Two adjacent descriptors must be coalesced only within the submitted byte window.
+    // An urgent compute-stream readback completes while later Context bytes remain unqueued.
+    for (const std::size_t window : {2ULL << 20, 8ULL << 20}) {
+        const auto bytes = 3 * window + 13;
+        DeviceBuffer arena(device.device(), 3 * bytes + 192);
+        PinnedHostBuffer host(bytes + 64), urgent(28);
+        LayoutBuilder builder;
+        const auto layout =
+            plan_kv_execution_tables(builder, {.logical_page_capacity = 2, .table_rows = 1});
+        DeviceBuffer table_backing(device.device(), builder.finish(256));
+        context::ExecutionTableStorage tables(table_backing.span(), layout, arena.span(), 256);
+        const std::array views{context::ContextTableStorage{2, &tables}};
+        context::ContextStorage storage(arena.span(), host.span(), views);
+        context::ContextMigration migration(device, storage);
+        std::vector<std::byte> original(arena.size(), std::byte{0xa5});
+        for (std::size_t i = 0; i < bytes; ++i) original[i] = std::byte((i * 29 + 13) & 255);
+        arena.copy_from_host(original.data(), original.size());
+        std::memset(host.data(), 0xa5, host.size());
+        table_backing.fill(0xff);
+        context::ContextActions actions;
+        actions.operations = {
+            page_copy(device_range(0, bytes / 2), host_range(32, bytes / 2)),
+            page_copy(device_range(bytes / 2, bytes - bytes / 2),
+                      host_range(32 + bytes / 2, bytes - bytes / 2)),
+            page_copy(host_range(32, bytes), device_range(bytes + 64, bytes)),
+            page_copy(device_range(bytes + 64, bytes), device_range(2 * bytes + 128, bytes)),
+            context::RecordClear{device_range(2 * bytes + 128 + bytes - 17, 17)},
+            context::MappingUpdate{2, 0, 0, {static_cast<std::int64_t>(bytes + 64),
+                                           static_cast<std::int64_t>(2 * bytes + 128)}}};
+        migration.submit(actions, window);
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
+        expect(!migration.ready() && migration.occupied(),
+               "A partial Context window retired the complete action plan");
+        expect_rejected([&] { migration.finish(); }, "An unfinished Context window was reused");
+        expect_rejected([&] { (void)migration.observations(); },
+                        "An unfinished Context plan published observations");
+        const auto* captured = static_cast<const std::byte*>(host.data());
+        expect(std::memcmp(captured + 32, original.data(), window) == 0 &&
+                   std::all_of(captured + 32 + window, captured + host.size(),
+                               [](auto value) { return value == std::byte{0xa5}; }),
+               "Context copies exceeded the first byte window");
+        std::array<std::int64_t, 2> mapping{};
+        table_backing.copy_to_host(mapping.data(), sizeof(mapping));
+        expect(mapping == std::array<std::int64_t, 2>{-1, -1},
+               "Context tables were published before their record copies");
+        copy_bytes_async(urgent.span(), arena.span().subspan(0, urgent.size()),
+                         device.execution_view());
+        device.synchronize();
+        expect(std::memcmp(urgent.data(), original.data(), urgent.size()) == 0 &&
+                   !migration.ready() && captured[32 + window] == std::byte{0xa5},
+               "Urgent compute readback required submitting the remaining Context plan");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!migration.ready()) {
+            migration.advance();
+            if (std::chrono::steady_clock::now() > deadline) {
+                migration.drain();
+                throw std::runtime_error("Incremental Context plan did not make progress");
+            }
+            std::this_thread::yield();
+        }
+        const auto observations = migration.observations();
+        expect(observations.size() == 3 &&
+                   std::all_of(observations.begin(), observations.end(), [&](const auto& item) {
+                       return item.work.payload_bytes == bytes &&
+                              item.work.copy_operations >= 4 && item.elapsed_ns > 0;
+                   }),
+               "Incremental observations lost payload bytes, windows or elapsed time");
+        migration.finish();
+        auto expected = original;
+        std::copy_n(original.begin(), bytes, expected.begin() + bytes + 64);
+        std::copy_n(original.begin(), bytes, expected.begin() + 2 * bytes + 128);
+        std::fill_n(expected.begin() + 3 * bytes + 128 - 17, 17, std::byte{0});
+        std::vector<std::byte> actual(arena.size());
+        arena.copy_to_host(actual.data(), actual.size());
+        table_backing.copy_to_host(mapping.data(), sizeof(mapping));
+        expect(actual == expected &&
+                   mapping == std::array<std::int64_t, 2>{
+                                  static_cast<std::int64_t>(bytes + 64),
+                                  static_cast<std::int64_t>(2 * bytes + 128)} &&
+                   std::memcmp(captured + 32, original.data(), bytes) == 0 &&
+                   captured[31] == std::byte{0xa5} && captured[32 + bytes] == std::byte{0xa5},
+               "Incremental copies changed dependency order, table offsets or neighboring bytes");
+        context::ContextActions export_only;
+        export_only.operations = {page_copy(device_range(0, bytes), host_range(32, bytes))};
+        std::memset(host.data(), 0xa5, host.size());
+        migration.submit(export_only, window);
+        migration.drain();
+        expect(!migration.occupied() && migration.ready() &&
+                   std::memcmp(captured + 32, original.data(), bytes) == 0,
+               "Drain omitted unsubmitted Context windows");
+        context::ContextMigration compute_migration(device, storage, device.execution_view());
+        expect_rejected([&] { compute_migration.submit(export_only, window); },
+                        "Compute stream accepted an incremental Context plan");
+    }
+}
 } // namespace
 
 int main() {
@@ -333,6 +432,7 @@ int main() {
         CUDA_CHECK(status);
         DeviceContext device;
         check_record_execution(device);
+        check_incremental_execution(device);
         std::cout << "Packed Context records and execution tables passed\n";
         return 0;
     } catch (const std::exception& error) {

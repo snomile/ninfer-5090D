@@ -80,6 +80,7 @@ struct ComputeOperation {
 struct ContextOperation {
     runtime::ExecutionRequest<ExecutionTypes> request;
     runtime::CommandSequence last_command;
+    bool bindings_submitted = false;
 };
 
 class RankProgramImpl {

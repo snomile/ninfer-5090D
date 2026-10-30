@@ -42,7 +42,11 @@ public:
     void validate(const ContextActions& actions) const;
 
     // Transfer-stream work inherits all compute already submitted at this boundary.
-    void submit(const ContextActions& actions);
+    // A nonzero byte window bounds RecordCopy work on an independent stream. The caller
+    // retains actions until finish/drain and calls advance to submit each completed window.
+    // The final completion fence, observations and table order still cover the entire plan.
+    void submit(const ContextActions& actions, std::size_t copy_window_bytes = 0);
+    void advance();
     [[nodiscard]] bool ready() const;
 
     [[nodiscard]] bool occupied() const noexcept { return occupied_; }
@@ -62,6 +66,7 @@ private:
 
     void prepare(const ContextActions& actions);
     void enqueue(const ContextActions& actions, CudaExecutionView execution);
+    void enqueue_window();
     [[nodiscard]] std::uint32_t enqueue_peer(const PeerCopy&, CudaExecutionView);
 
     DeviceContext* device_;
@@ -79,6 +84,13 @@ private:
     std::vector<Segment> segments_;
     std::vector<runtime::ContextTransferObservation> observations_;
     cudaStream_t submitted_stream_ = nullptr;
+    const ContextActions* pending_actions_ = nullptr;
+    std::size_t copy_window_bytes_ = 0;
+    std::size_t next_operation_ = 0;
+    std::size_t copy_offset_ = 0;
+    std::size_t mapping_offset_ = 0;
+    std::size_t next_segment_ = 0;
+    bool window_pending_ = false;
     bool occupied_                 = false;
     bool fenced_                   = false;
 };
