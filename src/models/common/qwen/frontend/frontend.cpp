@@ -244,6 +244,18 @@ public:
             std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
         processor.max_vision_tokens = vision_tokens;
         processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
+        if (!options.max_vision_item_tokens ||
+            options.max_vision_item_tokens > kMaximumVisionItemTokens)
+            throw std::invalid_argument("frontend max_vision_item_tokens must be in [1,16384]");
+        processor.max_item_vision_tokens =
+            std::min<std::uint64_t>(vision_tokens, options.max_vision_item_tokens);
+        processor.max_item_raw_patches =
+            processor.max_item_vision_tokens * kRawPatchesPerVisionToken;
+        const std::uint64_t pixels = processor.max_item_vision_tokens * 32ULL * 32ULL;
+        processor.image_max_pixels = std::min(processor.image_max_pixels, pixels);
+        processor.image_min_pixels = std::min(processor.image_min_pixels, processor.image_max_pixels);
+        processor.video_max_pixels = std::min(processor.video_max_pixels, pixels);
+        processor.video_min_pixels = std::min(processor.video_min_pixels, processor.video_max_pixels);
         if (vision_enabled) {
             const std::uint64_t minimum_live =
                 processor.max_raw_patches * kPreparedVisionPatchFeatures * sizeof(std::uint16_t);

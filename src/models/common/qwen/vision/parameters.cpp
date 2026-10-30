@@ -143,6 +143,17 @@ public:
         out.merger_fc2      = linear(w.merger_fc2);
         out.merger_fc1_bias = tensor(w.merger_fc1_bias);
         out.merger_fc2_bias = tensor(w.merger_fc2_bias);
+        out.host_staged = out.patch_embedding.weight.device == Device::cpu();
+        if (out.host_staged) {
+            const auto profile = describe_vision(
+                w, [&](WeightId id) {
+                    const auto& parameter = weight(id);
+                    if (parameter.uses.empty())
+                        return ops::WeightInput{parameter.view, ops::LinearPolicy::A16Only, {}};
+                    return weight_input(weights_, id);
+                }, true);
+            out.weight_staging_slot_bytes = profile.weight_staging_slot_bytes;
+        }
         return out;
     }
 

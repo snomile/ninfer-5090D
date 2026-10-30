@@ -139,8 +139,8 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
             if (!visual.input) throw std::logic_error("Vision production has no encoder batch");
             const auto& batch = visual.input->batches.at(0);
             auto output       = storage.output(0, batch.features);
-            qwen::VisionContext encoder(device.execution_view(), *parameters.profile->config.vision,
-                                        *parameters.vision);
+            qwen::VisionContext encoder(device, *parameters.profile->config.vision,
+                                        *parameters.vision, storage);
             const auto bytes = encoder.encode(batch, output, resources.workspace_storage.span(),
                                               storage.staging());
             storage.produced(bytes);

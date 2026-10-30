@@ -29,7 +29,8 @@ struct PreparedResources {
     std::uint64_t owned_value_bytes = 0;
 };
 
-enum class HostAccess { CpuOnly, CudaTransfer };
+// CudaMapped requests a CUDA view backed by registered Host memory, without a device copy.
+enum class HostAccess { CpuOnly, CudaTransfer, CudaMapped };
 
 struct PlacementRequest {
     ObjectHandle object;
@@ -65,6 +66,7 @@ struct MaterializationPlan {
     // Host placements are relative to their respective registered/ordinary regions.
     std::vector<TensorPlacement> ordinary_host_objects;
     std::vector<TensorPlacement> registered_host_objects;
+    std::vector<StorageId> mapped_objects;
     PreparedResources resources;
 };
 

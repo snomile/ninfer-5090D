@@ -1031,6 +1031,8 @@ void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
         (void)try_admit_one(true);
         if (instance_.session->has_context_operation()) (void)poll_execution(boundary);
     }
+    // Context polling may also retire the last compute reader of a terminal request.
+    (void)settle_terminal_requests(boundary);
     reserve_resident_units();
     if (!admission_decision_ || !admission_decision_->restoring) {
         if (!admission_decision_ && consume_admission_check()) {
@@ -1043,6 +1045,7 @@ void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
     }
     if (instance_.session->has_context_operation()) {
         (void)poll_execution(boundary);
+        (void)settle_terminal_requests(boundary);
         if (!instance_.session->has_context_operation()) reserve_resident_units();
     }
     cycle_step_ = CycleStep::Control;
@@ -1092,11 +1095,15 @@ template <class Instance>
             break;
         }
         case CycleStep::Prefill: {
+            // A decode completed after begin_cycle may still own a terminal sequence.
+            // Retire it before asking the shared KV/State pool for another resident unit.
+            // settle_terminal_requests itself preserves outstanding native readers.
+            auto boundary = begin_host_phase();
             if (instance_.session->has_context_operation()) {
-                auto boundary = begin_host_phase();
                 (void)poll_execution(boundary);
-                finish_engine_phase(boundary, EngineHostPhase::Boundary);
             }
+            (void)settle_terminal_requests(boundary);
+            finish_engine_phase(boundary, EngineHostPhase::Boundary);
             reserve_resident_units(ReservationScope::Prefill);
             auto eligible = slots_;
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {

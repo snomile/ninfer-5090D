@@ -176,6 +176,10 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     std::size_t vision_memory_budget_bytes = 1ULL << 30;
+    std::uint32_t max_vision_item_tokens    = 16384;
+    bool host_mapped_embedding             = false;
+    bool host_mapped_dflash2_codebooks      = false;
+    bool host_pinned_vision_weights        = false;
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;

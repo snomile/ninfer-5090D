@@ -23,6 +23,27 @@ ResolvedLoadPlan resolve_load(const artifact::Reader& reader,
         throw artifact::ArtifactError("weight placement requires the selected GPU or CPU");
     std::vector<Device> devices(definition->weight_data().size(), cuda);
     std::vector<Device> banks(definition->expert_banks().size(), cuda);
+    const auto& options = definition->options();
+    const auto& weights = definition->weights();
+    std::vector<bool> mapped(devices.size());
+    if (options.host_mapped_embedding) {
+        mapped[weights.text.token_embedding.index] = true;
+        if (weights.mtp) mapped[weights.mtp->token_embedding.index] = true;
+        if (weights.draft) mapped[weights.draft->token_embedding.index] = true;
+    }
+    if (options.host_mapped_dflash2_codebooks) {
+        if (!options.dflash2() || !weights.draft || !weights.draft->selector)
+            throw artifact::ArtifactError("mapped codebooks require the DFlash2 selector");
+        mapped[weights.draft->selector->predecessor_codebook.index] = true;
+        mapped[weights.draft->selector->successor_codebook.index] = true;
+    }
+    if (options.host_pinned_vision_weights) {
+        if (!weights.vision)
+            throw artifact::ArtifactError("pinned Vision weights require Vision");
+        for (std::size_t i = 0; i < devices.size(); ++i)
+            if (definition->parameter({i}).name.starts_with("vision/"))
+                devices[i] = Device::cpu();
+    }
     for (const auto& layer : definition->weights().text.layers) {
         if (const auto* moe = std::get_if<MoeWeights>(&layer.ffn)) {
             banks[moe->bank.index] = expert_device;
@@ -35,8 +56,9 @@ ResolvedLoadPlan resolve_load(const artifact::Reader& reader,
     for (std::size_t i = 0; i < devices.size(); ++i)
         for (const auto& part : definition->parameter({i}).binding.parts)
             requests.push_back({part.object, devices[i],
-                                devices[i] == Device::cpu() ? artifact::HostAccess::CudaTransfer
-                                                            : artifact::HostAccess::CpuOnly});
+                                mapped[i] ? artifact::HostAccess::CudaMapped
+                                : devices[i] == Device::cpu() ? artifact::HostAccess::CudaTransfer
+                                                              : artifact::HostAccess::CpuOnly});
     auto storage = artifact::plan_materialization(reader, requests);
     return {reader, std::move(definition), std::move(storage), std::move(devices),
             std::move(banks)};

@@ -6,6 +6,7 @@
 #include "models/common/vision/window.h"
 
 #include <cstdint>
+#include <array>
 #include <functional>
 
 namespace ninfer::models::vision {
@@ -13,6 +14,8 @@ namespace ninfer::models::vision {
 struct EncoderMemory {
     std::size_t workspace_bytes    = 0;
     std::size_t host_staging_bytes = 0;
+    // Included in workspace_bytes, never an additional allocation.
+    std::size_t weight_staging_bytes = 0;
 };
 
 struct Capacity {
@@ -40,6 +43,12 @@ public:
 
     [[nodiscard]] MemorySpan staging() { return staging_.span(); }
 
+    // Reused across encoder calls. Program retirement also retires these transfer readers.
+    void prepare_weight_upload(std::size_t slot, cudaStream_t transfer);
+    void weight_uploaded(std::size_t slot, cudaStream_t transfer);
+    void acquire_weights(std::size_t slot, cudaStream_t compute);
+    void release_weights(std::size_t slot, cudaStream_t compute);
+
     [[nodiscard]] const Capacity& capacity() const noexcept { return capacity_; }
 
     [[nodiscard]] bool begin(const WindowUse&);
@@ -62,6 +71,7 @@ private:
     DeviceBuffer output_;
     PinnedHostBuffer staging_;
     CudaEventTimer timer_;
+    std::array<std::optional<CudaCompletionEvent>, 2> weight_ready_, weight_consumed_;
     std::optional<WindowUse> active_;
     std::uint64_t last_id_   = 0;
     std::size_t output_peak_ = 0, workspace_peak_ = 0;

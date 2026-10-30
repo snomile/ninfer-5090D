@@ -13,6 +13,16 @@
 #include <string_view>
 #include <utility>
 
+#if defined(__linux__)
+#    include <features.h>
+#    if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#        if __GLIBC_PREREQ(2, 33)
+#            include <malloc.h>
+#            define NINFER_HAS_MALLINFO2 1
+#        endif
+#    endif
+#endif
+
 namespace ninfer::serve {
 namespace {
 
@@ -165,6 +175,36 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
     gauge("max_context_tokens", options_.max_context, "Per-request logical context limit.");
     gauge("spec_decode_draft_window", options_.speculative.draft_tokens,
           "Configured speculative draft window.");
+    const auto& media = snapshot.media;
+#define MEDIA_GAUGE(field, name, help) gauge(name, media.field, help)
+    MEDIA_GAUGE(capacity_bytes, "media_cache_capacity_bytes", "Retained media cache capacity.");
+    MEDIA_GAUGE(retained_bytes, "media_cache_retained_bytes", "Retained media payload bytes.");
+    MEDIA_GAUGE(live_capacity_bytes, "media_cache_live_capacity_bytes", "Live media payload capacity.");
+    MEDIA_GAUGE(live_bytes, "media_cache_live_bytes", "Retained and request-held media payload bytes.");
+    MEDIA_GAUGE(entries, "media_cache_entries", "Retained media entries.");
+    MEDIA_GAUGE(inflight, "media_cache_inflight", "Distinct items being preprocessed.");
+    MEDIA_GAUGE(queued_tasks, "media_preprocess_tasks_queued", "Queued media preprocessing tasks.");
+    MEDIA_GAUGE(active_tasks, "media_preprocess_tasks_active", "Active media preprocessing tasks.");
+    MEDIA_GAUGE(preprocess_threads, "media_preprocess_threads", "Media preprocessing workers.");
+#undef MEDIA_GAUGE
+#define MEDIA_COUNTER(field, name, help) counter(name, media.field, baseline_.media.field, help)
+    MEDIA_COUNTER(hits, "media_cache_hits_total", "Retained media cache hits.");
+    MEDIA_COUNTER(misses, "media_cache_misses_total", "New media preprocessing operations.");
+    MEDIA_COUNTER(singleflight_waits, "media_cache_singleflight_waits_total", "Joined media work.");
+    MEDIA_COUNTER(evictions, "media_cache_evictions_total", "Media entries evicted for capacity.");
+    MEDIA_COUNTER(oversize_bypasses, "media_cache_oversize_bypasses_total", "Oversize media not retained.");
+#undef MEDIA_COUNTER
+#if defined(NINFER_HAS_MALLINFO2)
+    const struct mallinfo2 allocator = mallinfo2();
+    gauge("process_allocator_stats_available", 1, "Whether glibc mallinfo2 is available.");
+    gauge("process_allocator_arena_bytes", allocator.arena, "glibc non-mmap arena bytes.");
+    gauge("process_allocator_allocated_bytes", allocator.uordblks, "Allocated non-mmap arena bytes.");
+    gauge("process_allocator_free_bytes", allocator.fordblks, "Free bytes held by glibc arenas.");
+    gauge("process_allocator_mmap_bytes", allocator.hblkhd, "glibc mmap allocation bytes.");
+    gauge("process_allocator_mmap_regions", allocator.hblks, "glibc mmap allocation regions.");
+#else
+    gauge("process_allocator_stats_available", 0, "Whether glibc mallinfo2 is available.");
+#endif
 
 #define GAUGE(field, name, help)   gauge(name, stats.field, help)
 #define COUNTER(field, name, help) counter(name, stats.field, baseline.field, help)
@@ -318,6 +358,9 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
               "Initial Engine queue wait of settled generation requests.");
     header("memory_allocation_bytes", "gauge",
            "Owned backing bytes by rank, location and resource.");
+    header("weight_registered_host_bytes", "gauge", "Registered subset of Host weight backing.");
+    header("weight_mapped_host_bytes", "gauge", "CUDA mapped subset of registered Host weights.");
+    header("vision_weight_staging_bytes", "gauge", "Vision weights subset of Device workspace.");
     header("workspace_required_peak_bytes", "gauge",
            "Lifetime peak extent required by executed paths.");
     header("workspace_measurement_peak_bytes", "gauge",
@@ -464,6 +507,10 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
         const auto& a = rank.memory.allocations;
         allocation("weights", "device", a.device_weights_bytes);
         allocation("weights", "host", a.host_weights_bytes);
+        emit("weight_registered_host_bytes", a.registered_weights_bytes);
+        emit("weight_mapped_host_bytes", a.mapped_weights_bytes);
+        if (rank.memory.vision)
+            emit("vision_weight_staging_bytes", rank.memory.vision->weight_staging_bytes);
         allocation("persistent", "device", a.persistent_device_bytes);
         allocation("context", "device", a.context_device_bytes);
         allocation("workspace", "device", a.workspace_device_bytes);

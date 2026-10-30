@@ -41,6 +41,13 @@ void validate_options(const EngineOptions& options) {
     if (options.media_preprocess_threads > 64) {
         throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
     }
+    if (!options.max_vision_item_tokens || options.max_vision_item_tokens > 16384)
+        throw std::invalid_argument("Engine max_vision_item_tokens must be in [1,16384]");
+    if (options.host_mapped_dflash2_codebooks &&
+        options.speculative.backend != SpeculativeBackend::DFlash2)
+        throw std::invalid_argument("mapped codebooks require the DFlash2 backend");
+    if (options.host_pinned_vision_weights && !options.enable_vision)
+        throw std::invalid_argument("pinned Vision weights require Vision");
 }
 
 } // namespace
@@ -54,6 +61,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         options.max_pending_requests = 1;
         options.speculative          = {};
         options.enable_vision        = false;
+        options.host_mapped_dflash2_codebooks = false;
+        options.host_pinned_vision_weights = false;
         options.use_cuda_graph       = false;
         options.context_cache = ContextCacheOptions{.enabled = false, .host_capacity_bytes = 0};
         break;
@@ -85,7 +94,13 @@ ConstructedModel construct_model(EngineOptions& options) {
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
-    switch (models::resolve_architecture(reader.directory())) {
+    const auto architecture = models::resolve_architecture(reader.directory());
+    if (architecture != models::Architecture::Qwen3_5 &&
+        architecture != models::Architecture::Qwen3_5Moe &&
+        (options.host_mapped_embedding || options.host_mapped_dflash2_codebooks ||
+         options.host_pinned_vision_weights || options.max_vision_item_tokens != 16384))
+        throw std::invalid_argument("5090D weight placement and item limits require Qwen3.5");
+    switch (architecture) {
     case models::Architecture::Glm5Next: {
 #if NINFER_ENABLE_DISTRIBUTED
         if (options.deployment && options.deployment->ranks.size() > 1) {

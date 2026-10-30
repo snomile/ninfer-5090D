@@ -20,6 +20,7 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
     a.device_weights_bytes     = weights.device_capacity_bytes;
     a.host_weights_bytes       = weights.host_capacity_bytes;
     a.registered_weights_bytes = weights.registered_host_bytes;
+    a.mapped_weights_bytes     = weights.mapped_host_bytes;
     a.context_device_bytes     = resources.context.size();
     a.persistent_device_bytes  = resources.persistent.size();
     a.workspace_device_bytes   = resources.workspace_storage.size();

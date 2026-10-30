@@ -73,7 +73,7 @@ MaterializationPlan plan_materialization(const Reader& reader,
     out.objects.resize(out.object_count);
     out.resources = std::move(resources);
     std::unordered_multimap<std::size_t, StorageId> catalog;
-    std::vector<bool> host, registered, device;
+    std::vector<bool> host, registered, device, mapped;
     std::vector<std::uint64_t> domains;
     bool has_device = false;
     for (const auto& request : requests) {
@@ -96,6 +96,7 @@ MaterializationPlan plan_materialization(const Reader& reader,
             host.push_back(false);
             registered.push_back(false);
             device.push_back(false);
+            mapped.push_back(false);
             if (request.tensor.whole_object && !request.storage_domain)
                 out.objects.at(request.tensor.whole_object->index) = id;
         } else {
@@ -103,17 +104,25 @@ MaterializationPlan plan_materialization(const Reader& reader,
         }
         out.requests.push_back(id);
         if (request.device == Device::cpu()) {
+            if (request.host_access == HostAccess::CudaMapped)
+                throw ArtifactError("mapped Host weights require a CUDA device");
             host[id.index] = true;
             registered[id.index] =
                 registered[id.index] || request.host_access == HostAccess::CudaTransfer;
         } else {
             if (request.device.type() != DeviceType::CUDA ||
                 (has_device && request.device != out.device) ||
-                request.host_access != HostAccess::CpuOnly)
+                request.host_access == HostAccess::CudaTransfer)
                 throw ArtifactError("materialization requires one CUDA device");
             out.device       = request.device;
             has_device       = true;
-            device[id.index] = true;
+            if (request.host_access == HostAccess::CudaMapped) {
+                mapped[id.index] = host[id.index] = registered[id.index] = true;
+            } else {
+                device[id.index] = true;
+            }
+            if (mapped[id.index] && device[id.index])
+                throw ArtifactError("tensor requests both mapped Host and Device residency");
         }
     }
     LayoutBuilder host_layout, registered_layout, device_layout;
@@ -135,6 +144,7 @@ MaterializationPlan plan_materialization(const Reader& reader,
         if (device[i])
             out.device_objects.push_back(
                 {{i}, device_layout.add(g.bytes, g.alignment, "device tensor")});
+        if (mapped[i]) out.mapped_objects.push_back({i});
     }
     if (!out.registered_host_objects.empty())
         out.registered_host_bytes = registered_layout.finish(out.host_alignment);

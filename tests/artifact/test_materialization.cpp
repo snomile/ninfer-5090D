@@ -25,6 +25,44 @@ using namespace ninfer;
 using namespace ninfer::artifact;
 using namespace ninfer::test::artifact_fixture;
 
+void mapped_placement() {
+    Fixture fixture;
+    fixture.write();
+    Reader reader(fixture.entry);
+    const auto matrix = reader.find("q5");
+    const auto cuda = Device::cuda(0);
+    const std::array requests{PlacementRequest{matrix, cuda, HostAccess::CudaMapped},
+                              PlacementRequest{matrix, cuda, HostAccess::CudaMapped},
+                              PlacementRequest{matrix, Device::cpu(), HostAccess::CudaTransfer}};
+    const auto plan = plan_materialization(reader, requests);
+    require(plan.mapped_objects.size() == 1 && plan.device_objects.empty() &&
+                plan.device_capacity_bytes == 0 && plan.registered_host_objects.size() == 1 &&
+                plan.registered_host_bytes >= reader.geometry(matrix).bytes,
+            "mapped parent duplicated backing or consumed Device allocation budget");
+    const std::array conflict{requests[0], PlacementRequest{matrix, cuda}};
+    rejects([&] { (void)plan_materialization(reader, conflict); },
+            "mapped and Device residency conflict was accepted");
+    const std::array invalid{PlacementRequest{matrix, Device::cpu(), HostAccess::CudaMapped}};
+    rejects([&] { (void)plan_materialization(reader, invalid); },
+            "mapped Host request without a CUDA destination was accepted");
+}
+
+void mapped_materialization(DeviceContext& device) {
+    Fixture fixture;
+    fixture.write();
+    Reader reader(fixture.entry);
+    const auto matrix = reader.find("q5");
+    const std::array requests{PlacementRequest{matrix, device.device(), HostAccess::CudaMapped}};
+    auto backing = materialize(reader, plan_materialization(reader, requests), device.transfer_view());
+    const auto& parent = backing.device_parent(matrix);
+    std::vector<std::byte> actual(parent.geometry.bytes);
+    CUDA_CHECK(cudaMemcpy(actual.data(), parent.data, actual.size(), cudaMemcpyDeviceToHost));
+    require(std::equal(actual.begin(), actual.end(), fixture.payload.begin() + 256) &&
+                backing.stats().device_capacity_bytes == 0 && backing.stats().h2d_bytes == 0 &&
+                backing.stats().mapped_host_bytes == actual.size(),
+            "mapped materialization changed encoded bytes or performed H2D allocation");
+}
+
 void cpu_materialization() {
     Fixture fixture;
     fixture.write();
@@ -353,6 +391,7 @@ void staging_reuse(DeviceContext& device) {
 
 int main(int argc, char** argv) {
     try {
+        mapped_placement();
         if (argc == 2 && std::string_view(argv[1]) == "--cpu-only") {
             cpu_materialization();
             ninfer::test::materialization_alignment_checks({});
@@ -377,6 +416,7 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("expected [--artifact|--writer-fixture PATH]");
         }
         materialization(device);
+        mapped_materialization(device);
         ninfer::test::materialization_alignment_checks(device.transfer_view());
         ninfer::test::encoded_slice_checks(device.transfer_view());
         registered_materialization(device);

@@ -78,10 +78,10 @@ using PublishedOutput = ninfer::models::frontend::PublishedOutput;
 namespace fi          = ninfer::models::qwen::frontend;
 
 constexpr std::string_view kThinkingControlGuidance =
-    "\n\n Considering the limited time by the user, I have to give the solution based on the "
+    " \n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n";
 constexpr std::string_view kThinkingControl =
-    "\n\n Considering the limited time by the user, I have to give the solution based on the "
+    " \n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n</think>\n\n";
 constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
 
@@ -1250,6 +1250,33 @@ int test_media_token_ids_come_from_tokenizer() {
                  "Vision preparation ignored the loaded image token ID");
 }
 
+int test_vision_item_limit() {
+    ninfer::models::frontend::FrontendOptions options;
+    options.vision_enabled = true;
+    options.max_context = 16384;
+    options.max_vision_item_tokens = 1;
+    const auto capped = make_frontend(resources(), options);
+    auto input = image_input();
+    input.messages.front().parts.push_back(input.messages.front().parts.front());
+    const auto prepared = capped.prepare(input);
+    const auto& data = FrontendFactory::inspect(prepared);
+    int failures = check(data.vision_items.size() == 2, "per-item cap dropped media");
+    for (const auto& item : data.vision_items)
+        failures += check(item.patch_count == 4 && item.token_spans.size() == 1 &&
+                              item.token_spans.front().count == 1,
+                          "per-item cap was not applied before pixel preparation");
+    const auto uncapped = make_frontend(resources()).prepare(image_input());
+    failures += check(FrontendFactory::inspect(uncapped).vision_items.front().patch_count == 16,
+                      "default image resizing changed");
+    options.max_vision_item_tokens = 0;
+    failures += check(throws_invalid_argument([&] { (void)make_frontend(resources(), options); }),
+                      "zero item cap accepted");
+    options.max_vision_item_tokens = 16385;
+    failures += check(throws_invalid_argument([&] { (void)make_frontend(resources(), options); }),
+                      "unsupported item cap accepted");
+    return failures;
+}
+
 int test_text_and_image_prepare(const Frontend& frontend) {
     ninfer::ChatMessage text_message;
     text_message.role = ninfer::ChatRole::User;
@@ -2180,6 +2207,112 @@ int test_constrained_thinking_control(const Frontend& frontend) {
     failures +=
         check(channel_text(session.commit_preview(), ninfer::OutputChannel::Content) == " yes",
               "constrained content lost its leading space after thinking");
+    constexpr std::string_view close = "\n</think>\n\n";
+    std::vector<std::string> partials;
+    for (std::size_t size = 1; size < close.size(); ++size) {
+        partials.emplace_back(close.substr(0, size));
+        partials.emplace_back(close.substr(close.size() - size));
+    }
+    for (const auto& partial : partials) {
+        const auto tokens = frontend.tokenize_text(partial);
+        auto partial_session = frontend.make_output_session(
+            prompt, {}, {}, {.budget = static_cast<std::uint32_t>(tokens.size())},
+            ninfer::OutputConstraint::grammar("root ::= \" yes\""));
+        const auto boundary =
+            partial_session.preview_model(tokens, 512, ninfer::FinishReason::OutputLimit);
+        failures += check(
+            boundary.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl &&
+                boundary.accepted_tokens == tokens.size() && !boundary.finished(),
+            "canonical close fragment did not retain the thinking boundary");
+        const auto model_output = partial_session.commit_preview();
+        failures += check(channel_text(model_output, ninfer::OutputChannel::Content).empty(),
+                          "partial canonical close published constrained content");
+        const auto pending = partial_session.pending_control_tokens();
+        const std::vector<ninfer::TokenId> forced(pending.begin(), pending.end());
+        if (forced.empty()) {
+            failures += check(false, "partial canonical close lost target control");
+            continue;
+        }
+        const auto first = partial_session.preview_control(forced, 512);
+        partial_session.discard_preview();
+        failures += check(!partial_session.thinking_stats().applied &&
+                              partial_session.thinking_stats().injected_tokens == 0 &&
+                              partial_session.model_token_budget_remaining(512) == 0,
+                          "discarded control consumed its budget or published accounting");
+        const auto retry = partial_session.preview_control(forced, 512);
+        failures += check(first.accepted_tokens == forced.size() &&
+                              retry.accepted_tokens == first.accepted_tokens &&
+                              !retry.finished() &&
+                              retry.prefix_execution_split_after == forced.size(),
+                          "retried control closed early across a canonical fragment");
+        const auto repaired = partial_session.commit_preview();
+        failures += check(channel_text(repaired, ninfer::OutputChannel::Content).empty() &&
+                              partial_session.thinking_stats().injected_tokens == forced.size() &&
+                              partial_session.thinking_stats().applied &&
+                              partial_session.pending_control_tokens().empty(),
+                          "repaired control leaked content or lost accounting");
+        (void)partial_session.preview_model(frontend.tokenize_text(" yes"), 512,
+                                            ninfer::FinishReason::OutputLimit);
+        failures += check(
+            channel_text(partial_session.commit_preview(), ninfer::OutputChannel::Content) == " yes",
+            "content grammar did not recover after a canonical close fragment");
+    }
+    return failures;
+}
+
+int test_control_grammar_rejection() {
+    auto source = resources();
+    auto tokenizer_json = nlohmann::json::parse(source.tokenizer_json);
+    auto& added_tokens = tokenizer_json["added_tokens"];
+    for (auto it = added_tokens.begin(); it != added_tokens.end();) {
+        if (it->at("id") == 8) it = added_tokens.erase(it);
+        else ++it;
+    }
+    tokenizer_json["added_tokens"].push_back(added(33, "limited", true));
+    source.tokenizer_json = tokenizer_json.dump();
+    auto config = nlohmann::json::parse(source.tokenizer_config_json);
+    config["added_tokens_decoder"].erase("8");
+    config["added_tokens_decoder"]["33"] = decoder_added("limited", true);
+    source.tokenizer_config_json = config.dump();
+    const auto frontend = make_frontend(source);
+    auto session = frontend.make_output_session(
+        thinking_prompt(frontend), {}, {}, {.budget = 1},
+        ninfer::OutputConstraint::grammar("root ::= \" yes\""));
+    (void)session.preview_model(std::array<ninfer::TokenId, 1>{0}, 512,
+                                ninfer::FinishReason::OutputLimit);
+    const auto initial = session.commit_preview();
+    int failures = check(channel_text(initial, ninfer::OutputChannel::Reasoning) == "x",
+                         "typed control rejection fixture lost initial reasoning");
+    const auto pending = session.pending_control_tokens();
+    const std::vector<ninfer::TokenId> forced(pending.begin(), pending.end());
+    failures += check(std::find(forced.begin(), forced.end(), 33) != forced.end() &&
+                          !forced.empty() && forced.front() != 33,
+                      "rejection fixture must reject after accepting a control prefix");
+    if (forced.empty()) return failures;
+    const ninfer::text::Tokenizer tokenizer(
+        {source.tokenizer_json, source.tokenizer_config_json});
+    std::vector<std::uint32_t> before((tokenizer.vocab_size() + 31) / 32), after(before.size());
+    (void)session.grammar_masks({}, before);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool typed = false;
+        try { (void)session.preview_control(forced, 512); }
+        catch (const ninfer::runtime::OutputControlError&) { typed = true; }
+        failures += check(typed, "incompatible target control did not raise OutputControlError");
+        session.discard_preview();
+        (void)session.grammar_masks({}, after);
+        failures += check(before == after && !session.thinking_stats().applied &&
+                              session.thinking_stats().injected_tokens == 0 &&
+                              session.thinking_stats().model_thinking_tokens == 1 &&
+                              session.pending_control_tokens().size() == forced.size(),
+                          "rejected control retained tentative matcher or accounting state");
+    }
+    (void)session.preview_terminal(ninfer::FinishReason::Cancelled);
+    const auto cancelled = session.commit_preview();
+    failures += check(channel_text(cancelled, ninfer::OutputChannel::Content).empty() &&
+                          channel_text(cancelled, ninfer::OutputChannel::Reasoning).empty() &&
+                          session.pending_control_tokens().empty() &&
+                          session.thinking_stats().injected_tokens == 0,
+                      "terminal recovery published rejected control tokens");
     return failures;
 }
 
@@ -2858,6 +2991,7 @@ int main() {
     failures += test_invalid_public_part_enums(frontend);
     failures += test_text_and_image_prepare(frontend);
     failures += test_media_token_ids_come_from_tokenizer();
+    failures += test_vision_item_limit();
     failures += test_template_media_contract();
     failures += test_image_resize_rejection_policy();
     failures += test_explicit_leading_instruction_cache_boundary();
@@ -2878,6 +3012,7 @@ int main() {
     failures += test_thinking_accounting(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_constrained_thinking_control(frontend);
+    failures += test_control_grammar_rejection();
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();
@@ -2886,7 +3021,9 @@ int main() {
     failures += test_media_cache_runs_independent_misses_in_parallel();
     failures += test_many_images_prepare_in_one_parallel_batch();
     failures += test_media_preparation_cancellation();
+#ifndef NINFER_CPU_TEST_NO_AFFINITY
     failures += test_media_auto_threads_respect_affinity();
+#endif
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;

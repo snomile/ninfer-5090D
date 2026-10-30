@@ -31,6 +31,7 @@ struct FrontendOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
+    std::uint32_t max_vision_item_tokens   = 16384;
 };
 
 struct PreparedSessionKey {

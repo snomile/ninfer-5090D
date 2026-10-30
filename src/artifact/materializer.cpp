@@ -295,7 +295,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     if (plan.registered_host_bytes && !execution) {
         throw ArtifactError("registered Host weights require a CUDA execution view");
     }
-    if (cuda && (!execution || execution->device() != plan.device)) {
+    if ((cuda || !plan.mapped_objects.empty()) &&
+        (!execution || execution->device() != plan.device)) {
         throw ArtifactError("device materialization requires its CUDA execution view");
     }
     std::optional<CudaDeviceScope> device_scope;
@@ -561,6 +562,19 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     }
     if (cuda) { completion.finish(); }
     if (copied != total) { throw ArtifactError("incomplete tensor materialization"); }
+    // Bind aliases only after loading, so copy planning never schedules H2D into mapped memory.
+    for (const auto id : plan.mapped_objects) {
+        auto& object = out.tensors_.at(id.index);
+        if (!object.host || object.device)
+            throw ArtifactError("invalid mapped Host tensor placement");
+        const auto registration = out.host_registration_.view();
+        const auto offset = static_cast<std::size_t>(
+            object.host->data - static_cast<const std::byte*>(registration.host.data));
+        const auto mapped = registration.subspan(offset, object.host->geometry.bytes);
+        object.device = WeightParent{object.host->geometry, plan.device,
+                                     static_cast<const std::byte*>(mapped.device_address), {}};
+        out.stats_.mapped_host_bytes += object.host->geometry.bytes;
+    }
     for (std::size_t i = 0; i < out.tensors_.size(); ++i) {
         auto& object = out.tensors_[i];
         if (!object.host && !object.device) { continue; }

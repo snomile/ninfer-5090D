@@ -644,7 +644,12 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_semantic.control_pending = false;
     impl_->preview_semantic.applied         = true;
     impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
-    impl_->accept_grammar(tokens);
+    try {
+        impl_->accept_grammar(tokens);
+    } catch (const text::GrammarAcceptanceError&) {
+        throw runtime::OutputControlError(
+            "target thinking control is incompatible with the generated reasoning suffix");
+    }
     impl_->preview_finish_reason = FinishReason::None;
     impl_->preview_ready         = true;
     return runtime::OutputDecision{

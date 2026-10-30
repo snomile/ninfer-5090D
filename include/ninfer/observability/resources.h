@@ -24,6 +24,7 @@ struct VisionMemorySummary {
     std::size_t input_staging_bytes     = 0;
     std::size_t output_active_bytes     = 0;
     std::size_t output_peak_bytes       = 0;
+    std::size_t weight_staging_bytes    = 0; // Subset of encoder_workspace_bytes.
 };
 
 struct MoeMemorySummary {
@@ -63,6 +64,7 @@ struct MemoryAllocations {
     std::uint64_t device_weights_bytes     = 0;
     std::uint64_t host_weights_bytes       = 0;
     std::uint64_t registered_weights_bytes = 0;
+    std::uint64_t mapped_weights_bytes     = 0; // Subset of registered Host weights.
     std::uint64_t persistent_device_bytes  = 0;
     std::uint64_t context_device_bytes     = 0;
     std::uint64_t workspace_device_bytes   = 0;

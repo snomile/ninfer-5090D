@@ -529,16 +529,22 @@ bool HttpServer::listen() {
     if (public_model_id_.empty()) {
         throw std::logic_error("HTTP public model id is not resolved");
     }
-    if (options_.launch.logging.stats_interval_ms != 0) {
-        stats_stopping_ = false;
-        stats_thread_   = std::thread([this] { run_stats_reporter(); });
-    }
+    if (!service_->is_available())
+        throw std::runtime_error("inference engine became unavailable before serving");
     try {
+        if (options_.launch.logging.stats_interval_ms != 0) {
+            stats_stopping_ = false;
+            stats_thread_   = std::thread([this] { run_stats_reporter(); });
+        }
+        engine_monitor_.start([this] { return service_->is_available(); },
+                              [this] { server_.stop(); });
         const bool result = server_.listen_after_bind();
         stop_stats_reporter();
+        engine_monitor_.finish_shutdown();
         return result;
     } catch (...) {
         stop_stats_reporter();
+        engine_monitor_.finish_shutdown();
         throw;
     }
 }

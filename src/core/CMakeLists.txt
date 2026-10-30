@@ -1,5 +1,6 @@
 add_library(ninfer_cpu SHARED
   cpu/system.cpp
+  cpu/workers.cpp
   cpu/task_pool.cpp
 )
 ninfer_internal_includes(ninfer_cpu)

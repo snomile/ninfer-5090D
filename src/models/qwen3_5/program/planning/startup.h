@@ -40,6 +40,7 @@ struct SequencePlanningInputs {
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
     std::size_t vision_memory_budget_bytes = 0;
+    std::uint32_t max_vision_item_tokens   = 16384;
 };
 
 struct SequencePlanImpl {
@@ -61,6 +62,7 @@ struct SequencePlanImpl {
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
     std::size_t vision_memory_budget_bytes = 0;
+    std::uint32_t max_vision_item_tokens   = 16384;
     ResourceLayout persistent;
     WorkspaceSpec workspace;
     bool graph_probe                     = false;

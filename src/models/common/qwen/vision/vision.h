@@ -9,6 +9,7 @@ namespace ninfer::models::qwen {
 class VisionContext {
 public:
     VisionContext(CudaExecutionView, const VisionConfig&, const VisionParameters&);
+    VisionContext(DeviceContext&, const VisionConfig&, const VisionParameters&, vision::Storage&);
 
     [[nodiscard]] static vision::Capacity plan_resources(const VisionConfig&, const VisionProfile&,
                                                          std::uint32_t max_features,
@@ -19,6 +20,8 @@ public:
 
 private:
     CudaExecutionView execution_;
+    CudaExecutionView transfer_;
+    vision::Storage* weight_handoff_ = nullptr;
     const VisionConfig& config_;
     const VisionParameters& parameters_;
 };

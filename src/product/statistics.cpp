@@ -11,6 +11,7 @@ Json allocations_json(const MemoryAllocations& m) {
     return {{"device_weights_bytes", m.device_weights_bytes},
             {"host_weights_bytes", m.host_weights_bytes},
             {"registered_weights_bytes", m.registered_weights_bytes},
+            {"mapped_weights_bytes", m.mapped_weights_bytes},
             {"persistent_device_bytes", m.persistent_device_bytes},
             {"context_device_bytes", m.context_device_bytes},
             {"workspace_device_bytes", m.workspace_device_bytes},
@@ -154,6 +155,7 @@ MemoryAllocations sum_allocations(std::span<const RankSnapshot> ranks) {
         total.device_weights_bytes += a.device_weights_bytes;
         total.host_weights_bytes += a.host_weights_bytes;
         total.registered_weights_bytes += a.registered_weights_bytes;
+        total.mapped_weights_bytes += a.mapped_weights_bytes;
         total.persistent_device_bytes += a.persistent_device_bytes;
         total.context_device_bytes += a.context_device_bytes;
         total.workspace_device_bytes += a.workspace_device_bytes;
@@ -214,6 +216,7 @@ Json resource_json(const RankSnapshot& rank) {
                          {"encoder_workspace_bytes", v.encoder_workspace_bytes},
                          {"output_capacity_bytes", v.output_capacity_bytes},
                          {"input_staging_bytes", v.input_staging_bytes},
+                         {"weight_staging_bytes", v.weight_staging_bytes},
                          {"output_active_bytes", v.output_active_bytes},
                          {"output_peak_bytes", v.output_peak_bytes}};
     }

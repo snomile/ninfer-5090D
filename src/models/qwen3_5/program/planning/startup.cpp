@@ -516,7 +516,8 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
     if (plan.features.vision) {
         out.vision =
             qwen::VisionContext::plan_resources(*profile.config.vision, *profile.vision,
-                                                plan.capacity, plan.vision_memory_budget_bytes);
+                                                std::min(plan.capacity, plan.max_vision_item_tokens),
+                                                plan.vision_memory_budget_bytes);
         out.capacity = std::max(out.capacity, out.vision->encoder.workspace_bytes);
     }
     return out;
@@ -597,6 +598,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->multiprocessor_count              = inputs.multiprocessor_count;
     impl->context_cache                     = inputs.context_cache;
     impl->vision_memory_budget_bytes        = inputs.vision_memory_budget_bytes;
+    impl->max_vision_item_tokens            = inputs.max_vision_item_tokens;
     impl->kv_storage                        = inputs.kv_storage;
     impl->persistent                        = persistent_layout(*impl);
     impl->context_cache.host_capacity_bytes = context::host_context_capacity(
@@ -648,6 +650,7 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
         .multiprocessor_count       = device.multiprocessor_count(),
         .context_cache              = options.context_cache,
         .vision_memory_budget_bytes = options.vision_memory_budget_bytes,
+        .max_vision_item_tokens = options.max_vision_item_tokens,
     };
     auto planner           = std::make_unique<SequencePlannerImpl>();
     planner->inputs        = inputs;

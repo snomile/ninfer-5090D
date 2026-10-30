@@ -106,6 +106,18 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
         case Field::VisionMemoryBudget:
             value = std::uint64_t{e.vision_memory_budget_bytes};
             break;
+        case Field::MaxVisionItemTokens:
+            value = std::uint64_t{e.max_vision_item_tokens};
+            break;
+        case Field::HostMappedEmbedding:
+            value = e.host_mapped_embedding;
+            break;
+        case Field::HostMappedDFlash2Codebooks:
+            value = e.host_mapped_dflash2_codebooks;
+            break;
+        case Field::HostPinnedVisionWeights:
+            value = e.host_pinned_vision_weights;
+            break;
         case Field::Device:
             value = static_cast<std::uint64_t>(e.device);
             break;

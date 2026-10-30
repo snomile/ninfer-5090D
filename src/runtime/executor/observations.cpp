@@ -19,7 +19,7 @@ auto fields(T& v) {
     else if constexpr (std::is_same_v<Value, VisionMemorySummary>)
         return std::tie(v.budget_bytes, v.max_window_features, v.encoder_workspace_bytes,
                         v.output_capacity_bytes, v.input_staging_bytes, v.output_active_bytes,
-                        v.output_peak_bytes);
+                        v.output_peak_bytes, v.weight_staging_bytes);
     else if constexpr (std::is_same_v<Value, MoeMemorySummary>)
         return std::tie(v.host_weights_bytes, v.registered_host_bytes, v.cache_bytes, v.fixed_bytes,
                         v.window_bytes, v.window_count, v.used_bytes, v.target_bytes, v.ready_bytes,
@@ -28,6 +28,7 @@ auto fields(T& v) {
                         v.cpu_workspace_bytes, v.uploaded_bytes, v.prefetched_bytes);
     else if constexpr (std::is_same_v<Value, MemoryAllocations>)
         return std::tie(v.device_weights_bytes, v.host_weights_bytes, v.registered_weights_bytes,
+                        v.mapped_weights_bytes,
                         v.persistent_device_bytes, v.context_device_bytes, v.workspace_device_bytes,
                         v.io_pinned_bytes, v.host_context_bytes, v.ple_device_bytes,
                         v.ple_pinned_bytes, v.ple_host_bytes, v.expert_device_bytes,

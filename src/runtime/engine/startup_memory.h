@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/device.h"
+#include "core/device_memory.h"
 
 namespace ninfer::runtime {
 

@@ -53,7 +53,31 @@ Capacity plan_capacity(std::size_t budget, std::uint32_t maximum, std::int32_t w
 
 Storage::Storage(DeviceContext& device, Capacity capacity)
     : capacity_(capacity), output_(device.device(), capacity.output_bytes),
-      staging_(capacity.encoder.host_staging_bytes), timer_(device) {}
+      staging_(capacity.encoder.host_staging_bytes), timer_(device) {
+    if (capacity.encoder.weight_staging_bytes) {
+        for (std::size_t slot = 0; slot < 2; ++slot) {
+            weight_ready_[slot].emplace(device);
+            weight_consumed_[slot].emplace(device);
+            weight_consumed_[slot]->record(device.stream());
+        }
+    }
+}
+
+void Storage::prepare_weight_upload(std::size_t slot, cudaStream_t transfer) {
+    weight_consumed_.at(slot).value().wait(transfer);
+}
+
+void Storage::weight_uploaded(std::size_t slot, cudaStream_t transfer) {
+    weight_ready_.at(slot).value().record(transfer);
+}
+
+void Storage::acquire_weights(std::size_t slot, cudaStream_t compute) {
+    weight_ready_.at(slot).value().wait(compute);
+}
+
+void Storage::release_weights(std::size_t slot, cudaStream_t compute) {
+    weight_consumed_.at(slot).value().record(compute);
+}
 
 bool Storage::begin(const WindowUse& use) {
     if (active_ && active_->id == use.id) {
@@ -115,7 +139,8 @@ VisionMemorySummary Storage::observe() const noexcept {
             capacity_.output_bytes,
             capacity_.encoder.host_staging_bytes,
             active_bytes(),
-            output_peak_};
+            output_peak_,
+            capacity_.encoder.weight_staging_bytes};
 }
 
 } // namespace ninfer::models::vision

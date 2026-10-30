@@ -15,8 +15,18 @@ constexpr FieldSpec kFields[] = {
      "Chat template override; empty uses the artifact."},
     {Field::Vision, "model.vision", "--vision", "--no-vision", "", "Load Vision resources."},
     {Field::VisionMemoryBudget, "vision.memory_budget", "--vision-memory-budget", "", "SIZE",
-     "Per-rank Vision activation and output-window budget (1GiB); excludes weights.",
+     "Per-rank Vision activation, output and staged-weight budget (1GiB); excludes resident weights.",
      Scope::Generation, ConfigurationUnit::Bytes},
+    {Field::MaxVisionItemTokens, "vision.max_item_tokens", "--max-vision-item-tokens", "", "N",
+     "Per-media-item token limit (1..16384); resize oversized images before encoding."},
+    {Field::HostMappedEmbedding, "model.host_mapped_embedding", "--host-mapped-embedding",
+     "--no-host-mapped-embedding", "", "Keep Qwen3.5 input embedding in mapped Host memory.",
+     Scope::Common},
+    {Field::HostMappedDFlash2Codebooks, "model.host_mapped_dflash2_codebooks",
+     "--host-mapped-dflash2-codebooks", "--no-host-mapped-dflash2-codebooks", "",
+     "Keep DFlash2 selector codebooks in mapped Host memory."},
+    {Field::HostPinnedVisionWeights, "vision.host_pinned_weights", "--host-pinned-vision-weights",
+     "--no-host-pinned-vision-weights", "", "Stage Qwen3.5 Vision weights from pinned Host memory."},
     {Field::Device, "engine.device", "--device", "", "N", "Local CUDA device ordinal.",
      Scope::Common},
     {Field::MaxContext, "engine.max_context", "--max-context", "", "N",
@@ -310,6 +320,9 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     }
     switch (field) {
     case Field::Vision:
+    case Field::HostMappedEmbedding:
+    case Field::HostMappedDFlash2Codebooks:
+    case Field::HostPinnedVisionWeights:
     case Field::GpuTiming:
     case Field::CudaGraph:
     case Field::PrefixReuse:
@@ -323,6 +336,8 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
         invalid("expected a boolean");
     case Field::Device:
         return integer(value, command_line, 0, std::numeric_limits<int>::max());
+    case Field::MaxVisionItemTokens:
+        return integer(value, command_line, 1, 16384);
     case Field::MaxContext:
     case Field::CheckpointInterval:
     case Field::MaxPendingRequests:

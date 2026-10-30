@@ -1,8 +1,11 @@
 #pragma once
 
 #include "models/common/weights.h"
+#include "artifact/schema.h"
+#include "core/layout.h"
 #include "ninfer/ops/weight_input.h"
 
+#include <algorithm>
 #include <array>
 #include <vector>
 
@@ -57,6 +60,8 @@ struct VisionBlockParameters {
 };
 
 struct VisionParameters {
+    bool host_staged = false;
+    std::size_t weight_staging_slot_bytes = 0;
     ops::SingleProjectionWeight patch_embedding;
     Tensor patch_embedding_bias, position_embedding;
     std::vector<VisionBlockParameters> layers;
@@ -72,6 +77,8 @@ struct VisionBlockProfile {
 struct VisionProfile {
     ops::LinearProfile patch_embedding, merger_fc1, merger_fc2;
     std::vector<VisionBlockProfile> layers;
+    bool host_staged = false;
+    std::size_t weight_staging_slot_bytes = 0;
 };
 
 [[nodiscard]] VisionWeights bind_vision(Bindings&, const VisionConfig&,
@@ -79,7 +86,8 @@ struct VisionProfile {
 [[nodiscard]] VisionParameters prepare_vision(std::span<const BoundWeight>, const VisionWeights&);
 
 template <class Input>
-[[nodiscard]] VisionProfile describe_vision(const VisionWeights& weights, Input&& input) {
+[[nodiscard]] VisionProfile describe_vision(const VisionWeights& weights, Input&& input,
+                                           bool host_staged = false) {
     const auto linear = [&](WeightId id) {
         const auto value = input(id);
         return ops::describe_linear_weight({&value, 1});
@@ -92,6 +100,55 @@ template <class Input>
         const std::array inputs{input(layer.query), input(layer.key), input(layer.value)};
         result.layers.push_back({ops::describe_linear_weight(inputs), linear(layer.output),
                                  linear(layer.fc1), linear(layer.fc2)});
+    }
+    result.host_staged = host_staged;
+    if (host_staged) {
+        LayoutBuilder phase;
+        const auto matrix = [&](WeightId id) {
+            const auto value = input(id);
+            const auto region = contiguous_weight_region(value.weight);
+            (void)phase.add(region.parent->geometry.bytes, 256, "Vision staged payload");
+        };
+        const auto tensor = [&](WeightId id) {
+            const auto value = input(id);
+            (void)phase.add(artifact::checked_mul(weight_element_count(value.weight.shape), 2,
+                                                 "Vision staged tensor"),
+                            256, "Vision staged tensor");
+        };
+        const auto norm = [&](NormWeights n) { tensor(n.weight); tensor(n.bias); };
+        const auto finish = [&] {
+            result.weight_staging_slot_bytes =
+                std::max(result.weight_staging_slot_bytes, phase.finish(256));
+            phase = LayoutBuilder{};
+        };
+        matrix(weights.patch_embedding);
+        tensor(weights.patch_embedding_bias);
+        tensor(weights.position_embedding);
+        finish();
+        for (const auto& layer : weights.layers) {
+            norm(layer.norm1);
+            norm(layer.norm2);
+            const std::array qkv{input(layer.query), input(layer.key), input(layer.value)};
+            WeightView combined{{0, qkv[0].weight.shape[1]}, {}};
+            for (const auto& value : qkv) {
+                combined.shape[0] += value.weight.shape[0];
+                combined.parts.insert(combined.parts.end(), value.weight.parts.begin(),
+                                       value.weight.parts.end());
+            }
+            (void)phase.add(contiguous_weight_region(combined).parent->geometry.bytes, 256,
+                            "Vision staged QKV payload");
+            std::size_t bias_bytes = 0;
+            for (auto id : {layer.query_bias, layer.key_bias, layer.value_bias})
+                bias_bytes += weight_element_count(input(id).weight.shape) * 2;
+            (void)phase.add(bias_bytes, 256, "Vision staged QKV bias");
+            matrix(layer.output); tensor(layer.output_bias);
+            matrix(layer.fc1); tensor(layer.fc1_bias);
+            matrix(layer.fc2); tensor(layer.fc2_bias);
+            finish();
+        }
+        norm(weights.merger_norm);
+        matrix(weights.merger_fc1); tensor(weights.merger_fc1_bias); finish();
+        matrix(weights.merger_fc2); tensor(weights.merger_fc2_bias); finish();
     }
     return result;
 }

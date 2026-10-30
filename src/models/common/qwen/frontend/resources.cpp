@@ -147,7 +147,8 @@ frontend::ProcessorOptions parse_processor_options(std::string_view image_json,
 void prepare_control_tokens(models::frontend::TextResources& resources) {
     models::frontend::prepare_control_tokens(
         resources,
-        "\n\n Considering the limited time by the user, I have to give the solution based on the "
+        // Break a partial canonical close before appending the complete control serialization.
+        " \n\n Considering the limited time by the user, I have to give the solution based on the "
         "thinking directly now.\n</think>\n\n",
         "</think>");
 }

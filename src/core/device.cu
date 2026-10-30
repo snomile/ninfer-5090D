@@ -79,12 +79,13 @@ DeviceContext::DeviceContext(int device_id) : device_(Device::cuda(device_id)) {
     if (count <= 0) { throw std::runtime_error("no CUDA devices available"); }
     if (device_id >= count) { throw std::invalid_argument("invalid CUDA device id"); }
 
-    bind_to_current_thread();
-
-    err = cudaSetDeviceFlags(sync_flags);
+    // CUDA 12+ cudaSetDevice initializes the primary context. Set mapping and scheduling
+    // flags before that initialization, including when the selected device is not ordinal 0.
+    err = cudaInitDevice(device_id, sync_flags | cudaDeviceMapHost, 0);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaSetDeviceFlags failed", err));
+        throw std::runtime_error(cuda_error_message("cudaInitDevice failed", err));
     }
+    bind_to_current_thread();
 
     err = cudaGetDeviceProperties(&props_, device_id);
     if (err != cudaSuccess) {

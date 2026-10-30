@@ -383,8 +383,18 @@ template <class Instance>
             const auto& request = flight.requests[row];
             const auto tokens   = std::span<const TokenId>(flight.control_tokens)
                                     .subspan(row * flight.control_stride, flight.control_stride);
-            const auto decision =
-                request->output.preview_control(tokens, request->budget->remaining());
+            OutputDecision decision;
+            try {
+                decision = request->output.preview_control(tokens, request->budget->remaining());
+            } catch (const OutputControlError&) {
+                // No native control has been submitted. Roll back every preview in this
+                // membership and retire only the rejected request through the normal boundary.
+                discard_control_preview(flight);
+                request->terminal_error = std::current_exception();
+                request->model_state = EngineRequestState::ModelFinished;
+                reserved_units_[flight.lanes[row]].reset();
+                return false;
+            }
             if (decision.accepted_tokens != flight.control_stride || decision.finished() ||
                 decision.continuation != ContinuationAction::Decode ||
                 (decision.prefix_execution_split_after &&

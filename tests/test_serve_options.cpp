@@ -125,6 +125,53 @@ void test_request_defaults() {
             "server output default overflowed at the protocol boundary");
 }
 
+void test_5090d_migration() {
+    const auto value = parse({"ninfer-serve", "model.ninfer", "--max-context", "200000",
+        "--context-capacity", "auto", "--host-cache-capacity", "4GiB",
+        "--memory-headroom", "400MiB", "--max-concurrency", "2", "--kv-dtype", "fp8",
+        "--prefill-chunk", "1024", "--spec", "dflash2", "--draft-tokens", "7",
+        "--proposal-head", "optimized", "--thinking-budget", "4096", "--preserve-thinking",
+        "--max-request-size", "64MiB", "--media-cache-capacity", "0B",
+        "--media-live-capacity", "2GiB", "--vision", "--vision-memory-budget", "1GiB",
+        "--max-vision-item-tokens", "2048",
+        "--host-mapped-embedding", "--host-mapped-dflash2-codebooks", "--host-pinned-vision-weights"});
+    const auto& e = value.launch.engine;
+    require(e.host_mapped_embedding && e.host_mapped_dflash2_codebooks &&
+                e.host_pinned_vision_weights && e.max_vision_item_tokens == 2048 &&
+                e.context_cache.host_capacity_bytes == (4ULL << 30) &&
+                e.memory_headroom_bytes == (400ULL << 20) &&
+                e.context_capacity.mode == ninfer::ContextCapacityMode::Automatic,
+            "5090D startup flags did not reach engine options");
+    require(e.max_context == 200000 && e.max_concurrency == 2 && e.prefill_chunk == 1024 &&
+                e.kv_cache == ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 &&
+                e.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                e.speculative.draft_tokens == 7 &&
+                e.speculative.proposal_head == ninfer::ProposalHead::Optimized &&
+                e.media_cache_bytes == 0 && e.media_live_bytes == (2ULL << 30) &&
+                e.enable_vision && e.vision_memory_budget_bytes == (1ULL << 30) &&
+                value.launch.generation.thinking_budget == 4096 &&
+                value.launch.generation.preserve_thinking == true &&
+                value.max_request_bytes == (64ULL << 20),
+            "new startup command no longer preserves the production execution settings");
+    const auto defaults = parse({"ninfer-serve", "model.ninfer"}).launch.engine;
+    require(!defaults.host_mapped_embedding && !defaults.host_mapped_dflash2_codebooks &&
+                !defaults.host_pinned_vision_weights && defaults.max_vision_item_tokens == 16384,
+            "custom optimization became enabled by default");
+    const auto bytes = parse({"ninfer-serve", "model.ninfer", "--context-capacity", "300000"});
+    require(bytes.launch.engine.context_capacity.explicit_bytes == 300000,
+            "new capacity must be documented as bytes, not historical KV token count");
+    for (const auto* count : {"0", "16385", "-1", "2048.5"})
+        rejects([&] { (void)parse({"ninfer-serve", "model.ninfer", "--max-vision-item-tokens", count}); });
+    for (const auto* old : {"--kv-capacity", "--device-state-slots", "--host-context-mib",
+                            "--default-thinking-budget", "--max-request-mib", "--media-cache-mib"})
+        rejects([&] { (void)parse({"ninfer-serve", "model.ninfer", old, "0"}); });
+    const auto rendered = ninfer::product::format_configuration(
+        ninfer::product::configuration_view(value));
+    require(rendered.find("host_mapped_embedding") != std::string::npos &&
+                rendered.find("max_item_tokens") != std::string::npos,
+            "startup display omitted optimization settings");
+}
+
 void test_provenance() {
     for (auto args : std::vector<std::vector<std::string>>{
              {"ninfer-serve", "model.ninfer", "--api-key", "private-value"},
@@ -148,6 +195,7 @@ int main() {
     try {
         test_resources_and_units();
         test_request_defaults();
+        test_5090d_migration();
         test_provenance();
         std::cout << "ok\n";
         return 0;

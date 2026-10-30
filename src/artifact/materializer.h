@@ -24,6 +24,7 @@ struct MaterializationStats {
     std::uint64_t owned_value_bytes     = 0;
     std::uint64_t peak_staging_bytes    = 0;
     std::uint64_t registered_host_bytes = 0; // Subset of host_capacity_bytes.
+    std::uint64_t mapped_host_bytes     = 0; // Payload subset, not allocated Device memory.
     std::size_t device_object_count     = 0;
     std::size_t host_object_count       = 0; // CPU tensors and retained resources.
     // I/O, CPU copies and upload completion; excludes backing allocation and pinning.

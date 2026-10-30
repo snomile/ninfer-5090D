@@ -5,9 +5,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 namespace ninfer::runtime {
+
+// A frontend rejected injected tokens before any model execution was submitted.
+class OutputControlError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 // A bounded tokenizer or partial media plan supplies a lower bound, not the full prompt length.
 [[nodiscard]] inline std::string context_length_error_message(std::size_t tokens,

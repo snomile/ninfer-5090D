@@ -11,6 +11,9 @@ struct LoadOptions {
     bool vision                    = false;
     SpeculativeBackend speculative = SpeculativeBackend::None;
     ProposalHead proposal_head     = ProposalHead::Full;
+    bool host_mapped_embedding        = false;
+    bool host_mapped_dflash2_codebooks = false;
+    bool host_pinned_vision_weights   = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -52,7 +55,10 @@ struct LoadOptions {
     return {.purpose       = options.purpose,
             .vision        = options.enable_vision,
             .speculative   = options.speculative.backend,
-            .proposal_head = options.speculative.proposal_head};
+            .proposal_head = options.speculative.proposal_head,
+            .host_mapped_embedding = options.host_mapped_embedding,
+            .host_mapped_dflash2_codebooks = options.host_mapped_dflash2_codebooks,
+            .host_pinned_vision_weights = options.host_pinned_vision_weights};
 }
 
 } // namespace ninfer::models

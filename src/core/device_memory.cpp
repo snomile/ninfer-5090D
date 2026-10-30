@@ -30,9 +30,4 @@ DeviceMemorySnapshot device_memory_snapshot(Device device) {
     return snapshot;
 }
 
-std::int64_t device_memory_growth(DeviceMemorySnapshot before, DeviceMemorySnapshot after) {
-    return static_cast<std::int64_t>(before.available_bytes()) -
-           static_cast<std::int64_t>(after.available_bytes());
-}
-
 } // namespace ninfer

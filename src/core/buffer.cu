@@ -62,7 +62,7 @@ CudaHostRegistration::CudaHostRegistration(ConstMemorySpan host, Device cuda_dev
     }
     CudaDeviceScope scope(cuda_device);
     if (host.bytes) {
-        check(cudaHostRegister(const_cast<void*>(host.data), host.bytes, cudaHostRegisterDefault),
+        check(cudaHostRegister(const_cast<void*>(host.data), host.bytes, cudaHostRegisterMapped),
               "cudaHostRegister");
     }
     try {

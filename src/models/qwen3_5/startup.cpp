@@ -99,7 +99,8 @@ qwen::Frontend Startup::frontend(const EngineOptions& options) const {
                                 .max_context              = options.max_context,
                                 .media_cache_bytes        = options.media_cache_bytes,
                                 .media_live_bytes         = options.media_live_bytes,
-                                .media_preprocess_threads = options.media_preprocess_threads},
+                                .media_preprocess_threads = options.media_preprocess_threads,
+                                .max_vision_item_tokens = options.max_vision_item_tokens},
                                default_sampling(architecture_));
 }
 

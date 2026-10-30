@@ -368,6 +368,18 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
         case Field::VisionMemoryBudget:
             engine.vision_memory_budget_bytes = u64();
             break;
+        case Field::MaxVisionItemTokens:
+            engine.max_vision_item_tokens = u32();
+            break;
+        case Field::HostMappedEmbedding:
+            engine.host_mapped_embedding = boolean();
+            break;
+        case Field::HostMappedDFlash2Codebooks:
+            engine.host_mapped_dflash2_codebooks = boolean();
+            break;
+        case Field::HostPinnedVisionWeights:
+            engine.host_pinned_vision_weights = boolean();
+            break;
         case Field::Device:
             engine.device = static_cast<int>(u64());
             break;

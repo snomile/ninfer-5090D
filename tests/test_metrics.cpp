@@ -41,6 +41,14 @@ int main() {
     running.runtime.speculative_draft_tokens += 6;
     running.runtime.speculative_accepted_tokens = 3;
     running.runtime.running_requests            = 1;
+    running.media.live_bytes = 123;
+    running.media.retained_bytes = 100;
+    running.media.live_capacity_bytes = 2048;
+    running.media.capacity_bytes = 1024;
+    running.media.hits = 7;
+    running.ranks[0].memory.allocations.mapped_weights_bytes = 128;
+    running.ranks[0].memory.allocations.registered_weights_bytes = 256;
+    running.ranks[0].memory.vision = VisionMemorySummary{.weight_staging_bytes = 512};
     running.runtime.context_pools               = {{.rank           = 0,
                                                     .domain         = ContextMemoryDomain::Host,
                                                     .capacity_bytes = 1048576,
@@ -53,6 +61,16 @@ int main() {
     running.runtime.context_transfers.state[4].bytes = 1024;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
     const auto live = metrics.render(running, true);
+    check(live.find("ninfer_media_cache_live_bytes 123\n") != std::string::npos &&
+              live.find("ninfer_media_cache_retained_bytes 100\n") != std::string::npos &&
+              live.find("ninfer_media_cache_hits_total 7\n") != std::string::npos,
+          "media snapshot gauges or counters missing");
+    check(live.find("ninfer_weight_mapped_host_bytes{rank=\"0\",node=\"0\"} 128\n") != std::string::npos &&
+              live.find("ninfer_weight_registered_host_bytes{rank=\"0\",node=\"0\"} 256\n") != std::string::npos &&
+              live.find("ninfer_vision_weight_staging_bytes{rank=\"0\",node=\"0\"} 512\n") != std::string::npos,
+          "registered, mapped and staged subsets must remain separately observable");
+    check(live.find("ninfer_process_allocator_stats_available ") != std::string::npos,
+          "allocator support must be explicit");
     check(live.find("ninfer_memory_headroom_bytes{rank=\"0\",node=\"0\"} 512\n") !=
                   std::string::npos &&
               live.find("ninfer_memory_host_reservation_bytes{rank=\"0\",node=\"0\"} 1024\n") !=

@@ -60,6 +60,7 @@ struct VisionWorkspaceLayout {
     LayoutRegion patch_scratch, qkv_scratch, projection_scratch;
     LayoutRegion up_scratch, down_scratch, merger_first_scratch, merger_second_scratch;
     std::size_t bytes = 0;
+    std::size_t weight_staging_offset = 0, weight_staging_slot = 0;
 };
 
 TensorRegion alias_tensor(const TensorRegion& storage, DType dtype,
@@ -178,6 +179,15 @@ VisionWorkspaceLayout build_workspace_layout(const VisionConfig& config, const P
     out.merger_second_scratch =
         scratch(capacity(parameters.merger_fc2, 1, tokens), "merger second scratch");
     out.bytes = builder.finish(kWorkspaceAlignment, "vision workspace");
+    if (parameters.host_staged) {
+        out.weight_staging_offset = out.bytes;
+        out.weight_staging_slot = parameters.weight_staging_slot_bytes;
+        if (!out.weight_staging_slot)
+            throw std::invalid_argument("Vision staging has no payload capacity");
+        out.bytes = artifact::checked_add(
+            out.bytes, checked_mul(2, out.weight_staging_slot, "staged weights"),
+            "Vision staged workspace");
+    }
     return out;
 }
 
@@ -195,15 +205,127 @@ vision::Capacity plan_resources(const VisionConfig& config, const VisionProfile&
             (void)host.add_tensor(DType::I32, {4, dimension(n)}, 256, "position indices");
             (void)host.add_tensor(DType::FP32, {4, dimension(n)}, 256, "position weights");
             (void)host.add_tensor(DType::I32, {dimension(features + 1ULL)}, 256, "segment offsets");
-            return vision::EncoderMemory{layout.bytes, host.finish(256)};
+            return vision::EncoderMemory{layout.bytes, host.finish(256),
+                                           2 * layout.weight_staging_slot};
         });
+}
+
+// Upload a complete encoded parent, then rebase every borrowed plane into the slot.
+// In particular, copying only qdata loses quantization scales and row-view offsets.
+class StageWriter {
+public:
+    StageWriter(MemorySpan slot, CudaExecutionView transfer) : slot_(slot), transfer_(transfer) {}
+
+    ops::SingleProjectionWeight linear(const ops::SingleProjectionWeight& source) {
+        const auto& w = source.weight;
+        if (w.device != Device::cpu() || !w.payload || !w.payload_bytes || !w.qdata ||
+            w.payload_bytes > std::numeric_limits<std::size_t>::max())
+            throw std::invalid_argument("Vision staging requires a Host encoded payload");
+        const auto base = reinterpret_cast<std::uintptr_t>(w.payload);
+        if (w.payload_bytes > std::numeric_limits<std::uintptr_t>::max() - base)
+            throw std::invalid_argument("Vision payload address range overflows");
+        for (const auto* plane : {w.qdata, w.qhigh, w.scales})
+            if (plane && (reinterpret_cast<std::uintptr_t>(plane) < base ||
+                          reinterpret_cast<std::uintptr_t>(plane) >= base + w.payload_bytes))
+                throw std::invalid_argument("Vision encoded plane is outside its payload");
+        auto* destination = allocate(static_cast<std::size_t>(w.payload_bytes));
+        copy_bytes_async({destination, std::size_t(w.payload_bytes), slot_.device},
+                         {w.payload, std::size_t(w.payload_bytes), Device::cpu(), true}, transfer_);
+        const auto rebase = [&](const void* plane) -> const void* {
+            return plane ? destination + (reinterpret_cast<std::uintptr_t>(plane) - base) : nullptr;
+        };
+        auto out = source;
+        out.weight.device = slot_.device;
+        out.weight.payload = destination;
+        out.weight.qdata = rebase(w.qdata);
+        out.weight.qhigh = rebase(w.qhigh);
+        out.weight.scales = rebase(w.scales);
+        return out;
+    }
+
+    Tensor tensor(const Tensor& source) {
+        if (source.device != Device::cpu() || source.dtype != DType::BF16 ||
+            !source.data || !source.is_contiguous() || !source.bytes())
+            throw std::invalid_argument("Vision staging requires a contiguous Host BF16 tensor");
+        auto out = source;
+        out.data = allocate(source.bytes());
+        out.device = slot_.device;
+        copy_bytes_async({out.data, out.bytes(), out.device},
+                         {source.data, source.bytes(), Device::cpu(), true}, transfer_);
+        return out;
+    }
+
+    NormParameters norm(const NormParameters& source) {
+        return {tensor(source.weight), tensor(source.bias)};
+    }
+
+private:
+    std::byte* allocate(std::size_t bytes) {
+        cursor_ = artifact::checked_add(cursor_, kWorkspaceAlignment - 1, "Vision staging cursor")
+                  & ~(kWorkspaceAlignment - 1);
+        const auto end = artifact::checked_add(cursor_, bytes, "Vision staged payload");
+        if (end > slot_.bytes) throw std::logic_error("Vision staging exceeds its planned slot");
+        auto* result = static_cast<std::byte*>(slot_.data) + cursor_;
+        cursor_ = end;
+        return result;
+    }
+    MemorySpan slot_;
+    CudaExecutionView transfer_;
+    std::size_t cursor_ = 0;
+};
+
+struct StagedPhase {
+    ops::SingleProjectionWeight projection;
+    Tensor bias, position;
+    NormParameters norm;
+    VisionBlockParameters block;
+};
+
+StagedPhase stage_phase(const VisionParameters& p, std::size_t phase, MemorySpan slot,
+                        CudaExecutionView transfer) {
+    StageWriter writer(slot, transfer);
+    StagedPhase out;
+    if (!phase) {
+        out.projection = writer.linear(p.patch_embedding);
+        out.bias = writer.tensor(p.patch_embedding_bias);
+        out.position = writer.tensor(p.position_embedding);
+    } else if (phase <= p.layers.size()) {
+        const auto& source = p.layers[phase - 1];
+        auto& b = out.block;
+        b.norm1 = writer.norm(source.norm1);
+        b.norm2 = writer.norm(source.norm2);
+        b.qkv = writer.linear(source.qkv);
+        b.qkv_bias = writer.tensor(source.qkv_bias);
+        b.output = writer.linear(source.output);
+        b.output_bias = writer.tensor(source.output_bias);
+        b.fc1 = writer.linear(source.fc1);
+        b.fc1_bias = writer.tensor(source.fc1_bias);
+        b.fc2 = writer.linear(source.fc2);
+        b.fc2_bias = writer.tensor(source.fc2_bias);
+    } else if (phase == p.layers.size() + 1) {
+        out.norm = writer.norm(p.merger_norm);
+        out.projection = writer.linear(p.merger_fc1);
+        out.bias = writer.tensor(p.merger_fc1_bias);
+    } else {
+        out.projection = writer.linear(p.merger_fc2);
+        out.bias = writer.tensor(p.merger_fc2_bias);
+    }
+    return out;
 }
 
 } // namespace
 
 VisionContext::VisionContext(CudaExecutionView execution, const VisionConfig& config,
                              const VisionParameters& parameters)
-    : execution_(execution), config_(config), parameters_(parameters) {}
+    : execution_(execution), transfer_(execution), config_(config), parameters_(parameters) {
+    if (parameters_.host_staged)
+        throw std::invalid_argument("Host-staged Vision requires Program-owned handoff storage");
+}
+
+VisionContext::VisionContext(DeviceContext& device, const VisionConfig& config,
+                             const VisionParameters& parameters, vision::Storage& handoff)
+    : execution_(device.execution_view()), transfer_(device.transfer_view()),
+      weight_handoff_(&handoff), config_(config), parameters_(parameters) {}
 
 vision::Capacity VisionContext::plan_resources(const VisionConfig& c, const VisionProfile& p,
                                                std::uint32_t maximum, std::size_t budget) {
@@ -240,6 +362,35 @@ std::size_t VisionContext::encode(const VisionEncoderBatch& input, Tensor& outpu
     if (backing.bytes < layout.bytes || backing.device != execution_.device() ||
         staging.device != Device::cpu() || !staging.host_pinned)
         throw std::invalid_argument("Vision encoder backing differs from its planned resources");
+    const bool staged = parameters_.host_staged;
+    const auto stream = execution_.stream();
+    std::array<StagedPhase, 2> phases;
+    const auto upload_phase = [&](std::size_t phase) {
+        const auto slot = phase % 2;
+        weight_handoff_->prepare_weight_upload(slot, transfer_.stream());
+        phases[slot] = stage_phase(parameters_, phase,
+            backing.subspan(layout.weight_staging_offset + slot * layout.weight_staging_slot,
+                            layout.weight_staging_slot), transfer_);
+        weight_handoff_->weight_uploaded(slot, transfer_.stream());
+    };
+    const auto acquire = [&](std::size_t phase) -> const StagedPhase& {
+        const auto slot = phase % 2;
+        weight_handoff_->acquire_weights(slot, stream);
+        if (phase < parameters_.layers.size() + 2) upload_phase(phase + 1);
+        return phases[slot];
+    };
+    const auto consumed = [&](std::size_t phase) {
+        if (staged) weight_handoff_->release_weights(phase % 2, stream);
+    };
+    if (staged) {
+        if (!weight_handoff_ || weight_handoff_->capacity().encoder.weight_staging_bytes !=
+                                    2 * layout.weight_staging_slot)
+            throw std::invalid_argument("Vision staging differs from Program capacity");
+        // A previous window/text execution may have used this shared workspace region.
+        weight_handoff_->release_weights(0, stream);
+        weight_handoff_->release_weights(1, stream);
+        upload_phase(0);
+    }
     MemoryArena host(staging);
     auto upload = [&](const void* source, Tensor& destination) {
         auto buffer = host.alloc_bytes(destination.bytes());
@@ -258,6 +409,11 @@ std::size_t VisionContext::encode(const VisionEncoderBatch& input, Tensor& outpu
     Tensor patch_bf16   = layout.patch_bf16.bind(backing);
     Tensor pos_indices  = layout.pos_indices.bind(backing);
     Tensor pos_weights  = layout.pos_weights.bind(backing);
+    StagedPhase patch;
+    patch.projection = parameters_.patch_embedding;
+    patch.bias = parameters_.patch_embedding_bias;
+    patch.position = parameters_.position_embedding;
+    if (staged) patch = acquire(0);
     {
         nvtx::ScopedRange patch_range(nvtx::Name::VisionPatchEmbedding, nvtx::Category::Vision,
                                       static_cast<std::uint64_t>(patches));
@@ -275,8 +431,8 @@ std::size_t VisionContext::encode(const VisionEncoderBatch& input, Tensor& outpu
         copy_bytes_async({patch_bf16.data, patch_bf16.bytes(), patch_bf16.device}, patch_host,
                          execution_);
         upload(input.positions.data(), position_ids);
-        project(patch_bf16, parameters_.patch_embedding, x, layout.patch_scratch);
-        ops::add_bias(parameters_.patch_embedding_bias, x, execution_);
+        project(patch_bf16, patch.projection, x, layout.patch_scratch);
+        ops::add_bias(patch.bias, x, execution_);
         // The artifact records the source table shape [rows,hidden], while Tensor's
         // contiguous matrix convention is [inner,columns]. The payload is already
         // row-major, so this is a zero-copy [hidden,rows] view, not a transpose.
@@ -284,14 +440,15 @@ std::size_t VisionContext::encode(const VisionEncoderBatch& input, Tensor& outpu
         upload(input.position_weights.data(), pos_weights);
         auto segments = layout.cu_seqlens.bind(backing).slice(0, 0, input.cu_seqlens.size());
         upload(input.cu_seqlens.data(), segments);
-        Tensor position_table = parameters_.position_embedding.reshape(
+        Tensor position_table = patch.position.reshape(
             {dimension(config_.hidden_size), dimension(config_.num_position_embeddings)});
         ops::embedding_interpolate_add(position_table, pos_indices, pos_weights, x, execution_);
     }
+    consumed(0);
     for (std::size_t layer = 0; layer < parameters_.layers.size(); ++layer) {
         nvtx::ScopedRange layer_range(nvtx::Name::VisionLayer, nvtx::Category::Vision,
                                       static_cast<std::uint64_t>(layer));
-        const auto& block = parameters_.layers[layer];
+        const auto& block = staged ? acquire(layer + 1).block : parameters_.layers[layer];
         {
             nvtx::ScopedRange attention_range(nvtx::Name::VisionAttention,
                                               nvtx::Category::Attention,
@@ -352,21 +509,33 @@ std::size_t VisionContext::encode(const VisionEncoderBatch& input, Tensor& outpu
             ops::add_bias(block.fc2_bias, down, execution_);
             ops::residual_add(down, x, execution_);
         }
+        consumed(layer + 1);
     }
 
     {
         nvtx::ScopedRange merge_range(nvtx::Name::VisionMerge, nvtx::Category::Vision,
                                       static_cast<std::uint64_t>(tokens));
         Tensor normalized = layout.normalized.bind(backing);
-        ops::layer_norm(x, parameters_.merger_norm.weight, parameters_.merger_norm.bias, 1.0e-6F,
+        StagedPhase first;
+        first.norm = parameters_.merger_norm;
+        first.projection = parameters_.merger_fc1;
+        first.bias = parameters_.merger_fc1_bias;
+        if (staged) first = acquire(parameters_.layers.size() + 1);
+        ops::layer_norm(x, first.norm.weight, first.norm.bias, 1.0e-6F,
                         normalized, execution_);
         Tensor merged = normalized.view({dimension(config_.merger_width()), tokens});
         Tensor hidden = layout.merger_hidden.bind(backing);
-        project(merged, parameters_.merger_fc1, hidden, layout.merger_first_scratch);
-        ops::add_bias(parameters_.merger_fc1_bias, hidden, execution_);
+        project(merged, first.projection, hidden, layout.merger_first_scratch);
+        ops::add_bias(first.bias, hidden, execution_);
         ops::gelu(hidden, ops::GeluMode::Exact, execution_);
-        project(hidden, parameters_.merger_fc2, output, layout.merger_second_scratch);
-        ops::add_bias(parameters_.merger_fc2_bias, output, execution_);
+        consumed(parameters_.layers.size() + 1);
+        StagedPhase second;
+        second.projection = parameters_.merger_fc2;
+        second.bias = parameters_.merger_fc2_bias;
+        if (staged) second = acquire(parameters_.layers.size() + 2);
+        project(hidden, second.projection, output, layout.merger_second_scratch);
+        ops::add_bias(second.bias, output, execution_);
+        consumed(parameters_.layers.size() + 2);
     }
     return layout.bytes;
 }
