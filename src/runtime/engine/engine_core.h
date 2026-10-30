@@ -611,6 +611,7 @@ private:
     [[nodiscard]] bool execution_outstanding() const noexcept;
 
     [[nodiscard]] bool compute_pending() const noexcept;
+    [[nodiscard]] bool has_ready_resident_work() const noexcept;
 
     void fail_all(std::exception_ptr error) noexcept;
 

@@ -1170,6 +1170,18 @@ bool EngineCore<Instance>::process_measurement() {
 }
 
 template <class Instance>
+[[nodiscard]] bool EngineCore<Instance>::has_ready_resident_work() const noexcept {
+    return std::any_of(slots_.begin(), slots_.end(), [&](const auto& request) {
+        return request && request->sequence && !request->capture_pending &&
+               !request->cancelled.load(std::memory_order_acquire) &&
+               (request->is_decode_ready() || request->is_control_ready() ||
+                request->is_prefilling() || request->is_replaying()) &&
+               !instance_.session->context_blocks(*request->sequence) &&
+               !instance_.session->execution_pending(*request->sequence);
+    });
+}
+
+template <class Instance>
 void EngineCore<Instance>::worker_loop() noexcept {
     std::uint64_t scheduled_revision = 0;
     for (;;) {
@@ -1202,8 +1214,12 @@ void EngineCore<Instance>::worker_loop() noexcept {
             progressed    = poll_execution(boundary);
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             const auto revision = schedule_revision_.load(std::memory_order_acquire);
+            // Context transfers have an independent execution frame. Waiting for their
+            // completion must not starve another lane; Native still owns its permits and
+            // decides which sequences the transaction actually blocks.
             const bool schedule = progressed || revision != scheduled_revision ||
-                                  !execution_outstanding() || Clock::now() >= pending_deadline_;
+                                  !execution_outstanding() || Clock::now() >= pending_deadline_ ||
+                                  has_ready_resident_work();
             if (cycle_step_ == CycleStep::Boundary && !compute_pending() && schedule) {
                 scheduled_revision = revision;
                 set_host_work_class(HostWorkClass::Control);
