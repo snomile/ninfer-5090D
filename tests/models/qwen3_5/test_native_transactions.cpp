@@ -176,7 +176,7 @@ public:
     runtime::BeginSummary finish_prefill(q35::SequenceHandle sequence, std::uint32_t remaining,
                                          bool terminal) {
         std::uint32_t processed = 0;
-        for (unsigned iteration = 0; iteration < remaining / kChunk + 4; ++iteration) {
+        for (unsigned iteration = 0; iteration < remaining / (kChunk / 4) + 4; ++iteration) {
             const bool recovering = program_.recovery_pending(sequence);
             reserve(sequence, q35::ExecutionUnitKind::Prefill);
             auto step = driver_.prefill(sequence);
@@ -235,6 +235,29 @@ public:
         (void)driver_.commit(std::move(pending), accepted);
         decode_and_finish(sequence);
         expect_empty("consecutive decode and terminal append leaked context");
+    }
+
+    void prefill_yields_to_active_peer() {
+        auto peer_base = request(32);
+        const auto peer = bind(peer_base);
+        finish_prefill(peer, 32, false);
+        auto long_base = request(kPromptTokens);
+        const auto sequence = bind(long_base, 1);
+        reserve(sequence, q35::ExecutionUnitKind::Prefill);
+        const auto bounded = driver_.prefill(sequence);
+        require(bounded.processed_prompt_tokens == kChunk / 4 && !bounded.complete &&
+                    !bounded.pending && !bounded.capture_ready,
+                "long prefill did not yield before blocking an active output lane");
+        require(driver_.abort(peer).status == runtime::ConsumeStatus::Consumed,
+                "active peer did not release its execution lane");
+        reserve(sequence, q35::ExecutionUnitKind::Prefill);
+        const auto ordinary = driver_.prefill(sequence);
+        require(ordinary.processed_prompt_tokens == kChunk && !ordinary.complete &&
+                    !ordinary.pending && !ordinary.capture_ready,
+                "prefill did not recover its full chunk after the active peer ended");
+        require(driver_.abort(sequence).status == runtime::ConsumeStatus::Consumed,
+                "bounded prefill did not release its partial continuation");
+        expect_empty("bounded peer prefill retained Context ownership");
     }
 
     void rewrite_segments_share_prefill_unit() {
@@ -2068,6 +2091,7 @@ int main(int argc, char** argv) {
             fixture.input_replay_lifecycle();
             fixture.active_input_zero_growth_binding();
             fixture.consecutive_decode_terminal();
+            fixture.prefill_yields_to_active_peer();
             fixture.rewrite_segments_share_prefill_unit();
             fixture.replay_carries_independent_input();
             fixture.retained_input_host_suffix();
