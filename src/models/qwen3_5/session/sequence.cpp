@@ -122,10 +122,10 @@ std::uint32_t SessionImpl::window_end(const SequenceState& state, const RequestC
     if (begin < request.base->summary.prompt_tokens)
         end = std::min(end, request.base->summary.prompt_tokens);
     if (request.lifecycle == Lifecycle::Prefilling && request.base->capture_backing &&
-        end == request.base->summary.prompt_tokens) {
-        // Keep the final semantic suffix a separate scheduling unit even when an optional
-        // checkpoint has no backing. Otherwise one lane can publish its first token while
-        // its peer still has a whole nominal prefill chunk to execute.
+        end == request.base->summary.prompt_tokens && end - begin == prefill_chunk) {
+        // Split a full final chunk even when optional checkpoint backing is unavailable.
+        // A preceding capture may already have shortened the suffix; splitting that small
+        // residual again adds a whole forward pass without removing a nominal peer chunk.
         const auto& boundaries = request.base->context_cache.semantic_boundaries;
         const auto next = std::upper_bound(boundaries.begin(), boundaries.end(), begin);
         if (next != boundaries.end()) end = std::min(end, *next);

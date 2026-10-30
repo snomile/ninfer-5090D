@@ -834,15 +834,21 @@ public:
     }
 
     void final_semantic_suffix_without_destination() {
+        final_semantic_suffix_without_destination(kPromptTokens, kChunk - 16);
+        final_semantic_suffix_without_destination(kPromptTokens - 1, kChunk - 1);
+    }
+
+    void final_semantic_suffix_without_destination(std::uint32_t tokens,
+                                                    std::uint32_t expected_final) {
         auto prepared = models::qwen::PreparedPromptAccess::take(
-            frontend_.prepare_tokens(std::vector<TokenId>(kPromptTokens, 198)));
+            frontend_.prepare_tokens(std::vector<TokenId>(tokens, 198)));
         constexpr std::uint32_t suffix = 16;
-        prepared.context_cache.semantic_boundaries = {kPromptTokens - suffix};
+        prepared.context_cache.semantic_boundaries = {tokens - suffix};
         prepared.context_cache.automatic_checkpoints = false;
         prepared.context_cache.opportunities.push_back(
             {.kind     = PromptCacheMarkerKind::SharedStablePrefix,
              .evidence = SharedCandidateEvidence::ExplicitBoundary,
-             .frontier = kPromptTokens - suffix});
+             .frontier = tokens - suffix});
         runtime::ResolvedExecutionOptions options;
         options.requested_output_tokens = 8;
         options.allow_prefix_reuse = true;
@@ -863,13 +869,20 @@ public:
         const auto full = program_.physical_usage();
         const auto offered = program_.prepare_capture(active);
         require(offered && !offered->reserved && !offered->assessment.ready() &&
-                    offered->frontier == kPromptTokens - suffix,
+                    offered->frontier == tokens - suffix,
                 "final semantic fixture did not exhaust optional capture destinations");
         expect_usage(full, "failed final capture retained an unpublished reservation");
-        const auto step = driver_.prefill(active);
-        require(step.processed_prompt_tokens == kChunk - suffix &&
-                    !step.complete && !step.pending && !step.capture_ready,
-                "missing optional backing merged the final semantic suffix into its peer's unit");
+        auto step = driver_.prefill(active);
+        require(step.processed_prompt_tokens == expected_final &&
+                    step.complete == (tokens != kPromptTokens) &&
+                    step.pending.has_value() == step.complete &&
+                    !step.capture_ready,
+                "missing optional backing changed full-chunk separation or a partial suffix");
+        if (step.pending) {
+            const std::array<runtime::CommitDecision, 1> decision{
+                {{.accepted_tokens = 1, .terminal = true}}};
+            (void)driver_.commit(std::move(*step.pending), decision);
+        }
         require(driver_.abort(active).status == runtime::ConsumeStatus::Consumed,
                 "semantic suffix pressure retained its active writer");
         device_pressure.clear();
