@@ -211,6 +211,16 @@ void logical_data_and_instances() {
 
     const auto resolved                   = q35::resolve_load(reader, plan, Device::cuda(0));
     const auto capacity                   = resolved.materialization().device_capacity_bytes;
+    const auto mapped_definition = q35::read_definition(reader, {.host_mapped_embedding = true});
+    const auto mapped_load = q35::resolve_load(reader, mapped_definition, Device::cuda(0));
+    const auto& mapped = mapped_load.materialization();
+    const auto embedding_object =
+        mapped_definition->parameter(mapped_definition->weights().text.token_embedding)
+            .binding.parts.front().object;
+    require(mapped.mapped_objects.size() == 1 && mapped.registered_host_objects.size() == 1 &&
+                mapped.device_capacity_bytes == capacity &&
+                mapped.objects.at(embedding_object.index) == mapped.mapped_objects.front(),
+            "shared embedding/head load lost mapped embedding or Device output-head residency");
     fixture.file.root["metadata"]["name"] = "another-training-run-and-recipe";
     fixture.file.root["components"]["text"]["config"]["num_hidden_layers"] = 2;
     fixture.file.root["components"]["text"]["config"]["layer_types"]       = {"full_attention",

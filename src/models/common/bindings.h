@@ -39,6 +39,7 @@ private:
 [[nodiscard]] std::vector<BoundWeight>
 resolve_weights(std::vector<PendingWeight>&& pending,
                 const artifact::MaterializedArtifact& materialized,
-                std::span<const Device> devices);
+                std::span<const Device> devices,
+                std::span<const artifact::HostAccess> host_access = {});
 
 } // namespace ninfer::models

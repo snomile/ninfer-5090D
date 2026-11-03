@@ -110,6 +110,20 @@ foreach(test IN ITEMS scheduler context_cost placement_policy resource_manager c
 endforeach()
 cpu_test(ninfer_metrics_test tests/test_metrics.cpp ninfer_cpu_runtime)
 
+set(cpu_file "${NINFER_SOURCE_DIR}/src/core/io/file.cpp")
+if(APPLE)
+  set(cpu_file "${CMAKE_CURRENT_LIST_DIR}/darwin_file.cpp")
+endif()
+add_library(ninfer_cpu_artifact STATIC ${cpu_file}
+  "${NINFER_SOURCE_DIR}/src/core/buffer.cpp")
+foreach(source IN ITEMS formats layouts reader placement encoded_slice)
+  target_sources(ninfer_cpu_artifact PRIVATE "${NINFER_SOURCE_DIR}/src/artifact/${source}.cpp")
+endforeach()
+cpu_includes(ninfer_cpu_artifact)
+target_link_libraries(ninfer_cpu_artifact PUBLIC ninfer_cpu_frontend_support)
+cpu_test(ninfer_artifact_placement_test tests/artifact/test_placement.cpp ninfer_cpu_artifact)
+target_include_directories(ninfer_artifact_placement_test PRIVATE "${NINFER_SOURCE_DIR}/tests")
+
 get_property(cpu_tests DIRECTORY PROPERTY TESTS)
 file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/fixtures")
 set_tests_properties(${cpu_tests} PROPERTIES

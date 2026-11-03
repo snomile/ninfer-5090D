@@ -26,11 +26,13 @@ private:
     friend std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                          const StartupObserver*);
     ResolvedLoadPlan(const artifact::Reader&, std::shared_ptr<const ModelDefinition>,
-                     artifact::MaterializationPlan, std::vector<Device>, std::vector<Device>);
+                     artifact::MaterializationPlan, std::vector<Device>, std::vector<Device>,
+                     std::vector<artifact::HostAccess>);
     const artifact::Reader* reader_;
     std::shared_ptr<const ModelDefinition> definition_;
     artifact::MaterializationPlan materialization_;
     std::vector<Device> devices_, bank_devices_;
+    std::vector<artifact::HostAccess> host_access_;
 };
 
 [[nodiscard]] ResolvedLoadPlan resolve_load(const artifact::Reader&,

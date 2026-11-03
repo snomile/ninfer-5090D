@@ -7,10 +7,11 @@ namespace ninfer::models::qwen3_5 {
 ResolvedLoadPlan::ResolvedLoadPlan(const artifact::Reader& reader,
                                    std::shared_ptr<const ModelDefinition> definition,
                                    artifact::MaterializationPlan materialization,
-                                   std::vector<Device> devices, std::vector<Device> bank_devices)
+                                   std::vector<Device> devices, std::vector<Device> bank_devices,
+                                   std::vector<artifact::HostAccess> host_access)
     : reader_(&reader), definition_(std::move(definition)),
       materialization_(std::move(materialization)), devices_(std::move(devices)),
-      bank_devices_(std::move(bank_devices)) {}
+      bank_devices_(std::move(bank_devices)), host_access_(std::move(host_access)) {}
 
 ResolvedLoadPlan resolve_load(const artifact::Reader& reader,
                               std::shared_ptr<const ModelDefinition> definition, Device cuda,
@@ -53,15 +54,17 @@ ResolvedLoadPlan resolve_load(const artifact::Reader& reader,
         }
     }
     std::vector<artifact::PlacementRequest> requests;
-    for (std::size_t i = 0; i < devices.size(); ++i)
+    std::vector<artifact::HostAccess> host_access(devices.size());
+    for (std::size_t i = 0; i < devices.size(); ++i) {
+        host_access[i] = mapped[i] ? artifact::HostAccess::CudaMapped
+                       : devices[i] == Device::cpu() ? artifact::HostAccess::CudaTransfer
+                                                    : artifact::HostAccess::CpuOnly;
         for (const auto& part : definition->parameter({i}).binding.parts)
-            requests.push_back({part.object, devices[i],
-                                mapped[i] ? artifact::HostAccess::CudaMapped
-                                : devices[i] == Device::cpu() ? artifact::HostAccess::CudaTransfer
-                                                              : artifact::HostAccess::CpuOnly});
+            requests.push_back({part.object, devices[i], host_access[i]});
+    }
     auto storage = artifact::plan_materialization(reader, requests);
     return {reader, std::move(definition), std::move(storage), std::move(devices),
-            std::move(banks)};
+            std::move(banks), std::move(host_access)};
 }
 
 std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceContext& device,
@@ -77,7 +80,7 @@ std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceCon
         pending.push_back(
             {definition->parameter({i}), description.uses, description.source_objects});
     }
-    auto bound = resolve_weights(std::move(pending), backing, plan.devices_);
+    auto bound = resolve_weights(std::move(pending), backing, plan.devices_, plan.host_access_);
     auto banks = moe::bind_banks(definition->expert_banks(), backing, plan.bank_devices_);
     return std::unique_ptr<ModelShard>(new ModelShard(std::move(definition), std::move(backing),
                                                       std::move(bound), std::move(banks)));

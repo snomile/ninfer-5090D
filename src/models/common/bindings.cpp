@@ -69,12 +69,17 @@ WeightId Bindings::direct(std::string name, artifact::Shape shape, QType format)
 
 std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,
                                          const artifact::MaterializedArtifact& materialized,
-                                         std::span<const Device> devices) {
+                                         std::span<const Device> devices,
+                                         std::span<const artifact::HostAccess> host_access) {
+    if (devices.size() != pending.size() ||
+        (!host_access.empty() && host_access.size() != pending.size()))
+        throw artifact::ArtifactError("weight placement count differs from pending weights");
     std::vector<BoundWeight> out;
     out.reserve(pending.size());
     for (std::size_t i = 0; i < pending.size(); ++i) {
         auto& item = pending[i];
-        auto view  = artifact::bind_view(item.reference, materialized, devices[i]);
+        auto view  = artifact::bind_view(item.reference, materialized, devices[i],
+            host_access.empty() ? artifact::HostAccess::CpuOnly : host_access[i]);
         out.push_back({std::move(item.reference.name), std::move(item.source_objects),
                        std::move(view), std::move(item.uses)});
     }

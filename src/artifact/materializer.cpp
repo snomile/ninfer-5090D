@@ -250,14 +250,21 @@ CudaHostView MaterializedArtifact::host_transfer_view(ObjectHandle handle) const
     return registered.subspan(offset, parent.geometry.bytes);
 }
 
-const WeightParent& MaterializedArtifact::device_parent(ObjectHandle handle) const {
+const WeightParent& MaterializedArtifact::device_parent(ObjectHandle handle, HostAccess access) const {
     if (!has_device(handle)) { throw ArtifactError("object has no device weight backing"); }
-    return *tensors_[object_storage_[handle.index]->index].device;
+    const auto id = *object_storage_[handle.index];
+    const auto& tensor = tensors_[id.index];
+    const auto& value = access == HostAccess::CudaMapped ? tensor.mapped
+                       : tensor.device ? tensor.device : tensor.mapped;
+    if (!value) throw ArtifactError("object has no mapped Host weight backing");
+    return *value;
 }
 
-const WeightParent& MaterializedArtifact::parent(StorageId id, Device device) const {
+const WeightParent& MaterializedArtifact::parent(StorageId id, Device device, HostAccess access) const {
     const auto& tensor = tensors_.at(id.index);
-    const auto& value  = device == Device::cpu() ? tensor.host : tensor.device;
+    const auto& value  = device == Device::cpu() ? tensor.host
+                        : access == HostAccess::CudaMapped ? tensor.mapped
+                        : tensor.device ? tensor.device : tensor.mapped;
     if (!value || value->device != device)
         throw ArtifactError("tensor has no backing on requested device");
     return *value;
@@ -282,7 +289,8 @@ std::span<const std::byte> MaterializedArtifact::host_bytes(ObjectHandle handle)
 
 bool MaterializedArtifact::has_device(ObjectHandle handle) const noexcept {
     return handle.index < object_storage_.size() && object_storage_[handle.index] &&
-           tensors_[object_storage_[handle.index]->index].device.has_value();
+           (tensors_[object_storage_[handle.index]->index].device.has_value() ||
+            tensors_[object_storage_[handle.index]->index].mapped.has_value());
 }
 
 MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
@@ -565,13 +573,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     // Bind aliases only after loading, so copy planning never schedules H2D into mapped memory.
     for (const auto id : plan.mapped_objects) {
         auto& object = out.tensors_.at(id.index);
-        if (!object.host || object.device)
+        if (!object.host || object.mapped)
             throw ArtifactError("invalid mapped Host tensor placement");
         const auto registration = out.host_registration_.view();
         const auto offset = static_cast<std::size_t>(
             object.host->data - static_cast<const std::byte*>(registration.host.data));
         const auto mapped = registration.subspan(offset, object.host->geometry.bytes);
-        object.device = WeightParent{object.host->geometry, plan.device,
+        object.mapped = WeightParent{object.host->geometry, plan.device,
                                      static_cast<const std::byte*>(mapped.device_address), {}};
         out.stats_.mapped_host_bytes += object.host->geometry.bytes;
     }
@@ -581,6 +589,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         validate_divisors(object.weight_divisors, "materialized tensor " + std::to_string(i));
         if (object.host) { object.host->weight_divisors = object.weight_divisors; }
         if (object.device) { object.device->weight_divisors = object.weight_divisors; }
+        if (object.mapped) { object.mapped->weight_divisors = object.weight_divisors; }
     }
     out.stats_.h2d_bytes = uploaded_bytes;
     out.stats_.upload_seconds =

@@ -121,8 +121,6 @@ MaterializationPlan plan_materialization(const Reader& reader,
             } else {
                 device[id.index] = true;
             }
-            if (mapped[id.index] && device[id.index])
-                throw ArtifactError("tensor requests both mapped Host and Device residency");
         }
     }
     LayoutBuilder host_layout, registered_layout, device_layout;

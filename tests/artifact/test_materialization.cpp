@@ -39,9 +39,11 @@ void mapped_placement() {
                 plan.device_capacity_bytes == 0 && plan.registered_host_objects.size() == 1 &&
                 plan.registered_host_bytes >= reader.geometry(matrix).bytes,
             "mapped parent duplicated backing or consumed Device allocation budget");
-    const std::array conflict{requests[0], PlacementRequest{matrix, cuda}};
-    rejects([&] { (void)plan_materialization(reader, conflict); },
-            "mapped and Device residency conflict was accepted");
+    const std::array shared{requests[0], PlacementRequest{matrix, cuda}};
+    const auto dual = plan_materialization(reader, shared);
+    require(dual.mapped_objects.size() == 1 && dual.device_objects.size() == 1 &&
+                dual.registered_host_objects.size() == 1,
+            "shared mapped and Device consumers did not retain both parents");
     const std::array invalid{PlacementRequest{matrix, Device::cpu(), HostAccess::CudaMapped}};
     rejects([&] { (void)plan_materialization(reader, invalid); },
             "mapped Host request without a CUDA destination was accepted");
@@ -61,6 +63,29 @@ void mapped_materialization(DeviceContext& device) {
                 backing.stats().device_capacity_bytes == 0 && backing.stats().h2d_bytes == 0 &&
                 backing.stats().mapped_host_bytes == actual.size(),
             "mapped materialization changed encoded bytes or performed H2D allocation");
+
+    Binder binder(reader);
+    const auto matrix_ref = binder.parameter("matrix", {2, 130});
+    const auto row_ref = binder.parameter("row", {1, 130});
+    const std::array shared{requests[0], PlacementRequest{matrix, device.device()}};
+    auto dual = materialize(reader, plan_materialization(reader, shared), device.transfer_view());
+    const auto embedding = bind_view(matrix_ref, dual, device.device(), HostAccess::CudaMapped);
+    const auto head = bind_view(matrix_ref, dual, device.device());
+    const auto alias = bind_view(row_ref, dual, device.device(), HostAccess::CudaMapped);
+    require(embedding.parts.front().parent->data != head.parts.front().parent->data &&
+                alias.parts.front().parent == embedding.parts.front().parent &&
+                dual.stats().h2d_bytes == actual.size() &&
+                dual.stats().mapped_host_bytes == actual.size() &&
+                dual.stats().device_object_count == 1 && dual.stats().host_object_count == 1,
+            "shared consumers lost residency, duplicated storage or selected the wrong parent");
+    for (const auto* parent : {embedding.parts.front().parent, head.parts.front().parent}) {
+        CUDA_CHECK(cudaMemcpy(actual.data(), parent->data, actual.size(), cudaMemcpyDeviceToHost));
+        require(std::equal(actual.begin(), actual.end(), fixture.payload.begin() + 256),
+                "shared mapped/Device parent changed encoded bytes");
+    }
+    rejects([&] {
+        (void)backing.parent({0}, Device::cuda(device.device().index() + 1), HostAccess::CudaMapped);
+    }, "mapped backing accepted a different CUDA device");
 }
 
 void cpu_materialization() {
