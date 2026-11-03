@@ -127,6 +127,9 @@ public:
 
     void start();
     void record_stop();
+    // Records externally observable timing nodes inside a Graph capture.
+    void start_external();
+    void record_stop_external();
     [[nodiscard]] float elapsed_ms() const;
     float stop_ms();
 

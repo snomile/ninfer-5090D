@@ -100,6 +100,8 @@ add_library(ninfer_cpu_runtime STATIC
   "${NINFER_SOURCE_DIR}/src/runtime/engine/context_cache/placement_policy.cpp"
   "${NINFER_SOURCE_DIR}/src/runtime/observability/execution.cpp"
   "${NINFER_SOURCE_DIR}/src/product/statistics.cpp"
+  "${NINFER_SOURCE_DIR}/src/product/observations.cpp"
+  "${NINFER_SOURCE_DIR}/src/serve/observations.cpp"
   "${NINFER_SOURCE_DIR}/src/serve/metrics.cpp")
 cpu_includes(ninfer_cpu_runtime)
 target_link_libraries(ninfer_cpu_runtime PUBLIC ninfer_cpu_product ninfer_cpu_frontend_support)
