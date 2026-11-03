@@ -167,6 +167,53 @@ std::int64_t steady_ns() {
                Clock::now().time_since_epoch()).count();
 }
 
+void stop_during_availability(bool available) {
+    Pipe ready;
+    const auto pid = ::fork();
+    require(pid >= 0, "failed to fork in-flight shutdown child");
+    if (pid == 0) {
+        ready.reader.close();
+        try {
+            EngineFailureMonitor monitor(1s);
+            std::promise<void> entered, release;
+            auto checked = entered.get_future();
+            auto released = release.get_future();
+            monitor.start([&] {
+                entered.set_value();
+                released.wait();
+                return available;
+            }, [] {});
+            require(checked.wait_for(2s) == std::future_status::ready,
+                    "availability callback did not enter");
+            std::promise<void> stopping;
+            auto started = stopping.get_future();
+            auto shutdown = std::async(std::launch::async, [&] {
+                stopping.set_value();
+                monitor.finish_shutdown();
+            });
+            started.wait();
+            // stop() is blocked joining the callback; hold the result until it has
+            // entered shutdown rather than relying on the periodic polling interval.
+            require(shutdown.wait_for(100ms) == std::future_status::timeout,
+                    "shutdown did not wait for the in-flight availability result");
+            const int in_flight = 1;
+            write_bytes(ready.writer.value, &in_flight, sizeof(in_flight));
+            release.set_value();
+            shutdown.get();
+            std::_Exit(available ? 0 : 91);
+        } catch (...) { std::_Exit(90); }
+    }
+    Child child{pid};
+    ready.writer.close();
+    int in_flight = 0;
+    read_bytes(ready.reader.value, &in_flight, sizeof(in_flight));
+    require(in_flight == 1, "in-flight shutdown was not observed");
+    const auto status = wait_child(child, Clock::now() + 3s);
+    require(WIFEXITED(status) && WEXITSTATUS(status) == (available ? 0 : EXIT_FAILURE),
+            available ? "healthy in-flight shutdown forced failure"
+                      : "in-flight failure was erased by stopping");
+}
+
 void deadline_exit(bool production_default) {
     Pipe ready;
     const auto pid = ::fork();
@@ -365,6 +412,8 @@ int main() {
     ::signal(SIGPIPE, SIG_IGN);
     try {
         lifecycle();
+        stop_during_availability(true);
+        stop_during_availability(false);
         deadline_exit(false);
         deadline_exit(true);
         http_drain(HttpScenario::SlowUpload);

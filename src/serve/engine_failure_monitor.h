@@ -36,9 +36,11 @@ public:
                 lock.unlock();
                 const bool available = is_available();
                 lock.lock();
+                // A shutdown racing an in-flight check still has to report failure.
+                // finish_shutdown() joins us and checks this state before cleanup.
+                if (!available) failed_.store(true, std::memory_order_release);
                 if (stopping_) return;
                 if (!available) {
-                    failed_.store(true, std::memory_order_release);
                     const auto deadline = std::chrono::steady_clock::now() + shutdown_grace_;
                     lock.unlock();
                     stop_accepting();
