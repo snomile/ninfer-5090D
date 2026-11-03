@@ -124,6 +124,12 @@ target_link_libraries(ninfer_cpu_artifact PUBLIC ninfer_cpu_frontend_support)
 cpu_test(ninfer_artifact_placement_test tests/artifact/test_placement.cpp ninfer_cpu_artifact)
 target_include_directories(ninfer_artifact_placement_test PRIVATE "${NINFER_SOURCE_DIR}/tests")
 
+cpu_test(ninfer_executor_observations_test tests/runtime/test_executor_observations.cpp
+  ninfer_cpu_runtime)
+target_sources(ninfer_executor_observations_test PRIVATE
+  "${NINFER_SOURCE_DIR}/src/distributed/wire.cpp"
+  "${NINFER_SOURCE_DIR}/src/runtime/executor/observations.cpp")
+
 get_property(cpu_tests DIRECTORY PROPERTY TESTS)
 file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/fixtures")
 set_tests_properties(${cpu_tests} PROPERTIES

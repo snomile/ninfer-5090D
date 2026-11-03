@@ -40,9 +40,22 @@ ninfer_add_test(ninfer_qwen3_5_preemption_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_preemption_real.cpp"
   LIBRARIES ninfer_model_execution ninfer_engine ninfer::json)
 
-ninfer_add_test(ninfer_qwen3_5_fairness_real_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_fairness_real.cpp"
-  LIBRARIES ninfer_model_execution ninfer_engine)
+add_test(NAME ninfer_qwen3_5_preemption_dflash2_real_test
+  COMMAND ninfer_qwen3_5_preemption_real_test)
+set_tests_properties(ninfer_qwen3_5_preemption_dflash2_real_test PROPERTIES
+  ENVIRONMENT "NINFER_TEST_BACKEND=dflash2;NINFER_TEST_PROPOSAL_HEAD=optimized")
+
+add_executable(ninfer_qwen3_5_fairness_real_test
+  "${CMAKE_CURRENT_LIST_DIR}/test_engine_fairness_real.cpp")
+ninfer_test_includes(ninfer_qwen3_5_fairness_real_test)
+target_link_libraries(ninfer_qwen3_5_fairness_real_test PRIVATE
+  ninfer_model_execution ninfer_engine)
+add_test(NAME ninfer_qwen3_5_fairness_real_test
+  COMMAND ninfer_qwen3_5_fairness_real_test mtp)
+add_test(NAME ninfer_qwen3_5_fairness_dflash2_real_test
+  COMMAND ninfer_qwen3_5_fairness_real_test dflash2)
+set_tests_properties(ninfer_qwen3_5_fairness_real_test
+  ninfer_qwen3_5_fairness_dflash2_real_test PROPERTIES TIMEOUT 300)
 
 ninfer_add_test(ninfer_qwen3_5_grammar_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_grammar_real.cpp"
@@ -95,7 +108,9 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_terminal_publication_real_test
   ninfer_qwen3_5_agent_continuation_real_test
   ninfer_qwen3_5_preemption_real_test
+  ninfer_qwen3_5_preemption_dflash2_real_test
   ninfer_qwen3_5_fairness_real_test
+  ninfer_qwen3_5_fairness_dflash2_real_test
   ninfer_qwen3_5_grammar_real_test
   ninfer_qwen3_5_tools_real_test
   ninfer_qwen3_5_score_real_test

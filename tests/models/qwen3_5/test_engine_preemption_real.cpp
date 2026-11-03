@@ -97,7 +97,7 @@ ninfer::EngineOptions engine_options(const std::filesystem::path& artifact,
     options.max_pending_requests = 2;
     options.speculative.backend  = selected;
     if (selected != ninfer::SpeculativeBackend::None) {
-        options.speculative.draft_tokens = 3;
+        options.speculative.draft_tokens = selected == ninfer::SpeculativeBackend::DFlash2 ? 7 : 3;
         const auto head                  = setting("NINFER_TEST_PROPOSAL_HEAD", "optimized");
         require(head == "full" || head == "optimized", "unknown test proposal head");
         options.speculative.proposal_head =

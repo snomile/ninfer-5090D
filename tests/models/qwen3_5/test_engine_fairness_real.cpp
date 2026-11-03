@@ -8,6 +8,7 @@
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 
 namespace {
@@ -31,15 +32,17 @@ RequestOptions request(std::uint32_t tokens) {
 // Run the public Engine and the production Native allocator/executor. The observable
 // acceptance condition is repeated new progress for BOTH requests before either ends.
 // A short request arriving during pressure must retain its pending deadline.
-void exercise(const char* artifact, bool snapshot) {
+void exercise(const char* artifact, bool snapshot, SpeculativeBackend backend) {
     EngineOptions options;
     options.artifact_path                     = artifact;
     options.max_concurrency                   = 2;
     options.max_pending_requests              = 2;
     options.prefill_chunk                     = 128;
     options.kv_cache                          = KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
-    options.speculative.backend               = SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens          = 3;
+    options.speculative.backend               = backend;
+    options.speculative.draft_tokens          = backend == SpeculativeBackend::DFlash2 ? 7 : 3;
+    if (backend == SpeculativeBackend::DFlash2)
+        options.speculative.proposal_head = ProposalHead::Optimized;
     options.context_cache.enabled             = false;
     options.context_cache.host_capacity_bytes = snapshot ? 512ULL << 20 : 0;
     const auto prompt_tokens = test::qwen3_5::configure_two_request_pressure(options, 256);
@@ -131,12 +134,18 @@ void exercise(const char* artifact, bool snapshot) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (!artifact || !*artifact) return 77;
     try {
-        exercise(artifact, true);
-        exercise(artifact, false);
+        const std::string_view mode = argc > 1 ? argv[1] : "mtp";
+        if (argc > 2 || (mode != "mtp" && mode != "dflash2"))
+            throw std::invalid_argument("fairness mode must be mtp or dflash2");
+        const auto backend = mode == "mtp" ? SpeculativeBackend::Mtp : SpeculativeBackend::DFlash2;
+        std::cout << "fairness mode=" << mode << " draft_tokens="
+                  << (backend == SpeculativeBackend::DFlash2 ? 7 : 3) << '\n';
+        exercise(artifact, true, backend);
+        exercise(artifact, false, backend);
     } catch (const std::exception& error) {
         std::cerr << "Engine fairness test failed: " << error.what() << '\n';
         return 1;

@@ -18,6 +18,12 @@ ninfer_add_test(ninfer_context_capacity_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_context_capacity.cpp"
   LIBRARIES ninfer_runtime_support)
 
+ninfer_add_test(ninfer_executor_observations_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_executor_observations.cpp"
+          "${PROJECT_SOURCE_DIR}/src/distributed/wire.cpp"
+          "${PROJECT_SOURCE_DIR}/src/runtime/executor/observations.cpp"
+  LIBRARIES ninfer_runtime_support)
+
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_sampling_defaults.cpp"
   LIBRARIES ninfer_engine ninfer_core)
