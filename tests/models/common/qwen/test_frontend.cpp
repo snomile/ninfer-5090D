@@ -1277,6 +1277,94 @@ int test_vision_item_limit() {
     return failures;
 }
 
+int test_small_image_item_limit() {
+    int failures = 0;
+    for (const auto cap : {1U, 2U, 4U, 8U}) {
+        for (const auto dimensions :
+             {std::pair{256, 32}, std::pair{32, 256}, std::pair{8, 4},
+              std::pair{4, 8}, std::pair{31, 33}, std::pair{64, 64},
+              std::pair{199, 1}}) {
+            try {
+                ninfer::models::frontend::FrontendOptions options;
+                options.vision_enabled = true;
+                options.max_context = 16384;
+                options.max_vision_item_tokens = cap;
+                const auto frontend = make_frontend(resources(), options);
+                const auto input = image_text_input(
+                    block_ppm(dimensions.first, dimensions.second, 42), {}, "small-budget.ppm");
+                const auto counted = frontend.count_tokens(input);
+                const auto prepared = frontend.prepare(input);
+                const auto& data = FrontendFactory::inspect(prepared);
+                const auto& item = data.vision_items.at(0);
+                failures += check(data.token_ids.size() == counted && item.patch_count >= 4 &&
+                                      item.patch_count <= 4 * cap && item.grid.height >= 2 &&
+                                      item.grid.width >= 2 && item.grid.height % 2 == 0 &&
+                                      item.grid.width % 2 == 0,
+                                  "small image budget violates geometry or inspect/prepare parity");
+                if (dimensions == std::pair{256, 32})
+                    failures += check(item.patch_count == 4 * cap,
+                                      "landscape image did not retain the usable budget");
+            } catch (const std::exception& error) {
+                std::cerr << "small image cap=" << cap << " dimensions=" << dimensions.first
+                          << 'x' << dimensions.second << ": " << error.what() << '\n';
+                ++failures;
+            }
+        }
+    }
+    const auto frontend = make_frontend(resources());
+    failures += check(throws_invalid_argument([&] {
+        (void)frontend.prepare(image_text_input(block_ppm(201, 1, 42), {}, "bad-aspect.ppm"));
+    }), "invalid image aspect ratio was accepted");
+    return failures;
+}
+
+int test_video_item_limit() {
+    int failures = 0;
+    struct Case { int frames, width, height; std::uint32_t cap, expected; };
+    for (const auto c : {Case{1, 256, 256, 64, 64}, Case{2, 256, 256, 64, 64},
+                         Case{63, 256, 256, 2048, 2048}, Case{64, 256, 256, 2048, 2048},
+                         Case{64, 256, 256, 512, 512}, Case{5, 256, 64, 48, 48},
+                         Case{5, 64, 256, 48, 48}, Case{5, 256, 256, 4, 3}}) {
+        try {
+            // A generated, lossless Y4M stream exercises the actual FFmpeg decoder,
+            // source-frame sampler and temporal padding without external fixture files.
+            const auto header = "YUV4MPEG2 W" + std::to_string(c.width) + " H" +
+                std::to_string(c.height) + " F2:1 Ip A1:1 C420jpeg\n";
+            std::vector<std::uint8_t> bytes(header.begin(), header.end());
+            for (int frame = 0; frame < c.frames; ++frame) {
+                const std::string marker = "FRAME\n";
+                bytes.insert(bytes.end(), marker.begin(), marker.end());
+                bytes.insert(bytes.end(), c.width * c.height, 64 + frame);
+                bytes.insert(bytes.end(), c.width * c.height / 2, 128);
+            }
+            auto input = image_text_input(std::move(bytes), {}, "budget.y4m");
+            auto& media = input.messages.front().parts.front().media;
+            media.kind = ninfer::MediaKind::Video;
+            media.media_type = "video/x-yuv4mpeg";
+            ninfer::models::frontend::FrontendOptions options;
+            options.vision_enabled = true;
+            options.max_context = 16384;
+            options.max_vision_item_tokens = c.cap;
+            const auto frontend = make_frontend(resources(), options);
+            const auto counted = frontend.count_tokens(input);
+            const auto prepared = frontend.prepare(input);
+            const auto& data = FrontendFactory::inspect(prepared);
+            const auto& item = data.vision_items.at(0);
+            failures += check(data.token_ids.size() == counted &&
+                                  item.grid.temporal == (c.frames + 1) / 2 &&
+                                  item.patch_count == 4 * c.expected &&
+                                  data.prepare.vision_tokens == c.expected &&
+                                  item.patch_count <= 4 * c.cap,
+                              "video budget lost detail, exceeded its cap or changed on prepare");
+        } catch (const std::exception& error) {
+            std::cerr << "video frames=" << c.frames << " cap=" << c.cap << ": "
+                      << error.what() << '\n';
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 int test_text_and_image_prepare(const Frontend& frontend) {
     ninfer::ChatMessage text_message;
     text_message.role = ninfer::ChatRole::User;
@@ -2992,6 +3080,8 @@ int main() {
     failures += test_text_and_image_prepare(frontend);
     failures += test_media_token_ids_come_from_tokenizer();
     failures += test_vision_item_limit();
+    failures += test_small_image_item_limit();
+    failures += test_video_item_limit();
     failures += test_template_media_contract();
     failures += test_image_resize_rejection_policy();
     failures += test_explicit_leading_instruction_cache_boundary();

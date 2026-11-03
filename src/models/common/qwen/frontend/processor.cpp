@@ -72,6 +72,23 @@ std::uint64_t checked_mul(std::uint64_t a, std::uint64_t b, std::string_view lab
 
 int round_even(double value) { return static_cast<int>(std::nearbyint(value)); }
 
+Size fit_spatial_budget(Size size, int height, int width, std::uint64_t max_pixels) {
+    size.h = std::max(kFactor, size.h);
+    size.w = std::max(kFactor, size.w);
+    if (checked_mul(size.h, size.w, "resized area") <= max_pixels) return size;
+    const auto cells = max_pixels / (kFactor * kFactor);
+    if (!cells)
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "media pixel budget cannot hold the minimum spatial patch");
+    const auto w = std::clamp<std::uint64_t>(
+        static_cast<std::uint64_t>(std::sqrt(static_cast<double>(cells) * width / height)),
+        1, cells);
+    const auto h = std::clamp<std::uint64_t>(
+        static_cast<std::uint64_t>(std::sqrt(static_cast<double>(cells) * height / width)),
+        1, cells / w);
+    return {static_cast<int>(h * kFactor), static_cast<int>(w * kFactor)};
+}
+
 Size smart_resize_image(int height, int width, std::uint64_t min_pixels, std::uint64_t max_pixels) {
     if (height <= 0 || width <= 0 || min_pixels == 0 || max_pixels < min_pixels) {
         throw std::invalid_argument("invalid image resize configuration");
@@ -92,7 +109,7 @@ Size smart_resize_image(int height, int width, std::uint64_t min_pixels, std::ui
         h = static_cast<int>(std::ceil(height * beta / kFactor)) * kFactor;
         w = static_cast<int>(std::ceil(width * beta / kFactor)) * kFactor;
     }
-    return {h, w};
+    return fit_spatial_budget({h, w}, height, width, max_pixels);
 }
 
 Size smart_resize_video(int frames, int height, int width, std::uint64_t min_pixels,
@@ -112,16 +129,16 @@ Size smart_resize_video(int frames, int height, int width, std::uint64_t min_pix
         checked_mul(static_cast<std::uint64_t>(h), static_cast<std::uint64_t>(w), "video area"),
         "video pixels");
     if (volume > max_pixels) {
-        const double beta = std::sqrt(static_cast<double>(frames) * height * width / max_pixels);
+        const double beta = std::sqrt(static_cast<double>(padded_frames) * height * width / max_pixels);
         h = std::max(kFactor, static_cast<int>(std::floor(height / beta / kFactor)) * kFactor);
         w = std::max(kFactor, static_cast<int>(std::floor(width / beta / kFactor)) * kFactor);
     } else if (volume < min_pixels) {
         const double beta = std::sqrt(static_cast<double>(min_pixels) /
-                                      (static_cast<double>(frames) * height * width));
+                                      (static_cast<double>(padded_frames) * height * width));
         h                 = static_cast<int>(std::ceil(height * beta / kFactor)) * kFactor;
         w                 = static_cast<int>(std::ceil(width * beta / kFactor)) * kFactor;
     }
-    return {h, w};
+    return fit_spatial_budget({h, w}, height, width, max_pixels / padded_frames);
 }
 
 std::uint16_t to_bf16(float value) noexcept {

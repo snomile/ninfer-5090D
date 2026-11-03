@@ -254,7 +254,8 @@ public:
         const std::uint64_t pixels = processor.max_item_vision_tokens * 32ULL * 32ULL;
         processor.image_max_pixels = std::min(processor.image_max_pixels, pixels);
         processor.image_min_pixels = std::min(processor.image_min_pixels, processor.image_max_pixels);
-        processor.video_max_pixels = std::min(processor.video_max_pixels, pixels);
+        // Video pixels count both frames in each temporal patch.
+        processor.video_max_pixels = std::min(processor.video_max_pixels, pixels * 2);
         processor.video_min_pixels = std::min(processor.video_min_pixels, processor.video_max_pixels);
         if (vision_enabled) {
             const std::uint64_t minimum_live =
