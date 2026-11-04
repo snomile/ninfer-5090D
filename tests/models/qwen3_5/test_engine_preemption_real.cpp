@@ -225,10 +225,12 @@ public:
         require(result.stats.reused_prompt_tokens == 0 &&
                     result.stats.prefix_reuse_path == ninfer::PrefixReusePath::Root,
                 "self recovery was incorrectly reported as an initial history hit");
+        const auto expected_draft_window = selected == ninfer::SpeculativeBackend::DFlash2 ? 7 : 3;
         require(
             result.stats.speculative.backend == selected &&
                 (selected == ninfer::SpeculativeBackend::None ||
-                 (result.stats.speculative.enabled && result.stats.speculative.draft_window == 3 &&
+                 (result.stats.speculative.enabled &&
+                  result.stats.speculative.draft_window == expected_draft_window &&
                   result.stats.speculative.rounds + result.stats.speculative.fallback_steps != 0)),
             "request did not execute the selected backend");
         require(result.stats.timings.first_token_seconds > 0.0 &&
