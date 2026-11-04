@@ -22,8 +22,9 @@
 
 namespace {
 
-constexpr std::uint32_t kOutputTokens    = 256;
-constexpr std::size_t kSnapshotHostBytes = 512ULL << 20;
+constexpr std::uint32_t kOutputTokens         = 1024;
+constexpr std::uint32_t kPressureGrowthTokens = 256;
+constexpr std::size_t kSnapshotHostBytes      = 512ULL << 20;
 const ninfer::GenerationObservationOptions kObservations{
     .constraint_timings = true, .live_timings = true, .prompt_progress = true};
 
@@ -312,7 +313,30 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
               CancelStage cancel_stage = CancelStage::None) {
     auto options = engine_options(artifact, selected, snapshot);
     const auto prompt_tokens =
-        ninfer::test::qwen3_5::configure_two_request_pressure(options, kOutputTokens);
+        ninfer::test::qwen3_5::configure_two_request_pressure(options, kPressureGrowthTokens);
+    require(prompt_tokens + kOutputTokens < options.max_context,
+            "pressure fixture's complete request exceeds max_context");
+    // Speculative lanes can advance at different rates. Keep both initial histories resident,
+    // but require pressure even if one lane grows alone before reaching its output limit.
+    // Equal 256-token output budgets could let the faster lane retire and release its pages
+    // before the slower lane reached the symmetric growth boundary used by the planner.
+    const auto plan            = ninfer::test::qwen3_5::context_capacity_plan(options);
+    const auto geometry        = ninfer::describe_context_pool(plan.records);
+    constexpr auto page_tokens = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+    const auto initial_pages   = (prompt_tokens + page_tokens - 1) / page_tokens;
+    const auto grown_pages =
+        (prompt_tokens + kOutputTokens - options.speculative.draft_tokens - 1 +
+         page_tokens - 1) / page_tokens;
+    std::vector<ninfer::RecordRequest> asymmetric_demand{{geometry.spec_classes.at(0), 2}};
+    for (std::size_t index = 1; index < geometry.spec_classes.size(); ++index)
+        asymmetric_demand.push_back({geometry.spec_classes[index], initial_pages + grown_pages});
+    const auto asymmetric_bytes = geometry.required_bytes(asymmetric_demand);
+    require(asymmetric_bytes > options.context_capacity.explicit_bytes,
+            "one lane can finish before the fixture is forced to recover");
+    std::cout << "pressure backend=" << backend_name << " prompt_tokens=" << prompt_tokens
+              << " output_tokens=" << kOutputTokens
+              << " context_bytes=" << options.context_capacity.explicit_bytes
+              << " asymmetric_bytes=" << asymmetric_bytes << '\n';
     ninfer::Engine engine(options);
     const auto before = engine.snapshot().runtime;
     const auto device =
