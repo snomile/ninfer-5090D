@@ -48,7 +48,7 @@ void snapshot() {
                 result.memory.vision->weight_staging_bytes == 104,
             "rank snapshot lost mapped, registered or staging fields");
     rejects([&] {
-        wire::Decoder truncated(std::span(bytes).first(bytes.size() - 1));
+        wire::Decoder truncated{std::span(bytes).first(bytes.size() - 1)};
         (void)protocol::rank_snapshot(truncated);
     });
 }
@@ -87,7 +87,7 @@ void completion() {
                         result.attention->work.scheduled_positions == 5,
                     "completion changed attention work");
         rejects([&] {
-            wire::Decoder truncated(std::span(bytes).first(bytes.size() - 1));
+            wire::Decoder truncated{std::span(bytes).first(bytes.size() - 1)};
             (void)protocol::rank_execution_observation(truncated);
         });
     }
