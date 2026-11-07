@@ -72,7 +72,9 @@ RUN set -eu; \
             ninfer_resource_manager_test ninfer_context_capacity_test \
             ninfer_serve_options_test ninfer_cli_options_test ninfer_openai_schema_test \
             ninfer_openai_responses_test ninfer_anthropic_schema_test \
-            ninfer_metrics_test ninfer_request_log_test ninfer_engine_failure_monitor_test; \
+            ninfer_metrics_test ninfer_request_log_test ninfer_engine_failure_monitor_test \
+            ninfer_pretty_logging_test ninfer_async_logging_test \
+            ninfer_request_timeline_events_test; \
     fi; \
     rm /usr/local/cuda/lib64/libcuda.so.1
 
