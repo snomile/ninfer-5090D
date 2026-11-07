@@ -188,6 +188,7 @@ struct RequestRecord {
     const GenerationObservationOptions observation;
     Clock::time_point deadline;
     Clock::time_point submitted;
+    bool prefill_observed = false;
     std::optional<Clock::time_point> admitted_at;
     std::optional<Clock::time_point> first_token;
     std::optional<Clock::time_point> last_token;

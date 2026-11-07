@@ -8,9 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <fstream>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 
@@ -70,18 +68,34 @@ std::string format_throughput_json(const std::string& server_instance_id,
 
 ServerLogEnvironment query_server_log_environment(int device);
 
+struct RequestLogStatistics {
+    std::uint64_t written_records = 0;
+    std::uint64_t dropped_records = 0;
+    std::uint64_t write_errors = 0;
+    std::size_t queued_records = 0;
+    std::size_t queued_bytes = 0;
+};
+
 // Opens in append mode so one campaign file can contain multiple independently started MTP/model
 // blocks. Every line carries server_instance_id because request ids restart at one per process.
+// Producers only enqueue bounded owned records; one worker writes and flushes every 250ms or
+// 256KiB. Saturation drops new records, reports cumulative loss, and never waits for disk.
+// Destruction drains accepted records and flushes; abrupt process termination can lose the tail.
 class JsonlRequestLog {
 public:
+    static constexpr std::size_t kMaxQueuedRecords = 4096;
+    static constexpr std::size_t kMaxQueuedBytes = 8 * 1024 * 1024;
+
     explicit JsonlRequestLog(std::string server_instance_id, const std::string& path,
                              const std::string& protected_artifact_path = {},
                              std::shared_ptr<spdlog::logger> logger     = {});
+    ~JsonlRequestLog();
 
     JsonlRequestLog(const JsonlRequestLog&)            = delete;
     JsonlRequestLog& operator=(const JsonlRequestLog&) = delete;
 
-    [[nodiscard]] bool enabled() const noexcept { return output_.is_open(); }
+    [[nodiscard]] bool enabled() const noexcept;
+    [[nodiscard]] RequestLogStatistics statistics() const;
 
     [[nodiscard]] const std::string& server_instance_id() const noexcept {
         return server_instance_id_;
@@ -105,12 +119,9 @@ public:
 private:
     void append(std::string record);
 
-    std::string path_;
+    struct Impl;
     std::string server_instance_id_;
-    std::ofstream output_;
-    std::mutex mutex_;
-    std::shared_ptr<spdlog::logger> logger_;
-    bool failed_ = false;
+    std::unique_ptr<Impl> impl_;
 };
 
 } // namespace ninfer::serve

@@ -19,7 +19,7 @@ add_library(ninfer_product_logging STATIC
   observations.cpp
 )
 ninfer_internal_includes(ninfer_product_logging)
-target_link_libraries(ninfer_product_logging PUBLIC spdlog::spdlog ninfer::json)
+target_link_libraries(ninfer_product_logging PUBLIC spdlog::spdlog ninfer::json Threads::Threads)
 
 add_library(ninfer_product_config STATIC
   config/options.cpp

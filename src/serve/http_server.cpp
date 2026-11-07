@@ -33,10 +33,16 @@ bool is_openai_path(std::string_view path) {
 }
 
 void ensure_http_request_id(const httplib::Request& request, httplib::Response& response) {
+    const auto proxy_id = request.get_header_value("X-Proxy-Request-Id");
+    const bool valid_proxy_id = !proxy_id.empty() && proxy_id.size() <= 96 &&
+        std::all_of(proxy_id.begin(), proxy_id.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+        });
     if (is_anthropic_path(request.path) && !response.has_header("request-id")) {
-        response.set_header("request-id", new_anthropic_request_id());
+        response.set_header("request-id", valid_proxy_id ? proxy_id : new_anthropic_request_id());
     } else if (is_openai_path(request.path) && !response.has_header("x-request-id")) {
-        response.set_header("x-request-id", new_openai_request_id());
+        response.set_header("x-request-id", valid_proxy_id ? proxy_id : new_openai_request_id());
     }
 }
 

@@ -134,6 +134,7 @@ EngineCore<Instance>::record_committed_output(const std::shared_ptr<Request>& re
     const Clock::time_point now = Clock::now();
     if (!request->first_token) {
         request->first_token = now;
+        observe_scheduling(request, GenerationSchedulingTransition::FirstToken, now);
         if (request->observation.first_token) {
             GenerationFirstTokenObservation observation{
                 .prepare_seconds = request->prepare_seconds,

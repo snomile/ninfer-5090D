@@ -36,6 +36,8 @@ add_library(ninfer_cpu_product STATIC
   "${NINFER_SOURCE_DIR}/src/product/logging/logging.cpp"
   "${NINFER_SOURCE_DIR}/src/product/logging/configuration.cpp"
   "${NINFER_SOURCE_DIR}/src/product/logging/pretty_format.cpp")
+target_sources(ninfer_cpu_product PRIVATE
+  "${NINFER_SOURCE_DIR}/src/product/logging/startup_log.cpp")
 foreach(source IN ITEMS options schema file configuration)
   target_sources(ninfer_cpu_product PRIVATE
     "${NINFER_SOURCE_DIR}/src/product/config/${source}.cpp")
@@ -73,6 +75,7 @@ foreach(protocol IN ITEMS openai_schema openai_responses openai_responses_store 
 endforeach()
 cpu_test(ninfer_cli_options_test tests/test_cli_options.cpp ninfer_cpu_product)
 cpu_test(ninfer_serve_options_test tests/test_serve_options.cpp ninfer_cpu_protocol)
+cpu_test(ninfer_pretty_logging_test tests/test_pretty_logging.cpp ninfer_cpu_product)
 cpu_test(ninfer_engine_failure_monitor_test tests/test_engine_failure_monitor.cpp Threads::Threads)
 target_include_directories(ninfer_engine_failure_monitor_test PRIVATE
   "${NINFER_SOURCE_DIR}/third_party/cpp-httplib")
@@ -102,6 +105,7 @@ add_library(ninfer_cpu_runtime STATIC
   "${NINFER_SOURCE_DIR}/src/product/statistics.cpp"
   "${NINFER_SOURCE_DIR}/src/product/observations.cpp"
   "${NINFER_SOURCE_DIR}/src/serve/observations.cpp"
+  "${NINFER_SOURCE_DIR}/src/serve/request_log.cpp"
   "${NINFER_SOURCE_DIR}/src/serve/metrics.cpp")
 cpu_includes(ninfer_cpu_runtime)
 target_link_libraries(ninfer_cpu_runtime PUBLIC ninfer_cpu_product ninfer_cpu_frontend_support)
@@ -109,6 +113,9 @@ foreach(test IN ITEMS scheduler context_cost placement_policy resource_manager c
   cpu_test(ninfer_${test}_test tests/runtime/test_${test}.cpp ninfer_cpu_runtime)
 endforeach()
 cpu_test(ninfer_metrics_test tests/test_metrics.cpp ninfer_cpu_runtime)
+cpu_test(ninfer_request_timeline_events_test tests/test_request_timeline_events.cpp ninfer_cpu_runtime)
+cpu_test(ninfer_async_logging_test tests/test_async_logging.cpp ninfer_cpu_runtime)
+set_tests_properties(ninfer_async_logging_test PROPERTIES TIMEOUT 30)
 
 set(cpu_file "${NINFER_SOURCE_DIR}/src/core/io/file.cpp")
 if(APPLE)

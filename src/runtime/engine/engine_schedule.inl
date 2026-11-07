@@ -749,6 +749,8 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
                     elapsed_ns(request->submitted, *request->admitted_at);
                 request->queue_wait_recorded = true;
                 publish_generation_start(request, begin);
+                observe_scheduling(request, GenerationSchedulingTransition::Admitted,
+                                   binding_started);
             }
             return true;
         }
@@ -796,11 +798,15 @@ void EngineCore<Instance>::observe_scheduling(const std::shared_ptr<Request>& re
         .request_prefill_tokens  = request->computed_prompt_tokens,
         .request_decode_tokens   = request->committed_decode_tokens,
         .request_replayed_tokens = request->replayed_tokens,
+        .reused_prompt_tokens    = request->admitted_begin
+                                       ? request->admitted_begin->reused_prompt_tokens : 0,
+        .device_to_host_bytes    = request->device_to_host_bytes,
+        .host_to_device_bytes    = request->host_to_device_bytes,
     };
+    auto event = std::make_unique<GenerationSchedulingObservation>(observation);
     {
         std::lock_guard lock(request->mutex);
-        request->events.emplace_back(
-            std::make_unique<GenerationSchedulingObservation>(observation));
+        request->events.emplace_back(std::move(event));
     }
     request->cv.notify_one();
 }

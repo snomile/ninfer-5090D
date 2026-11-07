@@ -50,8 +50,17 @@ ninfer_add_test(ninfer_request_log_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_request_log.cpp"
   LIBRARIES ninfer_serve)
 
+ninfer_add_test(ninfer_async_logging_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_async_logging.cpp"
+  LIBRARIES ninfer_serve)
+set_tests_properties(ninfer_async_logging_test PROPERTIES TIMEOUT 30)
+
 ninfer_add_test(ninfer_metrics_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_metrics.cpp"
+  LIBRARIES ninfer_serve)
+
+ninfer_add_test(ninfer_request_timeline_events_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_request_timeline_events.cpp"
   LIBRARIES ninfer_serve)
 
 ninfer_add_test(ninfer_engine_failure_monitor_test

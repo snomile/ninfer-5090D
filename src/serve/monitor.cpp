@@ -68,6 +68,13 @@ void HttpServer::register_monitor_routes() {
         auto out       = identity(observations_);
         out["engine"]  = product::observation_json(snapshot, now);
         out["service"] = service_observation_json(observations_.snapshot(true));
+        const auto log = request_jsonl_.statistics();
+        out["request_log"] = {{"enabled", request_jsonl_.enabled()},
+                             {"written_records", log.written_records},
+                             {"dropped_records", log.dropped_records},
+                             {"write_errors", log.write_errors},
+                             {"queued_records", log.queued_records},
+                             {"queued_bytes", log.queued_bytes}};
         res.set_header("Cache-Control", "no-store");
         res.set_content(out.dump(), "application/json");
     });

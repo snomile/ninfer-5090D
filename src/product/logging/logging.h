@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <cstddef>
 #include <string>
 #include <string_view>
 
@@ -63,8 +64,10 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// Application-owned operational logger lifetime. Construction does not mutate spdlog's global
-// default logger or registry; producers receive and retain the returned explicit shared handle.
+// Application-owned operational logger lifetime. Service logs use a private bounded spdlog
+// worker; overflow drops new records. Destruction drains the worker before flushing the sink.
+// Producers must stop before the runtime is destroyed. Tools retain synchronous terminal output.
+// Construction does not mutate spdlog's global default logger or registry.
 class LoggingRuntime {
 public:
     explicit LoggingRuntime(LoggingOptions options);
@@ -77,6 +80,7 @@ public:
 
     [[nodiscard]] std::shared_ptr<spdlog::logger> logger() const noexcept;
     [[nodiscard]] std::shared_ptr<TerminalProgress> terminal_progress() const noexcept;
+    [[nodiscard]] std::size_t dropped_records() const;
     void flush() noexcept;
 
 private:

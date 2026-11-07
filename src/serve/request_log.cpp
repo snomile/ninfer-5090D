@@ -6,19 +6,25 @@
 
 #include <spdlog/logger.h>
 
-#include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
+#include <type_traits>
 #include <utility>
+#include <variant>
 
 #include <unistd.h>
 
@@ -45,21 +51,6 @@ std::filesystem::path normalized_absolute_path(const std::string& value) {
     error.clear();
     path = std::filesystem::absolute(value, error);
     return error ? std::filesystem::path(value).lexically_normal() : path.lexically_normal();
-}
-
-std::string cuda_version_string(int version) {
-    if (version <= 0) { return {}; }
-    return std::to_string(version / 1000) + '.' + std::to_string((version % 1000) / 10);
-}
-
-std::string cuda_uuid_string(const cudaUUID_t& uuid) {
-    std::ostringstream out;
-    out << "GPU-" << std::hex << std::setfill('0');
-    for (int i = 0; i < 16; ++i) {
-        if (i == 4 || i == 6 || i == 8 || i == 10) { out << '-'; }
-        out << std::setw(2) << static_cast<unsigned int>(static_cast<unsigned char>(uuid.bytes[i]));
-    }
-    return out.str();
 }
 
 const char* finish_reason_name(ninfer::FinishReason reason) {
@@ -94,6 +85,8 @@ std::string tool_choice_name(const ToolChoice& choice) {
         return "auto";
     case ToolChoiceMode::None:
         return "none";
+    case ToolChoiceMode::Required:
+        return "required";
     }
     return "unknown";
 }
@@ -152,6 +145,12 @@ const char* scheduling_transition_name(ninfer::GenerationSchedulingTransition tr
         return "snapshot_revoked";
     case Transition::Terminal:
         return "terminal";
+    case Transition::Admitted:
+        return "admitted";
+    case Transition::PrefillStarted:
+        return "prefill_started";
+    case Transition::FirstToken:
+        return "decode_started";
     }
     throw std::logic_error("invalid scheduling transition");
 }
@@ -597,6 +596,9 @@ format_request_scheduling_json(const std::string& server_instance_id,
     record["steady_ns"]         = observation.steady_ns;
     record["elapsed_ns"]        = observation.elapsed_ns;
     record["preemption_index"]  = observation.preemption_index;
+    record["prefix_cache_hit_tokens"] = observation.reused_prompt_tokens;
+    record["device_to_host_bytes"] = observation.device_to_host_bytes;
+    record["host_to_device_bytes"] = observation.host_to_device_bytes;
     record["progress"]          = Json{
                  {"global_prefill_tokens", observation.global_prefill_tokens},
                  {"global_decode_tokens", observation.global_decode_tokens},
@@ -827,66 +829,163 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
     return record.dump();
 }
 
-ServerLogEnvironment query_server_log_environment(int device) {
-    ServerLogEnvironment environment;
-    environment.device               = device;
-    environment.cuda_compile_version = cuda_version_string(CUDART_VERSION);
+struct JsonlRequestLog::Impl {
+    struct SchedulingRecord {
+        std::uint64_t timestamp, request_id;
+        std::string http_request_id;
+        GenerationSchedulingObservation observation;
+    };
+    using Record = std::variant<std::string, SchedulingRecord>;
+    struct Pending {
+        Record record;
+        std::size_t bytes;
+    };
 
-    int runtime_version = 0;
-    if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess) {
-        environment.cuda_runtime_version = cuda_version_string(runtime_version);
+    Impl(std::string instance, const std::string& path, std::shared_ptr<spdlog::logger> logger)
+        : instance(std::move(instance)), path(path), logger(std::move(logger)),
+          output(path, std::ios::out | std::ios::app) {
+        if (!output) throw std::runtime_error("failed to open request JSONL log for append: " + path);
+        worker = std::thread([this] { run(); });
     }
-    int driver_version = 0;
-    if (cudaDriverGetVersion(&driver_version) == cudaSuccess) {
-        environment.cuda_driver_version = cuda_version_string(driver_version);
+
+    ~Impl() {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        ready.notify_one();
+        worker.join();
     }
-    cudaDeviceProp properties{};
-    if (cudaGetDeviceProperties(&properties, device) == cudaSuccess) {
-        environment.gpu_name                  = properties.name;
-        environment.gpu_uuid                  = cuda_uuid_string(properties.uuid);
-        environment.total_device_memory_bytes = properties.totalGlobalMem;
-        environment.compute_capability_major  = properties.major;
-        environment.compute_capability_minor  = properties.minor;
+
+    void enqueue(Record record, std::size_t bytes) {
+        {
+            std::lock_guard lock(mutex);
+            if (stopping || !enabled.load(std::memory_order_relaxed) ||
+                queue.size() >= kMaxQueuedRecords || bytes > kMaxQueuedBytes - queued_bytes) {
+                ++dropped;
+                return;
+            }
+            queue.push_back({std::move(record), bytes});
+            queued_bytes += bytes;
+        }
+        ready.notify_one();
     }
-    return environment;
-}
+
+    void run() noexcept {
+        try {
+            constexpr auto interval = std::chrono::milliseconds(250);
+            auto deadline = std::chrono::steady_clock::now() + interval;
+            std::size_t unflushed_bytes = 0;
+            std::uint64_t reported_drops = 0;
+            for (;;) {
+                std::optional<Pending> pending;
+                bool finish = false;
+                {
+                    std::unique_lock lock(mutex);
+                    ready.wait_until(lock, deadline, [&] { return stopping || !queue.empty(); });
+                    if (!queue.empty()) {
+                        pending.emplace(std::move(queue.front()));
+                        queue.pop_front();
+                        queued_bytes -= pending->bytes;
+                    }
+                    finish = stopping && queue.empty();
+                }
+                if (pending) {
+                    auto record = std::visit([&](auto& value) -> std::string {
+                        using T = std::decay_t<decltype(value)>;
+                        if constexpr (std::is_same_v<T, std::string>) {
+                            return std::move(value);
+                        } else {
+                            return format_request_scheduling_json(
+                                instance, value.timestamp, value.request_id,
+                                value.http_request_id, value.observation);
+                        }
+                    }, pending->record);
+                    output.write(record.data(), static_cast<std::streamsize>(record.size()));
+                    output.put('\n');
+                    unflushed_bytes += record.size() + 1;
+                    if (!output) throw std::runtime_error("write failed");
+                    ++written;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (finish || now >= deadline || unflushed_bytes >= 256 * 1024) {
+                    const auto lost = dropped.load(std::memory_order_relaxed);
+                    const bool status_changed = lost != reported_drops;
+                    if (status_changed) {
+                        auto status = event_base(instance, unix_time_ms(), "request_log_status");
+                        status["dropped_records"] = lost;
+                        output << status.dump() << '\n';
+                        reported_drops = lost;
+                        if (logger) logger->warn("request log dropped {} records | queue full | {}",
+                                                 lost, product::format_pretty_text(path));
+                    }
+                    if (unflushed_bytes || status_changed || finish) {
+                        output.flush();
+                        if (!output) throw std::runtime_error("flush failed");
+                    }
+                    unflushed_bytes = 0;
+                    deadline = now + interval;
+                }
+                if (finish) break;
+            }
+        } catch (...) {
+            {
+                std::lock_guard lock(mutex);
+                ++errors;
+                dropped.fetch_add(queue.size(), std::memory_order_relaxed);
+                queue.clear();
+                queued_bytes = 0;
+                enabled.store(false, std::memory_order_release);
+            }
+            try {
+                if (logger) logger->error("request log disabled | write failed | {}",
+                                           product::format_pretty_text(path));
+            } catch (...) {}
+        }
+    }
+
+    const std::string instance, path;
+    std::shared_ptr<spdlog::logger> logger;
+    std::ofstream output;
+    std::atomic<bool> enabled{true};
+    std::atomic<std::uint64_t> written{0}, dropped{0}, errors{0};
+    mutable std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<Pending> queue;
+    std::size_t queued_bytes = 0;
+    bool stopping = false;
+    std::thread worker;
+};
 
 JsonlRequestLog::JsonlRequestLog(std::string server_instance_id, const std::string& path,
                                  const std::string& protected_artifact_path,
                                  std::shared_ptr<spdlog::logger> logger)
-    : path_(path), server_instance_id_(std::move(server_instance_id)), logger_(std::move(logger)) {
-    if (path_.empty()) { return; }
+    : server_instance_id_(std::move(server_instance_id)) {
+    if (path.empty()) { return; }
     if (!protected_artifact_path.empty() &&
-        normalized_absolute_path(path_) == normalized_absolute_path(protected_artifact_path)) {
+        normalized_absolute_path(path) == normalized_absolute_path(protected_artifact_path)) {
         throw std::invalid_argument("request JSONL log must not overwrite the model artifact");
     }
-    output_.open(path_, std::ios::out | std::ios::app);
-    if (!output_) {
-        throw std::runtime_error("failed to open request JSONL log for append: " + path_);
-    }
+    impl_ = std::make_unique<Impl>(server_instance_id_, path, std::move(logger));
+}
+
+JsonlRequestLog::~JsonlRequestLog() = default;
+
+bool JsonlRequestLog::enabled() const noexcept {
+    return impl_ && impl_->enabled.load(std::memory_order_acquire);
+}
+
+RequestLogStatistics JsonlRequestLog::statistics() const {
+    if (!impl_) return {};
+    std::lock_guard lock(impl_->mutex);
+    return {.written_records = impl_->written.load(std::memory_order_relaxed),
+            .dropped_records = impl_->dropped.load(std::memory_order_relaxed),
+            .write_errors = impl_->errors.load(std::memory_order_relaxed),
+            .queued_records = impl_->queue.size(), .queued_bytes = impl_->queued_bytes};
 }
 
 void JsonlRequestLog::write_startup_config(const product::ServeOptions& options) {
     if (enabled()) append(format_startup_config_json(server_instance_id_, unix_time_ms(), options));
-}
-
-void JsonlRequestLog::write_server_start(const product::ServeOptions& options,
-                                         const ninfer::EngineOptions& engine_options,
-                                         const ninfer::ModelSamplingDefaults& sampling_defaults,
-                                         const std::string& public_model_id,
-                                         const EngineDescription& description,
-                                         const StartupReport& startup,
-                                         const EngineSnapshot& snapshot) {
-    if (!enabled()) { return; }
-    std::error_code error;
-    const std::uintmax_t size =
-        std::filesystem::file_size(options.launch.engine.artifact_path, error);
-    const std::optional<std::uint64_t> artifact_size =
-        error ? std::nullopt : std::optional<std::uint64_t>(size);
-    append(format_server_start_json(
-        server_instance_id_, unix_time_ms(), options, engine_options, sampling_defaults,
-        public_model_id, description, startup, snapshot,
-        query_server_log_environment(options.launch.engine.device), artifact_size));
 }
 
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {
@@ -898,8 +997,8 @@ void JsonlRequestLog::write_request_scheduling(
     std::uint64_t request_id, const std::string& http_request_id,
     const ninfer::GenerationSchedulingObservation& observation) {
     if (!enabled()) { return; }
-    append(format_request_scheduling_json(server_instance_id_, unix_time_ms(), request_id,
-                                          http_request_id, observation));
+    impl_->enqueue(Impl::SchedulingRecord{unix_time_ms(), request_id, http_request_id, observation},
+                   sizeof(Impl::SchedulingRecord) + http_request_id.size());
 }
 
 void JsonlRequestLog::write_request_rejected(const RequestRejectionLogContext& context) {
@@ -925,21 +1024,8 @@ void JsonlRequestLog::write_throughput(const ThroughputReport& report) {
 }
 
 void JsonlRequestLog::append(std::string record) {
-    bool report_failure = false;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (failed_) { return; }
-        output_ << record << '\n';
-        output_.flush();
-        if (!output_) {
-            failed_        = true;
-            report_failure = true;
-        }
-    }
-    if (report_failure && logger_ != nullptr) {
-        logger_->error("request log disabled | write failed | {}",
-                       product::format_pretty_text(path_));
-    }
+    const auto bytes = record.size() + 1;
+    impl_->enqueue(std::move(record), bytes);
 }
 
 } // namespace ninfer::serve

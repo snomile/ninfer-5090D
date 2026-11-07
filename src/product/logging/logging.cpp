@@ -1,6 +1,8 @@
 #include "product/logging/logging.h"
 
 #include <spdlog/formatter.h>
+#include <spdlog/async_logger.h>
+#include <spdlog/details/thread_pool.h>
 #include <spdlog/logger.h>
 #include <spdlog/sinks/sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -261,19 +263,46 @@ void TerminalProgress::clear() noexcept { impl_->sink->clear(); }
 struct LoggingRuntime::Impl {
     explicit Impl(LoggingOptions options) {
         const spdlog::level::level_enum level = to_spdlog_level(options.level);
-        auto sink = std::make_shared<ProgressAwareStderrSink>(to_spdlog_color_mode(options.color));
+        sink = std::make_shared<ProgressAwareStderrSink>(to_spdlog_color_mode(options.color));
         progress  = std::shared_ptr<TerminalProgress>(new TerminalProgress(
             std::make_unique<TerminalProgress::Impl>(sink, level <= spdlog::level::info)));
-        logger    = std::make_shared<spdlog::logger>(std::move(options.logger_name), sink);
+        if (options.presentation == LogPresentation::Service) {
+            pool = std::make_shared<spdlog::details::thread_pool>(2048, 1);
+            async = std::make_shared<spdlog::async_logger>(
+                std::move(options.logger_name), sink, pool, spdlog::async_overflow_policy::discard_new);
+            logger = async;
+        } else {
+            logger = std::make_shared<spdlog::logger>(std::move(options.logger_name), sink);
+        }
         logger->set_formatter(std::make_unique<PrettyLogFormatter>(options.presentation));
         logger->set_level(level);
         logger->flush_on(spdlog::level::warn);
-        logger->set_error_handler([sink](const std::string& message) noexcept {
+        logger->set_error_handler([sink = sink](const std::string& message) noexcept {
             sink->clear();
             report_logging_error(message);
         });
     }
 
+    ~Impl() {
+        const auto dropped = pool ? pool->discard_counter() : 0;
+        pool.reset(); // FIFO termination joins after all accepted records, even a full queue.
+        try {
+            if (dropped) {
+                const std::string message = "operational log dropped " + std::to_string(dropped) +
+                                            " records | queue full";
+                sink->log(spdlog::details::log_msg({}, spdlog::level::warn, message));
+            }
+            sink->flush();
+        } catch (const std::exception& error) {
+            report_logging_error(error.what());
+        } catch (...) {
+            report_logging_error("unknown flush error");
+        }
+    }
+
+    std::shared_ptr<ProgressAwareStderrSink> sink;
+    std::shared_ptr<spdlog::details::thread_pool> pool;
+    std::shared_ptr<spdlog::async_logger> async;
     std::shared_ptr<spdlog::logger> logger;
     std::shared_ptr<TerminalProgress> progress;
 };
@@ -281,7 +310,7 @@ struct LoggingRuntime::Impl {
 LoggingRuntime::LoggingRuntime(LoggingOptions options)
     : impl_(std::make_unique<Impl>(std::move(options))) {}
 
-LoggingRuntime::~LoggingRuntime() { flush(); }
+LoggingRuntime::~LoggingRuntime() = default;
 
 std::shared_ptr<spdlog::logger> LoggingRuntime::logger() const noexcept { return impl_->logger; }
 
@@ -289,9 +318,19 @@ std::shared_ptr<TerminalProgress> LoggingRuntime::terminal_progress() const noex
     return impl_->progress;
 }
 
+std::size_t LoggingRuntime::dropped_records() const {
+    return impl_->pool ? impl_->pool->discard_counter() : 0;
+}
+
 void LoggingRuntime::flush() noexcept {
     try {
-        impl_->logger->flush();
+        if (impl_->pool) {
+            // Explicit application flushes may wait for space; request producers never do.
+            impl_->pool->post_flush(std::shared_ptr<spdlog::async_logger>(impl_->async),
+                                   spdlog::async_overflow_policy::block);
+        } else {
+            impl_->logger->flush();
+        }
     } catch (const std::exception& exception) {
         impl_->progress->clear();
         report_logging_error(exception.what());

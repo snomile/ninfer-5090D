@@ -695,6 +695,9 @@ enum class GenerationSchedulingTransition : std::uint8_t {
     RecoveryComplete,
     SnapshotRevoked,
     Terminal,
+    Admitted,
+    PrefillStarted,
+    FirstToken,
 };
 
 enum class GenerationRecoveryRoute : std::uint8_t { None, Snapshot, Replay };
@@ -715,6 +718,9 @@ struct GenerationSchedulingObservation {
     std::uint64_t request_prefill_tokens      = 0;
     std::uint64_t request_decode_tokens       = 0;
     std::uint64_t request_replayed_tokens     = 0;
+    std::uint32_t reused_prompt_tokens        = 0;
+    std::uint64_t device_to_host_bytes        = 0;
+    std::uint64_t host_to_device_bytes        = 0;
 };
 
 using GenerationSchedulingObserver = std::function<void(const GenerationSchedulingObservation&)>;

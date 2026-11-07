@@ -63,13 +63,22 @@ std::shared_ptr<MonitorEvents::Subscription> MonitorEvents::subscribe() {
     std::lock_guard lock(mutex_);
     if (closed_) return {};
     for (auto& weak : subscribers_) {
-        if (weak.expired()) {
+        const auto previous = weak.lock();
+        if (!previous || previous->closed()) {
             auto result = std::make_shared<Subscription>();
             weak        = result;
             return result;
         }
     }
     return {};
+}
+
+bool MonitorEvents::has_subscribers() const {
+    std::lock_guard lock(mutex_);
+    if (closed_) return false;
+    for (const auto& weak : subscribers_)
+        if (auto subscriber = weak.lock(); subscriber && !subscriber->closed()) return true;
+    return false;
 }
 
 void MonitorEvents::publish(const std::string& event) {
@@ -114,10 +123,23 @@ ServiceSnapshot ServiceObservations::snapshot(bool include_requests) const {
 }
 
 void ServiceObservations::event(const char* kind, std::uint64_t id, nlohmann::json details) {
+    if (details.is_null()) details = nlohmann::json::object();
+    if (!details.contains("http_request_id")) {
+        std::lock_guard lock(mutex_);
+        if (auto it = requests_.find(id); it != requests_.end())
+            details["http_request_id"] = it->second.http_request_id;
+    }
     std::lock_guard lock(event_mutex_);
+    auto timestamp_ms = static_cast<std::uint64_t>(unix_seconds() * 1000);
+    if (details.contains("steady_ns")) {
+        const auto captured = details["steady_ns"].get<std::uint64_t>();
+        const auto now = steady_ns();
+        if (now >= captured) timestamp_ms -= (now - captured) / 1000000;
+    }
     nlohmann::json payload{{"server_instance_id", instance_id_},
+                           {"request_timeline_version", 1},
                            {"sequence", ++event_sequence_},
-                           {"timestamp_unix_ms", static_cast<std::uint64_t>(unix_seconds() * 1000)},
+                           {"timestamp_unix_ms", timestamp_ms},
                            {"kind", kind},
                            {"request_id", id}};
     if (!details.is_null()) payload["details"] = std::move(details);
@@ -136,7 +158,7 @@ void ServiceObservations::preparing(std::uint64_t id, std::string protocol,
                                              .stream          = metadata.stream});
         ++counters_.submitted;
     }
-    event("request_preparing", id);
+    if (events.has_subscribers()) event("request_preparing", id, {{"model", metadata.model}});
 }
 
 void ServiceObservations::prepared(const RequestLogContext& context) {
@@ -149,7 +171,9 @@ void ServiceObservations::prepared(const RequestLogContext& context) {
             it->second.response_id       = context.response_id;
         }
     }
-    event("request_submitted", context.id, {{"engine_request_id", context.engine_request_id}});
+    if (events.has_subscribers())
+        event("request_submitted", context.id, {{"engine_request_id", context.engine_request_id},
+                                          {"model", context.model}});
 }
 
 void ServiceObservations::first_token(std::uint64_t id,
@@ -159,24 +183,37 @@ void ServiceObservations::first_token(std::uint64_t id,
         std::lock_guard lock(mutex_);
         counters_.ttft.observe(seconds);
     }
-    event("first_token", id, {{"ttft_seconds", seconds}});
+    if (events.has_subscribers()) event("first_token", id, {{"ttft_seconds", seconds}});
 }
 
 void ServiceObservations::scheduling(std::uint64_t id,
                                      const GenerationSchedulingObservation& value) {
+    if (!events.has_subscribers()) return;
     constexpr std::array transitions{"pause_started",    "paused",          "restore_started",
                                      "restored",         "replay_complete", "recovery_complete",
-                                     "snapshot_revoked", "terminal"};
+                                     "snapshot_revoked", "terminal", "admitted",
+                                     "prefill_started", "decode_started"};
     event(transitions[static_cast<unsigned>(value.transition)], id,
           {{"engine_request_id", value.engine_request_id},
            {"steady_ns", value.steady_ns},
-           {"preemption_index", value.preemption_index}});
+           {"elapsed_ns", value.elapsed_ns},
+           {"route", static_cast<unsigned>(value.route)},
+           {"preemption_index", value.preemption_index},
+           {"computed_prefill_tokens", value.request_prefill_tokens},
+           {"decode_tokens", value.request_decode_tokens},
+           {"replayed_tokens", value.request_replayed_tokens},
+           {"cached_tokens", value.reused_prompt_tokens},
+           {"device_to_host_bytes", value.device_to_host_bytes},
+           {"host_to_device_bytes", value.host_to_device_bytes}});
 }
 
 void ServiceObservations::done(std::uint64_t id, const GenerationOutcome& outcome) {
     const bool cancelled = outcome.finish_reason == FinishReason::Cancelled;
+    std::string http_request_id;
     {
         std::lock_guard lock(mutex_);
+        if (auto it = requests_.find(id); it != requests_.end())
+            http_request_id = it->second.http_request_id;
         requests_.erase(id);
         ++(cancelled ? counters_.cancelled : counters_.completed);
         if (outcome.stats.constraint) {
@@ -193,27 +230,47 @@ void ServiceObservations::done(std::uint64_t id, const GenerationOutcome& outcom
                                    outcome.service_prepare_seconds);
         counters_.queue.observe(outcome.stats.engine_timing.queue_wait_seconds);
     }
+    if (!events.has_subscribers()) return;
     event(cancelled ? "request_cancelled" : "request_completed", id,
-          {{"prompt_tokens", outcome.prompt_tokens},
-           {"completion_tokens", outcome.completion_tokens}});
+          {{"http_request_id", http_request_id},
+           {"prompt_tokens", outcome.prompt_tokens},
+           {"completion_tokens", outcome.completion_tokens},
+           {"computed_prefill_tokens", outcome.stats.computed_prefill_tokens},
+           {"cached_tokens", outcome.stats.reused_prompt_tokens},
+           {"prefill_execution_seconds", outcome.stats.timings.prefill_seconds},
+           {"decode_execution_seconds", outcome.stats.timings.decode_seconds},
+           {"control_execution_seconds", outcome.stats.timings.control_seconds},
+           {"queue_seconds", outcome.stats.engine_timing.queue_wait_seconds},
+           {"paused_ms", outcome.stats.scheduling.paused_ns / 1000000.0},
+           {"replayed_tokens", outcome.stats.scheduling.replayed_tokens},
+           {"device_to_host_bytes", outcome.stats.scheduling.device_to_host_bytes},
+           {"host_to_device_bytes", outcome.stats.scheduling.host_to_device_bytes},
+           {"execution", product::request_execution_json(outcome.stats)}});
 }
 
 void ServiceObservations::rejected(std::uint64_t id) {
+    std::string http_request_id;
     {
         std::lock_guard lock(mutex_);
+        if (auto it = requests_.find(id); it != requests_.end())
+            http_request_id = it->second.http_request_id;
         requests_.erase(id);
         ++counters_.rejected;
     }
-    event("request_rejected", id);
+    if (events.has_subscribers()) event("request_rejected", id, {{"http_request_id", http_request_id}});
 }
 
 void ServiceObservations::failed(std::uint64_t id, bool cancelled) {
+    std::string http_request_id;
     {
         std::lock_guard lock(mutex_);
+        if (auto it = requests_.find(id); it != requests_.end())
+            http_request_id = it->second.http_request_id;
         requests_.erase(id);
         ++(cancelled ? counters_.cancelled : counters_.failed);
     }
-    event(cancelled ? "request_cancelled" : "request_failed", id);
+    if (events.has_subscribers()) event(cancelled ? "request_cancelled" : "request_failed", id,
+          {{"http_request_id", http_request_id}});
 }
 
 void ServiceObservations::response_failed(std::uint64_t id) {
@@ -221,7 +278,7 @@ void ServiceObservations::response_failed(std::uint64_t id) {
         std::lock_guard lock(mutex_);
         ++counters_.response_failures;
     }
-    event("response_failed", id);
+    if (events.has_subscribers()) event("response_failed", id);
 }
 
 void ServiceObservations::stop() { events.close(); }

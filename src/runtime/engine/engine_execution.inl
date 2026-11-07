@@ -334,6 +334,9 @@ template <class Instance>
     const auto& request = slots_[lane];
     auto flight =
         freeze_members(lanes, request->is_replaying() ? UnitKind::Replay : UnitKind::Prefill);
+    const bool observe_prefill = !request->is_replaying() && !request->prefill_observed &&
+                                 static_cast<bool>(request->observation.scheduling);
+    const auto started = observe_prefill ? Clock::now() : Clock::time_point{};
     ExecutionCallScope call(*this);
     const auto ticket = request->is_replaying()
                             ? instance_.session->start_replay(flight.sequences.front())
@@ -341,6 +344,11 @@ template <class Instance>
                                                                request->output.constrained());
     call.finish();
     if (!ticket) return false;
+    if (observe_prefill) {
+        request->prefill_observed = true;
+        observe_scheduling(request, GenerationSchedulingTransition::PrefillStarted,
+                           started);
+    }
     flight.ticket = *ticket;
     compute_.emplace(std::move(flight));
     reserved_units_[lane].reset();

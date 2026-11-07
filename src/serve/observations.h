@@ -70,10 +70,11 @@ public:
     };
 
     [[nodiscard]] std::shared_ptr<Subscription> subscribe();
+    [[nodiscard]] bool has_subscribers() const;
     void publish(const std::string& event);
     void close();
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::array<std::weak_ptr<Subscription>, kMaxSubscribers> subscribers_;
     bool closed_ = false;
 };
