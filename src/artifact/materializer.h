@@ -59,7 +59,7 @@ private:
                                             const StartupObserver*);
 
     struct TensorStorage {
-        std::vector<float> weight_divisors;
+        std::vector<float> matrix_scales;
         std::optional<WeightParent> device;
         std::optional<WeightParent> mapped;
         std::optional<WeightParent> host;

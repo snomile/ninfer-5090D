@@ -14,6 +14,7 @@ ninfer_add_test(ninfer_artifact_placement_test
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_materialization.cpp" "${CMAKE_CURRENT_LIST_DIR}/materialization_io.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/encoded_slice_checks.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/csf_selection_checks.cpp"
   LIBRARIES ninfer_artifact)
 
 ninfer_test_interpose(ninfer_artifact_materialization_test

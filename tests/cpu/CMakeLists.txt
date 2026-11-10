@@ -123,13 +123,15 @@ if(APPLE)
 endif()
 add_library(ninfer_cpu_artifact STATIC ${cpu_file}
   "${NINFER_SOURCE_DIR}/src/core/buffer.cpp")
-foreach(source IN ITEMS formats layouts reader placement encoded_slice)
+foreach(source IN ITEMS formats layouts reader binder placement encoded_slice csf_selection)
   target_sources(ninfer_cpu_artifact PRIVATE "${NINFER_SOURCE_DIR}/src/artifact/${source}.cpp")
 endforeach()
 cpu_includes(ninfer_cpu_artifact)
 target_link_libraries(ninfer_cpu_artifact PUBLIC ninfer_cpu_frontend_support)
 cpu_test(ninfer_artifact_placement_test tests/artifact/test_placement.cpp ninfer_cpu_artifact)
 target_include_directories(ninfer_artifact_placement_test PRIVATE "${NINFER_SOURCE_DIR}/tests")
+cpu_test(ninfer_artifact_reader_test tests/artifact/test_reader.cpp ninfer_cpu_artifact)
+target_include_directories(ninfer_artifact_reader_test PRIVATE "${NINFER_SOURCE_DIR}/tests")
 
 cpu_test(ninfer_executor_observations_test tests/runtime/test_executor_observations.cpp
   ninfer_cpu_runtime)
