@@ -67,7 +67,7 @@ RUN set -eu; \
             ninfer_qwen3_5_loading_test \
             ninfer_qwen3_5_native_transactions_test ninfer_qwen3_5_state_image_test \
             ninfer_qwen_frontend_test ninfer_qwen_tool_constraints_test \
-            ninfer_tool_call_parser_test ninfer_grammar_test ninfer_json_schema_test \
+            ninfer_tool_call_parser_test ninfer_grammar_test ninfer_json_schema_test ninfer_jinja_test \
             ninfer_scheduler_test ninfer_context_cost_test ninfer_placement_policy_test \
             ninfer_resource_manager_test ninfer_context_capacity_test \
             ninfer_serve_options_test ninfer_cli_options_test ninfer_openai_schema_test \

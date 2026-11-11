@@ -388,6 +388,48 @@ bool throws_invalid_argument(Callable&& callable) {
     return false;
 }
 
+int test_tool_history_arguments() {
+    const auto frontend = make_frontend(
+        resources("{{ messages[1].tool_calls[1].function.arguments|tojson }}"), false);
+    ninfer::PromptInput input;
+    input.messages = {
+        {.role = ninfer::ChatRole::User, .parts = {{.text = "run the tool"}}},
+        {.role       = ninfer::ChatRole::Assistant,
+         .tool_calls = {{.id = "first", .name = "noop", .arguments_json = "{}"},
+                        {.id = "second", .name = "legacy"}}},
+        {.role = ninfer::ChatRole::Tool, .parts = {{.text = "done"}}, .tool_call_id = "second"}};
+    auto& arguments = input.messages[1].tool_calls[1].arguments_json;
+    int failures    = 0;
+    for (const auto bad : {R"({"x": nope})", R"({"x":)", "[]", "null", R"({"x":1e99999})"}) {
+        arguments     = bad;
+        bool rejected = false;
+        try {
+            (void)frontend.prepare(input);
+        } catch (const std::invalid_argument& error) {
+            rejected = true;
+            const std::string_view message(error.what());
+            failures += check(message.find("messages[1].tool_calls[1]") != message.npos &&
+                                  message.find("legacy") != message.npos,
+                              "invalid tool history lost its message and call identity");
+            if (arguments == R"({"x": nope})")
+                failures += check(message.find("byte 8") != message.npos,
+                                  "invalid tool history lost its JSON error position");
+        }
+        failures += check(rejected, "invalid tool history was accepted");
+    }
+    for (const auto valid : {"", "{}", R"({"z":[1,true,null,{"s":"a\nb\"c"}],"a":2})"}) {
+        arguments           = valid;
+        const auto prepared = frontend.prepare(input);
+        const auto rendered =
+            fixture_tokenizer().decode(FrontendFactory::inspect(prepared).token_ids);
+        const auto expected = arguments.empty() ? nlohmann::ordered_json::object()
+                                                : nlohmann::ordered_json::parse(arguments);
+        failures += check(nlohmann::ordered_json::parse(rendered).dump() == expected.dump(),
+                          "tool history changed argument values or object order");
+    }
+    return failures;
+}
+
 int test_invalid_public_part_enums(const Frontend& frontend) {
     ninfer::ChatMessage invalid_part_message;
     invalid_part_message.role = ninfer::ChatRole::User;
@@ -2239,18 +2281,16 @@ int test_reasoning_split(const Frontend& frontend) {
         canonical_tokens, static_cast<std::uint32_t>(canonical_tokens.size() + 1U),
         ninfer::FinishReason::OutputLimit);
     int failures =
-        check(canonical.accepted_tokens == canonical_tokens.size() && !canonical.finished() &&
-                  canonical.prefix_execution_split_after == canonical_tokens.size(),
-              "canonical reasoning close did not publish its exact token execution frontier");
+        check(canonical.accepted_tokens == canonical_tokens.size() && !canonical.finished(),
+              "canonical reasoning close was not accepted");
     (void)canonical_session.commit_preview();
 
     auto session = frontend.make_output_session(prompt, {});
     const std::array<ninfer::TokenId, 2> tokens{3, 4};
     const auto decision = session.preview_model(tokens, 2, ninfer::FinishReason::OutputLimit);
     failures += check(decision.accepted_tokens == 2 &&
-                          decision.finish_reason == ninfer::FinishReason::OutputLimit &&
-                          !decision.prefix_execution_split_after,
-                      "reasoning close inside a mixed token produced an execution frontier");
+                          decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                      "reasoning close inside a mixed token changed output-budget handling");
     const auto output = session.commit_preview();
     failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
                       "reasoning channel did not remove the close marker");
@@ -2330,8 +2370,7 @@ int test_constrained_thinking_control(const Frontend& frontend) {
         const auto retry = partial_session.preview_control(forced, 512);
         failures += check(first.accepted_tokens == forced.size() &&
                               retry.accepted_tokens == first.accepted_tokens &&
-                              !retry.finished() &&
-                              retry.prefix_execution_split_after == forced.size(),
+                              retry.continuation == first.continuation && !retry.finished(),
                           "retried control closed early across a canonical fragment");
         const auto repaired = partial_session.commit_preview();
         failures += check(channel_text(repaired, ninfer::OutputChannel::Content).empty() &&
@@ -2479,8 +2518,7 @@ int test_thinking_budget_control(const Frontend& frontend) {
 
     const auto control_decision = session.preview_control(control, 18);
     failures +=
-        check(control_decision.accepted_tokens == control.size() && !control_decision.finished() &&
-                  control_decision.prefix_execution_split_after == control.size(),
+        check(control_decision.accepted_tokens == control.size() && !control_decision.finished(),
               "canonical thinking control was not accepted atomically");
     const auto control_output = session.commit_preview();
     failures += check(channel_text(control_output, ninfer::OutputChannel::Reasoning) ==
@@ -2998,7 +3036,7 @@ int test_model_owned_options() {
 int test_output_control_contract() {
     auto tokenizer = std::make_shared<const ninfer::text::Tokenizer>(fixture_tokenizer());
     auto reasoning = std::make_shared<const ninfer::models::frontend::ReasoningFormat>(
-        "</think>", "\n</think>\n\n", nullptr, true);
+        "</think>", nullptr, true);
     return check(throws_invalid_argument([&] {
                      ninfer::models::frontend::OutputSession output({.tokenizer = tokenizer,
                                                                      .reasoning = reasoning,
@@ -3076,6 +3114,7 @@ int main() {
     failures += test_selected_template_recovery_boundary();
     failures += test_official_resource_guards();
     failures += test_template_file_execution();
+    failures += test_tool_history_arguments();
     failures += test_invalid_public_part_enums(frontend);
     failures += test_text_and_image_prepare(frontend);
     failures += test_media_token_ids_come_from_tokenizer();

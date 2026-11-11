@@ -53,8 +53,8 @@ private:
 
 struct PrefixShortlistKey {
     std::array<std::uint64_t, 2> digests{};
-    std::uint32_t frontier                                                  = 0;
-    std::uint32_t identity_tag                                              = 0;
+    std::uint32_t frontier                                                   = 0;
+    std::uint32_t identity_tag                                               = 0;
     friend auto operator<=>(PrefixShortlistKey, PrefixShortlistKey) noexcept = default;
 };
 
@@ -400,12 +400,17 @@ public:
                   ResumeState* resume           = nullptr,
                   ExecutionUnitKind resume_kind = ExecutionUnitKind::Decode,
                   std::uint32_t resume_tokens   = 1);
-    [[nodiscard]] bool start_capture(SequenceHandle sequence);
+    [[nodiscard]] runtime::ContextStart start_capture(SequenceHandle sequence);
+    [[nodiscard]] bool retry_capture(SequenceHandle sequence);
+    [[nodiscard]] std::vector<CheckpointHandle> share_capture(SequenceHandle sequence,
+                                                              CheckpointHandle source);
     [[nodiscard]] bool capture_is_input(SequenceHandle sequence) const;
     [[nodiscard]] bool capture_is_shared(SequenceHandle) const;
-    [[nodiscard]] std::vector<std::uint32_t> capture_frontiers(SequenceHandle) const;
+    [[nodiscard]] std::vector<std::uint32_t> capture_frontiers(SequenceHandle, std::uint32_t begin,
+                                                               std::uint32_t end) const;
     [[nodiscard]] std::optional<CapturePreparation>
-    prepare_capture(SequenceHandle sequence, std::span<const CheckpointHandle> host_victims = {});
+    prepare_capture(SequenceHandle sequence, std::span<const CheckpointHandle> victims = {},
+                    runtime::CaptureStorage storage = runtime::CaptureStorage::Automatic);
     void skip_capture(SequenceHandle sequence,
                       runtime::CaptureSkip reason = runtime::CaptureSkip::Unavailable);
     // Finite physical actions, each including every optional holder needed for its release.
@@ -431,8 +436,7 @@ public:
     start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,
                  std::span<const bool> constrained = {});
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
-    start_control(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t stride,
-                  std::span<const std::optional<std::uint32_t>> splits);
+    start_control(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t stride);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_score(qwen::PreparedPrompt&&,
                                                                       std::uint32_t first_target);
     [[nodiscard]] std::optional<SessionEvent> poll();

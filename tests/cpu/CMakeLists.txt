@@ -92,6 +92,7 @@ foreach(probe IN ITEMS json_schema regex_choice)
 endforeach()
 
 include(frontend.cmake)
+cpu_test(ninfer_jinja_test tests/text/test_jinja.cpp ninfer_jinja)
 
 add_library(ninfer_cpu_runtime STATIC
   "${NINFER_SOURCE_DIR}/src/core/context_pool.cpp"
