@@ -5,7 +5,7 @@
 
 namespace ninfer::models::qwen3_5 {
 
-RequestBasePlan::RequestBasePlan(std::shared_ptr<detail::RequestBasePlanImpl> impl) noexcept
+RequestBasePlan::RequestBasePlan(std::shared_ptr<const detail::RequestBasePlanImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 
 RequestBasePlan::RequestBasePlan(RequestBasePlan&&) noexcept = default;
@@ -24,16 +24,9 @@ const models::frontend::PreparedContextCache& RequestBasePlan::context_cache() c
     return impl_ != nullptr ? impl_->context_cache : empty;
 }
 
-std::optional<PrefixShortlistKey>
-RequestBasePlan::prefix_shortlist_key(std::uint32_t frontier) const noexcept {
-    if (impl_ == nullptr || frontier == 0 || frontier > impl_->prefix_digests.size()) {
-        return std::nullopt;
-    }
-    return PrefixShortlistKey{
-        .digests      = impl_->prefix_digests.at(frontier),
-        .frontier     = frontier,
-        .identity_tag = impl_->prefix_identity_tag,
-    };
+std::optional<PrefixKey> RequestBasePlan::prefix_key(std::uint32_t frontier) const {
+    if (!impl_ || !frontier || frontier > impl_->summary.prompt_tokens) return {};
+    return impl_->query.key(frontier);
 }
 
 ResumeState::ResumeState(std::unique_ptr<detail::ResumeStateImpl> impl) noexcept
@@ -114,8 +107,8 @@ BindingEvaluation Session::assess_binding(const RequestBasePlan& base, runtime::
     return impl_->plan_binding(base, lane, candidate, resume, kind, tokens).evaluation;
 }
 
-PrefixShortlistKey Session::checkpoint_key(CheckpointHandle h, std::uint32_t f) const {
-    return impl_->checkpoint_key(h, f);
+PrefixKey Session::checkpoint_key(CheckpointHandle h) const {
+    return impl_->checkpoint(h).snapshot.input_prefix().key();
 }
 
 std::span<const runtime::KvPoolDescriptor> Session::kv_pools() const noexcept {
@@ -181,11 +174,16 @@ std::uint32_t Session::checkpoint_recovery_frontier(CheckpointHandle retained,
 
 context::RecoveryEvaluation<>
 Session::evaluate_recovery(std::span<const CheckpointHandle> advertised) const {
-    impl_->recovery_index.synchronize(qwen::RecoveryStoreView{impl_->checkpoints});
+    impl_->recovery_index.synchronize(
+        context::RecoveryStoreView{impl_->checkpoints, impl_->prefixes});
     return impl_->recovery_index.evaluate(advertised);
 }
 
 std::size_t Session::checkpoint_extent() const noexcept { return impl_->checkpoints.size(); }
+
+std::uint64_t Session::checkpoint_catalog_revision() const noexcept {
+    return impl_->checkpoints.revision();
+}
 
 std::vector<runtime::ContextTransferRequirement>
 Session::checkpoint_restore_requirements(CheckpointHandle h) const {
@@ -350,7 +348,7 @@ std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle h) 
 
 std::optional<runtime::ExecutionTicket>
 Session::start_decode(std::span<const SequenceHandle> h, std::span<const runtime::RoundBudget> b,
-                      std::span<const bool> c) {
+                      std::span<const std::uint8_t> c) {
     return impl_->start_decode(h, b, c);
 }
 
@@ -404,6 +402,26 @@ void Session::yield_prefill(SequenceHandle sequence) {
     if (owner && owner->sequence == sequence) impl_->vision_window.revoke(*owner);
 }
 
+runtime::PrefixId Session::checkpoint_prefix(CheckpointHandle h) const {
+    return impl_->checkpoints.at(h).snapshot.input_prefix().id();
+}
+
+std::vector<runtime::PrefixId> Session::matching_prefixes(const RequestBasePlan& base) const {
+    const auto& plan = *base.impl_;
+    return plan.query.ancestors();
+}
+
+std::vector<runtime::PrefixRelation>
+Session::recovery_relations(std::span<const runtime::PrefixId> ids) const {
+    return impl_->prefixes.relations(ids);
+}
+
+bool Session::recovery_precedes(runtime::PrefixId a, std::uint32_t af, runtime::PrefixId b,
+                                std::uint32_t bf) const {
+    return af <= bf && impl_->prefixes.valid(a) && impl_->prefixes.valid(b) &&
+           impl_->prefixes.is_prefix(a, b);
+}
+
 } // namespace ninfer::models::qwen3_5
 
 namespace ninfer::models::qwen3_5::detail {
@@ -418,8 +436,11 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, S
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       context_cache(plan.context_cache), vision_enabled(plan.profile->options.vision),
-      causal_scoring(plan.causal_scoring) {
-    if (!definition || !plan.profile || plan.context.pools.empty())
+      causal_scoring(plan.causal_scoring), sequences(max_concurrency), requests(max_concurrency),
+      lane_epochs(max_concurrency), lane_marks(max_concurrency),
+      recovery_metadata(directory.metadata_budget(), plan.causal_scoring ? 0 : plan.max_concurrency,
+                        1, 1) {
+    if (!definition || !plan.profile || !plan.batch_execution || plan.context.pools.empty())
         throw std::invalid_argument("Session preparation is incomplete");
     checkpoints.configure(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                           directory.metadata_budget(), &recovery_index);
@@ -428,7 +449,16 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, S
         count_builder.prepare(plan.profile->public_tokens);
     }
     releases.reserve(max_concurrency);
+    resident_sequences.reserve(max_concurrency);
     for (std::uint32_t i = 0; i < max_concurrency; ++i) sequences[i].lane = i;
+}
+
+std::uint64_t SessionImpl::next_lane_mark() {
+    if (++lane_mark_generation == 0) {
+        std::fill(lane_marks.begin(), lane_marks.end(), 0);
+        ++lane_mark_generation;
+    }
+    return lane_mark_generation;
 }
 
 SessionImpl::~SessionImpl() {
@@ -442,7 +472,6 @@ void SessionImpl::fail_all_cleanup() noexcept {
             executor().drain();
         } catch (...) {}
     }
-    pending_maintenance_.reset();
     if (context_operation_) context_operation_->transaction.fail_after_drain();
     abort_context();
     if (execution) {

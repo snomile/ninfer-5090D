@@ -68,12 +68,13 @@ bool SessionImpl::submit_score() {
         work.row                 = work_row(s, end - begin);
         const auto first         = std::min(end, std::max(begin, scoring->first_target - 1));
         work.first_target_column = first - begin;
-        work.targets.assign(s.identity.tokens.begin() + first + 1,
-                            s.identity.tokens.begin() + end + 1);
+        s.ledger.copy(first + 1, end + 1, work.targets);
+        work.shape = plan.batches->exact(1, 1);
         tx.rows.push_back(work.row);
         tx.context.prepare_actions();
         tx.ticket =
             executor->submit(std::move(*reservation), {actions(tx.context), std::move(work)});
+        for (auto h : tx.members) sequence(h).computing = true;
         tx.context.mark_submitted();
         return true;
     } catch (const std::exception& error) {

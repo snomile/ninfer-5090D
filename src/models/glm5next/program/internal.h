@@ -91,7 +91,7 @@ public:
     void accept_dflash(std::int32_t rows);
     void accept_speculative(std::int32_t rows);
     [[nodiscard]] execution::DFlashRun dflash_run(int rows, std::uint32_t bound);
-    [[nodiscard]] Tensor draft_features(int tokens, int rows);
+    [[nodiscard]] Tensor draft_features(const execution::BatchView&);
     void append_dflash_context(const execution::BatchView&, const Tensor& counts,
                                ops::ContextKVMaterializeExecutionEnvelope);
     void execute_speculative_commit(const execution::BatchView&, bool repair_history,
@@ -113,6 +113,7 @@ public:
     [[nodiscard]] execution::BatchView batch(const BatchLayout&, int tokens, int rows,
                                              int attention_rows, std::uint32_t visible,
                                              std::optional<std::uint32_t> sequence_owner = {});
+    void select_frame(PhysicalBatchShape);
     [[nodiscard]] Tensor row(const TensorRegion&, int rows);
     [[nodiscard]] MemorySpan output(const TensorRegion&);
     void finish_forward();
@@ -140,13 +141,14 @@ public:
     std::unique_ptr<Resources> owner;
     Resources& resources;
     const ExecutionShape shape;
+    FrameLayout frame;
     std::optional<ParallelExecution> parallel;
     std::unique_ptr<GraphInputs> graph_inputs;
     std::unique_ptr<Graphs> graphs;
     GraphMemorySummary graph_memory;
     std::unique_ptr<ComputeFrame> compute;
     std::unique_ptr<ContextFrame> context;
-    std::array<std::optional<runtime::ExecutionMember>, kMaximumConcurrency> bindings;
+    std::vector<std::optional<runtime::ExecutionMember>> bindings;
     std::deque<runtime::ExecutionEvent<ExecutionTypes>> events;
     runtime::ExecutionGpuTimer timer;
     std::optional<CudaEventTimer> prefill_timer;

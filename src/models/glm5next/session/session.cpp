@@ -8,8 +8,17 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPl
                          std::unique_ptr<context::ContextDirectory> prepared_directory)
     : definition(std::move(model)), plan(std::move(prepared)), shape(plan.shape),
       directory_owner(std::move(prepared_directory)), directory(*directory_owner),
+      recovery_metadata(directory.metadata_budget(),
+                        shape.purpose == EnginePurpose::Generation ? shape.max_concurrency : 0,
+                        plan.states.size(), plan.states.size()),
       checkpoints(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                   directory.metadata_budget(), &recovery_index) {
+    sequences.resize(shape.max_concurrency);
+    resident_sequences.reserve(shape.max_concurrency);
+    epochs.resize(shape.max_concurrency);
+    if (!plan.batches || plan.batches->resident_capacity() != shape.max_concurrency ||
+        plan.batches->attention_owners() != plan.states.size())
+        throw std::invalid_argument("GLM Session batch plan differs from prepared state");
     if (!definition) throw std::invalid_argument("invalid GLM5Next session definition");
     if (shape.purpose == EnginePurpose::Generation) {
         count_storage.acquire(
@@ -27,14 +36,14 @@ SessionImpl::~SessionImpl() { cleanup(); }
 std::uint32_t SessionImpl::pool_count() const noexcept { return plan.context.pools.size(); }
 
 bool SessionImpl::valid(SequenceHandle handle) const noexcept {
-    return std::any_of(sequences.begin(), sequences.end(), [&](const auto& s) {
-        return s && s->id == handle.value && s->epoch == handle.generation;
-    });
+    const auto found = resident_sequences.find(handle.value);
+    return found != resident_sequences.end() && found->second->epoch == handle.generation;
 }
 
 Sequence& SessionImpl::sequence(SequenceHandle handle) const {
-    for (const auto& s : sequences)
-        if (s && s->id == handle.value && s->epoch == handle.generation) return *s;
+    const auto found = resident_sequences.find(handle.value);
+    if (found != resident_sequences.end() && found->second->epoch == handle.generation)
+        return *found->second;
     throw std::logic_error("stale GLM5Next sequence");
 }
 
@@ -104,10 +113,15 @@ void SessionImpl::submit_releases() {
 }
 
 void SessionImpl::clear(Sequence& s) noexcept {
+    s.computing = false;
+    if (const auto found = resident_sequences.find(s.id);
+        found != resident_sequences.end() && found->second == &s)
+        resident_sequences.erase(found);
     try {
         vision_window.revoke(member(s));
         release_residency(member(s).residency);
         s.capture.reset();
+        s.prefix = {};
         for (auto& history : s.histories) history.reset();
         auto& states = directory.states();
         if (s.write_destination.valid()) {
@@ -195,9 +209,9 @@ bool Session::has_context_operation() const noexcept {
 }
 
 bool Session::execution_pending(SequenceHandle handle) const noexcept {
-    return impl_->compute &&
-           std::find(impl_->compute->members.begin(), impl_->compute->members.end(), handle) !=
-               impl_->compute->members.end();
+    const auto found = impl_->resident_sequences.find(handle.value);
+    return found != impl_->resident_sequences.end() && found->second->epoch == handle.generation &&
+           found->second->computing;
 }
 
 bool Session::context_blocks(SequenceHandle handle) const noexcept {
@@ -339,6 +353,29 @@ std::optional<SequenceHandle> Session::prefill_continuation() const {
 
 void Session::yield_prefill(SequenceHandle h) {
     impl_->vision_window.revoke(impl_->member(impl_->sequence(h)));
+}
+
+} // namespace ninfer::models::glm5next
+
+namespace ninfer::models::glm5next {
+runtime::PrefixId Session::checkpoint_prefix(CheckpointHandle h) const {
+    return impl_->checkpoints.at(h).snapshot.input_prefix().id();
+}
+
+std::vector<runtime::PrefixId> Session::matching_prefixes(const RequestBasePlan& base) const {
+    const auto& plan = *base.plan_;
+    return plan.query.ancestors();
+}
+
+std::vector<runtime::PrefixRelation>
+Session::recovery_relations(std::span<const runtime::PrefixId> ids) const {
+    return impl_->prefixes.relations(ids);
+}
+
+bool Session::recovery_precedes(runtime::PrefixId a, std::uint32_t af, runtime::PrefixId b,
+                                std::uint32_t bf) const {
+    return af <= bf && impl_->prefixes.valid(a) && impl_->prefixes.valid(b) &&
+           impl_->prefixes.is_prefix(a, b);
 }
 
 } // namespace ninfer::models::glm5next

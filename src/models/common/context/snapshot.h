@@ -4,6 +4,7 @@
 #include "models/common/context/directory/state.h"
 #include "models/common/context/directory.h"
 #include "models/common/context/work.h"
+#include "models/common/context/prefix.h"
 
 #include <algorithm>
 #include <memory>
@@ -14,13 +15,23 @@
 
 namespace ninfer::models::context {
 
-// A complete immutable recovery point. Metadata and identity are native types; the common
-// owner only retains the exact StateImage and the supplied logical KV prefixes.
-template <class Metadata, class Identity>
+template <class Store, class Handle>
+std::uint32_t retired_state_references(const Store& checkpoints, StateId image,
+                                       std::span<const Handle> retired) {
+    std::uint32_t result = 0;
+    for (auto it = retired.begin(); it != retired.end(); ++it)
+        if (std::find(retired.begin(), it, *it) == it &&
+            checkpoints.at(*it).snapshot.continuation().image == image)
+            ++result;
+    return result;
+}
+
+// One coherent native continuation, its physical history prefixes and exact input endpoint.
+template <class Metadata>
 class ContextSnapshot {
 public:
     ContextSnapshot(StateDirectory& states, Continuation<Metadata> continuation,
-                    std::vector<HistoryPrefix> prefixes, std::shared_ptr<const Identity> identity)
+                    std::vector<HistoryPrefix> prefixes, PrefixRef identity)
         : states_(&states), continuation_(std::move(continuation)), prefixes_(std::move(prefixes)),
           identity_(std::move(identity)) {
         if (!identity_) throw std::invalid_argument("snapshot has no input identity");
@@ -70,11 +81,7 @@ public:
         return continuation_;
     }
 
-    [[nodiscard]] const Identity& identity() const noexcept { return *identity_; }
-
-    [[nodiscard]] const std::shared_ptr<const Identity>& identity_owner() const noexcept {
-        return identity_;
-    }
+    [[nodiscard]] const PrefixRef& input_prefix() const noexcept { return identity_; }
 
     [[nodiscard]] const HistoryPrefix& prefix(std::size_t index) const {
         return prefixes_.at(index);
@@ -94,17 +101,27 @@ public:
     }
 
     [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
-    restore_requirements(const ContextDirectory& directory) const {
+    restore_requirements(const ContextDirectory& directory,
+                         const ContextReleaseSet& removed_device = {}) const {
         std::vector<runtime::ContextTransferRequirement> result;
         const auto state_records = states_->allocations(continuation_.image);
         for (const auto rank : states_->ranks(states_->variant(continuation_.image))) {
             if (std::any_of(state_records.begin(), state_records.end(), [&](const auto& record) {
                     return record.domain.rank == rank &&
-                           record.domain.memory == ContextMemory::Device;
+                           record.domain.memory == ContextMemory::Device &&
+                           std::find(removed_device.records.begin(), removed_device.records.end(),
+                                     record) == removed_device.records.end();
                 }))
                 continue;
-            const auto source = states_->host_binding(continuation_.image, rank);
-            auto requirement  = state_transfer_requirement(
+            const auto source =
+                std::any_of(state_records.begin(), state_records.end(),
+                            [&](const auto& record) {
+                                return record.domain.rank == rank &&
+                                       record.domain.memory == ContextMemory::Device;
+                            })
+                    ? states_->device_binding(continuation_.image, rank)
+                    : states_->host_binding(continuation_.image, rank);
+            auto requirement = state_transfer_requirement(
                 {source.bytes, 1}, runtime::ContextTransferDirection::HostToDevice);
             requirement.rank = rank;
             result.push_back(requirement);
@@ -121,8 +138,18 @@ public:
                     if (std::find(ranks.begin(), ranks.end(), part.rank) == ranks.end()) continue;
                     const auto columns = std::min<std::uint32_t>(
                         kPagedKVPageSize, prefix.frontier() - i * kPagedKVPageSize);
-                    if (storage.pages().device_covers(page, part.rank, columns)) continue;
-                    const auto source = storage.pages().host_binding(page, part.rank);
+                    const bool resident = storage.pages().device_covers(page, part.rank, columns);
+                    bool removed        = false;
+                    if (resident && !removed_device.records.empty())
+                        for (const auto& record :
+                             storage.pages().records(page, ContextMemory::Device))
+                            removed |= record.domain.rank == part.rank &&
+                                       std::find(removed_device.records.begin(),
+                                                 removed_device.records.end(),
+                                                 record) != removed_device.records.end();
+                    if (resident && !removed) continue;
+                    const auto source = resident ? storage.pages().physical(page, part.rank)
+                                                 : storage.pages().host_binding(page, part.rank);
                     work.payload_bytes += source.bytes;
                     ++work.copy_operations;
                     ++missing;
@@ -135,6 +162,28 @@ public:
                     result.push_back(requirement);
                 }
             }
+        }
+        return result;
+    }
+
+    // Resuming computation can require a private tail even when every saved byte is resident.
+    // Replica demotion leaves the logical writer/reference conditions unchanged.
+    [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
+    replay_requirements(const ContextDirectory& directory,
+                        std::span<const ContextSnapshot* const> retired = {}) const {
+        std::vector<runtime::ContextTransferRequirement> result;
+        std::vector<const HistoryPrefix*> retired_prefixes;
+        retired_prefixes.reserve(retired.size());
+        for (std::size_t pool = 0; pool < prefixes_.size(); ++pool) {
+            const auto& prefix = prefixes_[pool];
+            retired_prefixes.clear();
+            for (const auto* snapshot : retired)
+                retired_prefixes.push_back(&snapshot->prefix(pool));
+            const auto& histories = directory.pool(prefix.history().pool_id).histories();
+            auto copies           = history_tail_requirements(
+                histories, histories.binding_demand(&prefix, prefix.frontier(), prefix.frontier(),
+                                                              retired_prefixes));
+            result.insert(result.end(), copies.begin(), copies.end());
         }
         return result;
     }
@@ -159,7 +208,7 @@ private:
     StateDirectory* states_;
     Continuation<Metadata> continuation_;
     std::vector<HistoryPrefix> prefixes_;
-    std::shared_ptr<const Identity> identity_;
+    PrefixRef identity_;
     ContextUse use_       = ContextUse::Cache;
     ContextMemory memory_ = ContextMemory::Device;
 };

@@ -25,6 +25,18 @@ void validate_sampling(const ResolvedSamplingParameters& sampling) {
 
 } // namespace
 
+context::InputIdentityView RequestBasePlanImpl::identity_view(context::TokenView tokens) const {
+    context::InputIdentityView out{.tokens          = tokens,
+                                   .types           = prompt->token_types,
+                                   .generated_delta = prompt->rope_delta,
+                                   .media           = media};
+    const auto count = prompt->token_ids.size();
+    for (std::size_t axis = 0; axis < 3; ++axis)
+        out.positions[axis] =
+            std::span<const std::int32_t>(prompt->positions).subspan(axis * count, count);
+    return out;
+}
+
 bool RequestBasePlanImpl::accepts_capture(std::uint32_t frontier) const noexcept {
     if (frontier == 0 || frontier > summary.prompt_tokens) { return false; }
     if (vision && !vision->can_checkpoint(frontier)) return false;
@@ -32,12 +44,10 @@ bool RequestBasePlanImpl::accepts_capture(std::uint32_t frontier) const noexcept
 }
 
 CaptureGroup RequestBasePlanImpl::capture_group(std::uint32_t frontier) const {
-    if (!capture_backing || !accepts_capture(frontier)) {
+    if (!accepts_capture(frontier)) {
         throw std::logic_error("capture identity requires a legal prompt frontier");
     }
-    return {.identity = capture_backing,
-            .key      = {prefix_digests.at(frontier), frontier, prefix_identity_tag},
-            .frontier = frontier};
+    return {.frontier = frontier};
 }
 
 RequestBasePlan SessionImpl::plan_request(qwen::PreparedPromptData&& prompt,
@@ -104,24 +114,20 @@ RequestBasePlan SessionImpl::plan_request(qwen::PreparedPromptData&& prompt,
                                                   plan.vision_max_features);
     }
 
-    base->prefix_digests.assign(prompt);
     base->prefix_identity_tag = static_cast<std::uint32_t>(speculative_backend) |
                                 (static_cast<std::uint32_t>(plan.proposal_head) << 8U) |
                                 (static_cast<std::uint32_t>(plan.kv_storage) << 16U);
     base->prompt = std::make_shared<const qwen::PreparedPromptData>(std::move(prompt));
+    for (const auto& item : base->prompt->vision_items) base->media.push_back({&item});
+    base->query = context::PrefixQuery(prefixes, base->prefix_identity_tag, base->identity_view());
     if (base->summary.publish_continuation) {
         const auto& prepared = *base->prompt;
-        auto backing         = std::make_shared<PreparedCaptureBacking>();
-        backing->digests     = base->prefix_digests;
-        backing->ledger      = prepared.token_ids;
-        backing->prefix_identity.assign(prepared);
-        base->capture_backing = std::move(backing);
-        const auto add        = [&](std::uint32_t frontier, runtime::CheckpointRole role,
+        const auto add       = [&](std::uint32_t frontier, runtime::CheckpointRole role,
                              SharedCandidateEvidence evidence = SharedCandidateEvidence::None) {
             if (!base->accepts_capture(frontier)) { return; }
             auto it =
                 std::find_if(base->capture_groups.begin(), base->capture_groups.end(),
-                                    [frontier](const auto& group) { return group.frontier == frontier; });
+                                   [frontier](const auto& group) { return group.frontier == frontier; });
             if (it == base->capture_groups.end()) {
                 base->capture_groups.push_back(base->capture_group(frontier));
                 it = std::prev(base->capture_groups.end());
@@ -199,24 +205,32 @@ UnitDemand SessionImpl::next_unit(const SequenceState& state, const RequestContr
 }
 
 ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> units) {
-    std::array<UnitDemand, kMaximumConcurrency> demands{};
-    std::array<UnitDemand, kMaximumConcurrency> coverage{};
-    std::array<std::uint32_t, kMaximumConcurrency> old_main{}, old_backend{};
-    std::array<std::uint32_t, kMaximumConcurrency> add_main{}, add_backend{};
-    std::array<bool, kMaximumConcurrency> seen{};
+    struct Need {
+        std::uint32_t lane = 0;
+        UnitDemand demand{}, coverage{};
+        std::uint32_t old_main = 0, old_backend = 0, add_main = 0, add_backend = 0;
+        context::ContextDemandId main_id{}, backend_id{};
+        bool added = false;
+    };
+
+    std::vector<Need> needs;
+    needs.reserve(units.size());
+    const auto mark = next_lane_mark();
     for (std::size_t index = 0; index < units.size(); ++index) {
         const auto& unit = units[index];
         if (!valid_sequence(unit.sequence)) {
             throw std::logic_error("execution unit has a stale lane");
         }
         const auto lane = this->lane(unit.sequence);
-        if (seen[lane]) { throw std::logic_error("duplicate lane in unit reservation"); }
-        seen[lane]        = true;
+        if (lane_marks[lane] == mark) throw std::logic_error("duplicate lane in unit reservation");
+        lane_marks[lane]  = mark;
+        auto& need        = needs.emplace_back();
+        need.lane         = lane;
         auto& request     = requests[lane];
         const auto& state = active_sequence(lane);
-        demands[lane]     = next_unit(state, request, unit.kind, unit.tokens);
+        need.demand       = next_unit(state, request, unit.kind, unit.tokens);
         if (unit.kind == ExecutionUnitKind::Prefill || unit.kind == ExecutionUnitKind::Replay) {
-            auto& demand = demands[lane];
+            auto& demand = need.demand;
             demand.main_frontier =
                 window_end(state, request, state.continuation.metadata.execution_frontier,
                            demand.main_frontier, vision_window);
@@ -226,7 +240,7 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
                                                            : 0;
         }
         if ((unit.kind == ExecutionUnitKind::Prefill || unit.kind == ExecutionUnitKind::Replay) &&
-            demands[lane].main_frontier == state.continuation.metadata.execution_frontier &&
+            need.demand.main_frontier == state.continuation.metadata.execution_frontier &&
             state.continuation.metadata.execution_frontier < request.base->summary.prompt_tokens)
             return {.status = runtime::UnitReservationStatus::ExecutionUnavailable};
         if (request.permit) {
@@ -236,73 +250,72 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
             if (unit.kind == ExecutionUnitKind::Prefill || unit.kind == ExecutionUnitKind::Replay) {
                 // A permit retains capacity through its frontier. A checkpoint or an execution
                 // window may shorten the next prefix, but cannot enlarge that retained grant.
-                demands[lane].main_frontier =
-                    std::min(demands[lane].main_frontier, permit.main_frontier);
-                demands[lane].backend_frontier =
-                    std::min(demands[lane].backend_frontier, permit.backend_frontier);
-            } else if (permit.main_frontier != demands[lane].main_frontier ||
-                       permit.backend_frontier != demands[lane].backend_frontier)
+                need.demand.main_frontier =
+                    std::min(need.demand.main_frontier, permit.main_frontier);
+                need.demand.backend_frontier =
+                    std::min(need.demand.backend_frontier, permit.backend_frontier);
+            } else if (permit.main_frontier != need.demand.main_frontier ||
+                       permit.backend_frontier != need.demand.backend_frontier)
                 throw std::logic_error("an existing execution permit cannot change its frontier");
         }
-        coverage[lane] = request.recovery ? request.recovery->coverage : demands[lane];
-        if (demands[lane].main_frontier > coverage[lane].main_frontier ||
-            demands[lane].backend_frontier > coverage[lane].backend_frontier)
+        need.coverage = request.recovery ? request.recovery->coverage : need.demand;
+        if (need.demand.main_frontier > need.coverage.main_frontier ||
+            need.demand.backend_frontier > need.coverage.backend_frontier)
             throw std::logic_error("execution exceeds the retained recovery capacity");
         if (request.permit) continue;
         const auto main = text_kv_histories->write_pages(state.kv->text.handle(),
                                                          state.continuation.metadata.text_kv_valid,
-                                                         coverage[lane].main_frontier);
-        old_main[lane]  = text_kv_histories->reserved_growth_pages(state.kv->text.handle());
-        add_main[lane]  = main > old_main[lane] ? main - old_main[lane] : 0;
+                                                         need.coverage.main_frontier);
+        need.old_main   = text_kv_histories->reserved_growth_pages(state.kv->text.handle());
+        need.add_main   = main > need.old_main ? main - need.old_main : 0;
         if (state.kv->backend) {
             const auto backend = backend_kv_histories->write_pages(state.kv->backend->handle(),
                                                                    backend_kv_valid(state),
-                                                                   coverage[lane].backend_frontier);
-            old_backend[lane] =
+                                                                   need.coverage.backend_frontier);
+            need.old_backend =
                 backend_kv_histories->reserved_growth_pages(state.kv->backend->handle());
-            add_backend[lane] = backend > old_backend[lane] ? backend - old_backend[lane] : 0;
+            need.add_backend = backend > need.old_backend ? backend - need.old_backend : 0;
         }
     }
     ContextDemand bundle;
-    std::array<context::ContextDemandId, kMaximumConcurrency> main_ids, backend_ids;
-    for (const auto& unit : units) {
-        const auto lane = this->lane(unit.sequence);
+    for (auto& need : needs) {
+        const auto lane = need.lane;
         if (requests[lane].permit) continue;
         const auto& state = active_sequence(lane);
-        main_ids[lane] =
-            bundle.add_growth(*text_kv_histories, state.kv->text.handle(), add_main[lane]);
+        need.main_id =
+            bundle.add_growth(*text_kv_histories, state.kv->text.handle(), need.add_main);
         if (state.kv->backend)
-            backend_ids[lane] = bundle.add_growth(*backend_kv_histories,
-                                                  state.kv->backend->handle(), add_backend[lane]);
+            need.backend_id = bundle.add_growth(*backend_kv_histories, state.kv->backend->handle(),
+                                                need.add_backend);
     }
     auto assessment = directory.assess(bundle);
     if (!assessment.ready()) return {.assessment = std::move(assessment)};
     auto reserved = directory.reserve(bundle);
     if (!reserved) return {.assessment = std::move(reserved.assessment)};
-    std::array<bool, kMaximumConcurrency> added{};
     try {
-        for (const auto& unit : units) {
-            const auto lane = this->lane(unit.sequence);
+        for (auto& need : needs) {
+            const auto lane = need.lane;
             if (requests[lane].permit) { continue; }
             auto& state = active_sequence(lane);
-            added[lane] = true;
-            auto main   = reserved.reservation->take(main_ids[lane]);
+            need.added  = true;
+            auto main   = reserved.reservation->take(need.main_id);
             text_kv_histories->prepare_growth(state.kv->text.handle(), main);
             text_kv_histories->adopt_growth(state.kv->text.handle(), std::move(main));
             if (state.kv->backend) {
-                auto backend = reserved.reservation->take(backend_ids[lane]);
+                auto backend = reserved.reservation->take(need.backend_id);
                 backend_kv_histories->prepare_growth(state.kv->backend->handle(), backend);
                 backend_kv_histories->adopt_growth(state.kv->backend->handle(), std::move(backend));
             }
-            requests[lane].permit = demands[lane];
+            requests[lane].permit = need.demand;
         }
     } catch (...) {
-        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
-            if (!added[lane]) { continue; }
+        for (const auto& need : needs) {
+            const auto lane = need.lane;
+            if (!need.added) { continue; }
             auto& state = active_sequence(lane);
-            text_kv_histories->shrink_growth(state.kv->text.handle(), old_main[lane]);
+            text_kv_histories->shrink_growth(state.kv->text.handle(), need.old_main);
             if (state.kv->backend) {
-                backend_kv_histories->shrink_growth(state.kv->backend->handle(), old_backend[lane]);
+                backend_kv_histories->shrink_growth(state.kv->backend->handle(), need.old_backend);
             }
             requests[lane].permit.reset();
         }

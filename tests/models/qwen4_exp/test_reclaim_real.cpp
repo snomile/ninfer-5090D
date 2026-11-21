@@ -118,16 +118,14 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
         for (std::uint16_t pool = 0; pool < 2; ++pool)
             prefixes.push_back(p.directory.pool(pool).histories().retain_prefix(
                 owners[pool].handle(), frontier - pool));
-        auto identity = std::make_shared<q4::detail::Identity>();
         models::qwen::PreparedPromptData prompt;
         prompt.token_ids.resize(frontier, 1);
         prompt.token_types.resize(frontier);
         prompt.positions.resize(frontier * 3);
         for (unsigned axis = 0; axis < 3; ++axis)
             for (unsigned i = 0; i < frontier; ++i) prompt.positions[axis * frontier + i] = i;
-        identity->tokens = prompt.token_ids;
-        identity->positions.assign(prompt);
-        identity->digests.assign(prompt);
+        auto identity =
+            p.prefixes.prepare(0, {.tokens = context::TokenView(prompt.token_ids)}, frontier);
         const auto handle = *p.checkpoints.reserve();
         p.checkpoints.publish(
             handle,
@@ -270,9 +268,12 @@ int main() {
         auto definition = q4::read_definition(reader, models::load_options(options));
         auto profile    = q4::execution::describe_model(*definition);
         auto load       = q4::resolve_load(reader, definition, device->device(), Device::cpu());
-        auto execution  = q4::plan_execution(profile, load.ple_table().geometry(), options, *device,
-                                             8ULL * 1024 * 1024 * 1024,
-                                             q4::describe_moe_plan(*profile, options.moe));
+        auto execution  = q4::plan_execution(
+            profile, load.ple_table().geometry(), options,
+            std::make_shared<const models::BatchExecutionPlan>(models::make_batch_execution_spec(
+                options.max_concurrency, 1,
+                options.use_cuda_graph && options.purpose == EnginePurpose::Generation)),
+            *device, 8ULL * 1024 * 1024 * 1024, q4::describe_moe_plan(*profile, options.moe));
         require(execution.has_value(), "reclaim test execution plan does not fit");
         auto session_plan = q4::plan_session(*execution);
         auto model        = q4::materialize_model(std::move(load), *device);
@@ -282,7 +283,7 @@ int main() {
             std::make_unique<q4::RankProgram>(instance->parameters, std::move(*execution), *device);
         auto worker = std::make_unique<runtime::RankWorker<q4::RuntimeTypes>>(std::move(device),
                                                                               std::move(instance));
-        Executor executor(std::move(worker), {1});
+        Executor executor(std::move(worker), {1}, options.max_concurrency);
         q4::detail::SessionImpl session(definition, std::move(session_plan));
         session.executor            = &executor;
         session.identity_generation = executor.epoch().value;

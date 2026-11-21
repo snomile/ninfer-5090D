@@ -1,3 +1,4 @@
+#include "models/common/context/recovery_value.h"
 #include "models/common/context/recovery.h"
 #include "models/common/context/release_inventory.h"
 #include "models/common/context/directory.h"
@@ -23,7 +24,6 @@ struct View {
     context::MetadataBudget metadata{context::CheckpointStore<Record>::metadata_bytes(128) +
                                      context::RecoveryIndex<>::metadata_bytes(128) * 4};
     context::CheckpointStore<Record> store{128, metadata};
-    bool collide = false;
 
     const std::uint64_t& revision() const { return store.revision(); }
 
@@ -35,18 +35,28 @@ struct View {
 
     std::uint32_t frontier(Handle h) const { return store.at(h).tokens.size(); }
 
-    context::RecoveryKey key(Handle h, std::uint32_t f) const {
-        const auto& value    = store.at(h);
-        std::uint64_t digest = 1;
-        for (std::size_t i = 0; i < f && !collide; ++i) digest = digest * 131 + value.tokens.at(i);
-        return {{digest, digest ^ 42}, value.domain};
-    }
-
     bool prefix(Handle a, Handle b) const {
         const auto& x = store.at(a);
         const auto& y = store.at(b);
         return x.domain == y.domain && x.tokens.size() <= y.tokens.size() &&
                std::equal(x.tokens.begin(), x.tokens.end(), y.tokens.begin());
+    }
+
+    std::vector<ninfer::runtime::PrefixRelation> relations() const {
+        std::vector<ninfer::runtime::PrefixRelation> out(capacity());
+        for (std::uint32_t i = 0; i < capacity(); ++i) {
+            if (!valid(handle(i))) continue;
+            out[i].representative = i;
+            for (std::uint32_t j = 0; j < capacity(); ++j) {
+                if (!valid(handle(j)) || !prefix(handle(j), handle(i))) continue;
+                if (frontier(handle(j)) == frontier(handle(i)))
+                    out[i].representative = std::min(out[i].representative, j);
+                else if (out[i].parent == UINT32_MAX ||
+                         frontier(handle(j)) > frontier(handle(out[i].parent)))
+                    out[i].parent = j;
+            }
+        }
+        return out;
     }
 
     Handle add(std::vector<std::uint32_t> tokens, std::uint32_t domain = 0) {
@@ -57,17 +67,25 @@ struct View {
     }
 };
 
-// Independent exhaustive definition: one maximum degradation per maximal removed branch.
+// Independent exhaustive definition: group positive recovery degradation, not removed aliases.
 std::uint64_t oracle(const View& view, std::span<const Handle> input,
                      std::span<const Handle> advertised) {
     std::vector<Handle> removed;
     for (const auto h : input)
         if (view.valid(h) && std::find(removed.begin(), removed.end(), h) == removed.end())
             removed.push_back(h);
+    const auto degraded = [&](Handle h) {
+        return std::none_of(advertised.begin(), advertised.end(), [&](auto kept) {
+            return view.valid(kept) &&
+                   std::find(removed.begin(), removed.end(), kept) == removed.end() &&
+                   view.frontier(kept) == view.frontier(h) && view.prefix(kept, h);
+        });
+    };
     std::uint64_t result = 0;
     for (const auto branch : removed) {
+        if (!degraded(branch)) continue;
         if (std::any_of(removed.begin(), removed.end(), [&](auto other) {
-                return other != branch && view.prefix(branch, other) &&
+                return other != branch && degraded(other) && view.prefix(branch, other) &&
                        (view.frontier(branch) < view.frontier(other) || other.index < branch.index);
             }))
             continue;
@@ -85,6 +103,22 @@ std::uint64_t oracle(const View& view, std::span<const Handle> input,
         result += worst;
     }
     return result;
+}
+
+void redundant_aliases_do_not_split_loss() {
+    View view;
+    const auto p = view.add({1});
+    const auto a = view.add({1, 2}), aa = view.add({1, 2});
+    const auto b = view.add({1, 3}), bb = view.add({1, 3});
+    context::RecoveryIndex index(view.metadata);
+    index.synchronize(view);
+    const std::array all{p, a, aa, b, bb};
+    auto evaluation = index.evaluate(all);
+    require(evaluation.loss(std::array{p}) == 1 && evaluation.loss(std::array{a, b}) == 0 &&
+                evaluation.loss(std::array{p, a, b}) == 1,
+            "redundant aliases split a shared ancestor's recovery loss");
+    require(evaluation.loss(std::array{p, a, aa, b}) == 2,
+            "removing the last equivalent source lost its real degradation");
 }
 
 void catalog_reclamation() {
@@ -126,15 +160,14 @@ void known_losses() {
                 "branch loss depended on checkpoint order or dropped the common ancestor");
         const std::array chain{root, reverse ? b : a};
         require(first.loss(chain) == 100, "intermediate fallback hid a shallow recovery point");
-        const auto comparisons = index.work().exact_comparisons;
+        const auto comparisons = index.work().relations;
         for (int i = 0; i < 50; ++i) require(first.loss(removed) == 300, "query state leaked");
-        require(index.work().exact_comparisons == comparisons, "query rescanned token identities");
+        require(index.work().relations == comparisons, "query rescanned token identities");
     }
 }
 
 void lifecycle() {
     View view;
-    view.collide = true;
     context::RecoveryIndex index(view.metadata);
     const auto deep = view.add({1, 2, 3, 4});
     index.synchronize(view);
@@ -147,7 +180,7 @@ void lifecycle() {
     auto evaluation = index.evaluate(advertised);
     require(evaluation.prefix(shallow, deep) && !evaluation.prefix(unrelated, deep) &&
                 !evaluation.prefix(domain, deep),
-            "digest collision or domain invented a prefix");
+            "unrelated input or identity domain invented a prefix");
     const std::array removed{shallow, shallow, deep};
     require(evaluation.loss(removed) == 2, "surviving alias did not provide fallback");
     require(view.store.erase(shallow), "could not retire a checkpoint");
@@ -180,7 +213,6 @@ void exhaustive_and_random() {
     std::mt19937 random(20261019);
     for (unsigned fixture = 0; fixture < 80; ++fixture) {
         View view;
-        view.collide = fixture % 4 == 0;
         context::RecoveryIndex index(view.metadata);
         std::vector<Handle> handles;
         for (unsigned i = 0; i < 32; ++i) {
@@ -216,9 +248,9 @@ void exhaustive_and_random() {
             std::erase_if(reduced, [&](auto h) {
                 return std::find(unavailable.begin(), unavailable.end(), h) != unavailable.end();
             });
-            require(
-                evaluation.loss(removed, unavailable) == oracle(view, removed, reduced),
-                "admission gain used a removed fallback or scored the victim as incoming value");
+            require(evaluation.loss(removed, unavailable) == oracle(view, removed, reduced),
+                    "admission gain used a removed fallback or scored the victim as incoming "
+                    "value");
         }
     }
 }
@@ -312,12 +344,85 @@ void marginal_dependencies() {
         }
     }
 }
+
+void recovery_workspace_returns_idle_high_water() {
+    context::MetadataBudget catalog(32ULL << 20);
+    context::RecoveryMetadata workspace(catalog, 2);
+    context::RecoveryIndex<> index(catalog, &workspace);
+    context::CheckpointStore<Record> store(512, catalog, &index);
+    const auto idle = workspace.budget().limit();
+    std::vector<Handle> handles;
+    for (unsigned i = 0; i < 257; ++i) {
+        const auto h = store.reserve();
+        require(h.has_value(), "workspace growth exhausted the fixture");
+        store.publish(*h, {{i + 1}, 0});
+        handles.push_back(*h);
+    }
+    const auto peak = workspace.budget().limit();
+    require(peak > idle, "catalog did not grow its protected workspace");
+    {
+        context::MetadataAccount active(workspace.budget());
+        active.acquire(1024);
+        for (auto h : handles) require(store.erase(h), "retirement failed");
+        require(store.metadata_extent() == 0 && workspace.budget().limit() == peak,
+                "active decision lost the workspace promised before checkpoint retirement");
+    }
+    require(workspace.budget().limit() == idle,
+            "idle decision workspace retained its high-water quota");
+    const auto h = store.reserve();
+    require(h && workspace.budget().limit() > idle && workspace.budget().limit() < peak,
+            "recycled low slots regrew the obsolete high-water workspace");
+    store.cancel(*h);
+    require(workspace.budget().limit() == idle, "cancelled catalog growth retained its quota");
+}
+
+void reserved_decision_metadata() {
+    context::MetadataBudget parent(1024);
+    {
+        context::MetadataBudget child(400, &parent);
+        require(parent.reserved() == 400, "child did not protect its quota");
+        child.acquire(120);
+        child.reserve(80);
+        child.consume(80);
+        require(parent.allocated() == 200 && parent.reserved() == 200,
+                "child spending was not visible to parent accounting");
+        child.release(200);
+        bool failed = false;
+        try {
+            child.grow(1025);
+        } catch (const context::MetadataExhausted&) { failed = true; }
+        require(failed && child.limit() == 400 && parent.reserved() == 400,
+                "failed quota growth changed accounting");
+    }
+    require(parent.available() == 1024, "child quota leaked on destruction");
+    const auto required = context::recovery_value_metadata_bytes(8, 2) +
+                          context::CheckpointStore<Record>::metadata_bytes(8) +
+                          context::RecoveryIndex<>::metadata_bytes(8);
+    context::MetadataBudget catalog(required);
+    context::RecoveryMetadata protected_work(catalog, 2);
+    context::RecoveryIndex<> index(catalog, &protected_work);
+    context::CheckpointStore<Record> store(8, catalog, &index);
+    auto handle = store.reserve();
+    require(handle.has_value(), "descriptor could not reserve its recovery workspace");
+    store.publish(*handle, {{1, 2, 3}, 0});
+    context::MetadataAccount other(catalog);
+    other.acquire(catalog.available());
+    context::MetadataAccount decision(protected_work.budget());
+    decision.acquire(protected_work.budget().available());
+    require(catalog.available() == 0 && decision.bytes() > 0,
+            "catalog pressure consumed its reserved eviction workspace");
+    require(store.erase(*handle), "decision metadata prevented checkpoint retirement");
+}
+
 } // namespace
 
 int main() {
     try {
+        recovery_workspace_returns_idle_high_water();
+        reserved_decision_metadata();
         catalog_reclamation();
         known_losses();
+        redundant_aliases_do_not_split_loss();
         lifecycle();
         exhaustive_and_random();
         physical_selection();

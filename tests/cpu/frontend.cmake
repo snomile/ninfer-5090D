@@ -23,6 +23,8 @@ add_library(ninfer_cpu_frontend_support STATIC ${cpu_topology}
   "${NINFER_SOURCE_DIR}/src/core/dtype.cpp"
   "${NINFER_SOURCE_DIR}/src/core/memory.cpp"
   "${NINFER_SOURCE_DIR}/src/core/layout.cpp"
+  "${NINFER_SOURCE_DIR}/src/models/common/context/prefix.cpp"
+  "${NINFER_SOURCE_DIR}/src/models/common/context/request_ledger.cpp"
   "${NINFER_SOURCE_DIR}/src/media/decode/decode.cpp"
   "${NINFER_SOURCE_DIR}/src/media/decode/jpeg.cpp")
 cpu_includes(ninfer_cpu_frontend_support)
@@ -35,7 +37,6 @@ target_sources(ninfer_jinja PRIVATE "${NINFER_SOURCE_DIR}/src/text/jinja.cpp")
 cpu_includes(ninfer_jinja)
 target_link_libraries(ninfer_jinja PUBLIC ninfer_cpu_text)
 add_library(ninfer_cpu_frontend STATIC
-  "${NINFER_SOURCE_DIR}/src/models/common/qwen/prefix_identity.cpp"
   "${NINFER_SOURCE_DIR}/src/models/common/vision/window.cpp")
 foreach(source IN ITEMS resources chat_template prompt output_resources output_session tools
     image_transform media_cache digest)
@@ -61,6 +62,8 @@ cpu_test(ninfer_qwen_tool_constraints_test tests/models/common/qwen/test_tool_co
   ninfer_cpu_frontend)
 cpu_test(ninfer_tool_call_parser_test tests/models/common/qwen/test_tool_call_parser.cpp
   ninfer_cpu_frontend)
+cpu_test(ninfer_prefix_store_test tests/models/common/context/test_prefix.cpp
+  ninfer_cpu_frontend_support)
 add_test(NAME ninfer_qwen_tool_schema_oracle_test COMMAND "${CMAKE_COMMAND}" -E env
   "NINFER_TOOL_PROBE=$<TARGET_FILE:ninfer_qwen_tool_constraints_test>"
   "${Python3_EXECUTABLE}" -B "${NINFER_SOURCE_DIR}/tests/models/common/qwen/test_tool_schema.py")

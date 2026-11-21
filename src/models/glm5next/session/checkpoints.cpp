@@ -15,7 +15,10 @@ PreparedCheckpoint SessionImpl::prepare_checkpoint(Sequence& s) {
     for (std::uint32_t pool = 0; pool < pool_count(); ++pool)
         demand.add_growth(directory.pool(pool).histories(), s.histories[pool].handle(), 0);
     if (!directory.reserve(demand)) return {};
-    return {std::move(record), capture_identity(s)};
+    auto identity = s.prefix.try_checkpoint(s.request->identity_view(s.ledger.view()),
+                                            s.continuation.metadata.main_frontier);
+    if (!identity) return {};
+    return {std::move(record), std::move(identity)};
 }
 
 std::optional<CheckpointHandle> SessionImpl::detach(Sequence& s, runtime::CheckpointRole role,
@@ -97,6 +100,9 @@ Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> vic
     auto ticket         = std::make_unique<detail::CaptureReservation>();
     ticket->states      = &p.directory.states();
     ticket->checkpoints = &p.checkpoints;
+    ticket->identity =
+        s.prefix.try_checkpoint(s.request->identity_view(s.ledger.view()), point.frontier);
+    if (!ticket->identity) return {};
     ticket->records.reserve(point.roles.size());
     for (const auto role : point.roles) {
         const auto record = p.checkpoints.reserve();
@@ -189,9 +195,8 @@ std::vector<CheckpointHandle> Session::share_capture(SequenceHandle h, Checkpoin
     const auto& prior = p.checkpoints.at(source);
     if (prior.frontier() != point.frontier ||
         prior.snapshot.continuation().metadata.placement != s.continuation.metadata.placement ||
-        prior.snapshot.identity().tag != s.request->identity->tag ||
-        !input_prefix_equal(prior.snapshot.identity().view(), s.request->identity->view(),
-                            point.frontier))
+        p.prefixes.domain(prior.snapshot.input_prefix().id()) != s.request->domain ||
+        !s.request->query.matches(prior.snapshot.input_prefix().id()))
         return {};
     std::unique_ptr<detail::CaptureReservation> prepared;
     auto* ticket = s.capture.get();
@@ -274,7 +279,7 @@ runtime::ContextStart Session::start_capture(SequenceHandle h) {
                                                 : s.continuation.metadata.mtp_frontier.value()));
         p.directory.states().freeze(s.continuation.image);
         tx.snapshot.emplace(p.directory.states(), s.continuation, std::move(prefixes),
-                            s.request->identity);
+                            std::move(reservation.identity));
         for (std::uint32_t rank = 0; rank < p.plan.states.size(); ++rank)
             if (const auto& field = p.plan.states[rank].draft_context)
                 migration.add_state_group(s.continuation.image, field->offset, field->bytes, rank);
@@ -291,6 +296,10 @@ runtime::ContextStart Session::start_capture(SequenceHandle h) {
 namespace ninfer::models::glm5next {
 
 std::size_t Session::checkpoint_extent() const noexcept { return impl_->checkpoints.size(); }
+
+std::uint64_t Session::checkpoint_catalog_revision() const noexcept {
+    return impl_->checkpoints.revision();
+}
 
 std::vector<runtime::ContextTransferRequirement>
 Session::checkpoint_restore_requirements(CheckpointHandle h) const {
@@ -316,18 +325,16 @@ CheckpointMetadata Session::checkpoint_metadata(CheckpointHandle h) const {
             .placement = c.snapshot.continuation().metadata.placement};
 }
 
-PrefixShortlistKey Session::checkpoint_key(CheckpointHandle h, std::uint32_t f) const {
-    const auto& c = impl_->checkpoints.at(h);
-    if (f > c.frontier()) throw std::out_of_range("checkpoint key exceeds its frontier");
-    return detail::key(c.snapshot.identity(), f);
+PrefixKey Session::checkpoint_key(CheckpointHandle h) const {
+    return impl_->checkpoints.at(h).snapshot.input_prefix().key();
 }
 
 bool Session::checkpoint_matches(CheckpointHandle h, const RequestBasePlan& base) const {
     if (!valid_checkpoint(h) || !base.plan_->reuse) return false;
     const auto& c        = impl_->checkpoints.at(h);
-    const auto& identity = c.snapshot.identity();
-    return identity.tag == base.plan_->identity->tag &&
-           input_prefix_equal(base.plan_->prompt.prefix_view(), identity.view(), c.frontier());
+    const auto& identity = c.snapshot.input_prefix();
+    return impl_->prefixes.domain(identity.id()) == base.plan_->domain &&
+           base.plan_->query.matches(identity.id());
 }
 
 std::uint32_t Session::checkpoint_recovery_frontier(CheckpointHandle h, const RequestBasePlan& base,

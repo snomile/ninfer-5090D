@@ -1,17 +1,15 @@
 #pragma once
 
-#include "runtime/contract/resources.h"
+#include "runtime/contract/recovery.h"
 
 #include <algorithm>
-#include <cstdint>
-#include <memory>
-#include <optional>
+#include <list>
+#include <unordered_map>
 #include <vector>
 
 namespace ninfer::runtime {
 
-// Compressed edges refer to a surviving native checkpoint's semantic digest path. The model
-// verifies exact token/position/media identity before a returned checkpoint can be used.
+// Runtime indexes cache visibility. Native owns exact semantic prefix matching and lifetime.
 template <class Model>
 class PrefixIndex {
 public:
@@ -19,14 +17,34 @@ public:
     using Session = typename Model::Session;
     using Base    = typename Model::RequestBasePlan;
 
-    void insert(Session& session, Handle handle, std::uint32_t frontier, CheckpointRole role) {
-        if (insert_at(session, root_, handle, frontier, role)) {
-            ++counters(role).retained;
-            ++counters(role).published;
-        }
+    PrefixIndex()                                  = default;
+    PrefixIndex(const PrefixIndex&)                = delete;
+    PrefixIndex& operator=(const PrefixIndex&)     = delete;
+    PrefixIndex(PrefixIndex&&) noexcept            = default;
+    PrefixIndex& operator=(PrefixIndex&&) noexcept = default;
+
+    void insert(Session& session, Handle handle, CheckpointRole role) {
+        if (entries_.contains(handle)) return;
+        const auto prefix = session.checkpoint_prefix(handle);
+        auto& group       = prefixes_[prefix];
+        group.push_back({handle, role});
+        entries_.emplace(handle, Location{prefix, std::prev(group.end())});
+        ++counters(role).retained;
+        ++counters(role).published;
     }
 
-    void erase(Handle handle, bool reclaimed = false) { erase_at(root_, handle, reclaimed, true); }
+    void erase(Handle handle, bool reclaimed = false) {
+        const auto found = entries_.find(handle);
+        if (found == entries_.end()) return;
+        auto& value = counters(found->second.entry->role);
+        --value.retained;
+        ++value.released;
+        if (reclaimed) ++value.reclaimed;
+        const auto group = prefixes_.find(found->second.prefix);
+        group->second.erase(found->second.entry);
+        if (group->second.empty()) prefixes_.erase(group);
+        entries_.erase(found);
+    }
 
     [[nodiscard]] const PrefixCacheStatistics& statistics() const noexcept { return statistics_; }
 
@@ -38,21 +56,12 @@ public:
 
     [[nodiscard]] std::vector<Handle> matches(const Session& session, const Base& base) const {
         std::vector<Handle> result;
-        const Node* current = &root_;
-        while (current) {
-            for (const auto& entry : current->checkpoints) result.push_back(entry.handle);
-            const Node* next = nullptr;
-            for (const auto& child : current->children) {
-                if (child->frontier > base.summary().prompt_tokens) { continue; }
-                const auto key = base.prefix_shortlist_key(child->frontier);
-                if (key && *key == session.checkpoint_key(child->representative, child->frontier)) {
-                    next = child.get();
-                    break;
-                }
-            }
-            current = next;
+        for (const auto prefix : session.matching_prefixes(base)) {
+            const auto found = prefixes_.find(prefix);
+            if (found == prefixes_.end()) continue;
+            for (auto entry = found->second.rbegin(); entry != found->second.rend(); ++entry)
+                result.push_back(entry->handle);
         }
-        std::reverse(result.begin(), result.end());
         return result;
     }
 
@@ -62,20 +71,28 @@ public:
             value->released += value->retained;
             value->retained = 0;
         }
-        root_ = Node{};
+        entries_.clear();
+        prefixes_.clear();
     }
-
 private:
     struct Entry {
         Handle handle;
         CheckpointRole role;
     };
 
-    struct Node {
-        std::uint32_t frontier = 0;
-        Handle representative{};
-        std::vector<Entry> checkpoints;
-        std::vector<std::unique_ptr<Node>> children;
+    struct Location {
+        PrefixId prefix;
+        typename std::list<Entry>::iterator entry;
+    };
+
+    struct HandleHash {
+        std::size_t operator()(Handle h) const noexcept { return h.index; }
+    };
+
+    struct PrefixHash {
+        std::size_t operator()(PrefixId h) const noexcept {
+            return h.index ^ (h.generation * 0x9e3779b97f4a7c15ULL);
+        }
     };
 
     PrefixCacheCounters& counters(CheckpointRole role) noexcept {
@@ -92,76 +109,8 @@ private:
         std::terminate();
     }
 
-    static bool insert_at(Session& session, Node& node, Handle handle, std::uint32_t frontier,
-                          CheckpointRole role) {
-        if (node.frontier == frontier) {
-            const bool added =
-                std::none_of(node.checkpoints.begin(), node.checkpoints.end(),
-                             [&](const auto& entry) { return entry.handle == handle; });
-            if (added) node.checkpoints.push_back({handle, role});
-            node.representative = handle;
-            return added;
-        }
-        for (auto& child : node.children) {
-            if (session.checkpoint_key(child->representative, node.frontier + 1U) !=
-                session.checkpoint_key(handle, node.frontier + 1U)) {
-                continue;
-            }
-            std::uint32_t low = node.frontier + 1U, high = std::min(frontier, child->frontier);
-            while (low < high) {
-                const auto middle = low + (high - low + 1U) / 2U;
-                if (session.checkpoint_key(child->representative, middle) ==
-                    session.checkpoint_key(handle, middle)) {
-                    low = middle;
-                } else {
-                    high = middle - 1U;
-                }
-            }
-            if (low < child->frontier) {
-                auto branch            = std::make_unique<Node>();
-                branch->frontier       = low;
-                branch->representative = child->representative;
-                branch->children.push_back(std::move(child));
-                child = std::move(branch);
-            }
-            return insert_at(session, *child, handle, frontier, role);
-        }
-        auto child            = std::make_unique<Node>();
-        child->frontier       = frontier;
-        child->representative = handle;
-        child->checkpoints.push_back({handle, role});
-        node.children.push_back(std::move(child));
-        return true;
-    }
-
-    bool erase_at(Node& node, Handle handle, bool reclaimed, bool root = false) {
-        std::erase_if(node.checkpoints, [&](const auto& entry) {
-            if (entry.handle != handle) return false;
-            auto& value = counters(entry.role);
-            --value.retained;
-            ++value.released;
-            if (reclaimed) ++value.reclaimed;
-            return true;
-        });
-        for (auto it = node.children.begin(); it != node.children.end();) {
-            if (erase_at(**it, handle, reclaimed)) {
-                it = node.children.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        if (root) { return false; }
-        if (node.checkpoints.empty() && node.children.empty()) { return true; }
-        if (node.checkpoints.empty() && node.children.size() == 1) {
-            auto child = std::move(node.children.front());
-            node       = std::move(*child);
-        }
-        node.representative = !node.checkpoints.empty() ? node.checkpoints.front().handle
-                                                        : node.children.front()->representative;
-        return false;
-    }
-
-    Node root_;
+    std::unordered_map<Handle, Location, HandleHash> entries_;
+    std::unordered_map<PrefixId, std::list<Entry>, PrefixHash> prefixes_;
     PrefixCacheStatistics statistics_;
 };
 } // namespace ninfer::runtime

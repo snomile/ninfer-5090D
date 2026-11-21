@@ -1,40 +1,13 @@
 #include "models/glm5next/session/internal.h"
 
 #include "models/common/context/physical_reclaim.h"
+#include "models/common/context/recovery_store.h"
 
 #include <algorithm>
 #include <unordered_set>
 
 namespace ninfer::models::glm5next::detail {
 namespace {
-struct RecoveryStoreView {
-    const Checkpoints& store;
-
-    const std::uint64_t& revision() const { return store.revision(); }
-
-    std::size_t capacity() const { return store.size(); }
-
-    auto handle(std::uint32_t index) const { return store.handle(index); }
-
-    bool valid(CheckpointHandle handle) const { return store.valid(handle); }
-
-    std::uint32_t frontier(CheckpointHandle handle) const { return store.at(handle).frontier(); }
-
-    context::RecoveryKey key(CheckpointHandle h, std::uint32_t f) const {
-        const auto& identity = store.at(h).snapshot.identity();
-        return {identity.digests.at(f), identity.tag};
-    }
-
-    bool prefix(CheckpointHandle a, CheckpointHandle b) const {
-        const auto& left  = store.at(a);
-        const auto& right = store.at(b);
-        return left.frontier() <= right.frontier() &&
-               left.snapshot.identity().tag == right.snapshot.identity().tag &&
-               input_prefix_equal(left.snapshot.identity().view(), right.snapshot.identity().view(),
-                                  left.frontier());
-    }
-};
-
 context::PhysicalReclaim physical_facts(const SessionImpl& session,
                                         std::span<const CheckpointHandle> allowed,
                                         std::span<const CheckpointHandle> excluded = {}) {
@@ -186,14 +159,17 @@ runtime::ContextReleaseMeasure Session::release_measure(const ContextReleaseSet&
 
 runtime::ContextStart Session::start_maintenance(const ContextAssessment& assessment) {
     auto& session = *impl_;
-    if (session.operation) return runtime::ContextStart::Deferred;
-    if (!session.pending_maintenance) {
-        const auto current = session.directory.assess(assessment.demand);
-        if (!current.requires_maintenance()) return runtime::ContextStart::Stale;
-        session.pending_maintenance = current;
-        session.directory.request_maintenance();
-    }
-    return session.try_pending_maintenance();
+    if (session.operation || session.pending_maintenance || session.compute ||
+        session.executor->has_pending_work())
+        return runtime::ContextStart::Deferred;
+    const auto current = session.directory.assess(assessment.demand);
+    if (!current.requires_maintenance()) return runtime::ContextStart::Stale;
+    session.pending_maintenance = current;
+    const auto started          = session.try_pending_maintenance();
+    // A Deferred public submission belongs to the caller's retry decision. It must not
+    // later execute from poll() after that decision has been abandoned or repriced.
+    if (started == runtime::ContextStart::Deferred) session.pending_maintenance.reset();
+    return started;
 }
 
 std::size_t Session::host_bytes_released(std::span<const CheckpointHandle> records) const {
@@ -202,14 +178,15 @@ std::size_t Session::host_bytes_released(std::span<const CheckpointHandle> recor
 
 context::RecoveryEvaluation<>
 Session::evaluate_recovery(std::span<const CheckpointHandle> advertised) const {
-    impl_->recovery_index.synchronize(detail::RecoveryStoreView{impl_->checkpoints});
+    impl_->recovery_index.synchronize(
+        context::RecoveryStoreView{impl_->checkpoints, impl_->prefixes});
     return impl_->recovery_index.evaluate(advertised);
 }
 
 CheckpointSummary Session::checkpoint_summary(CheckpointHandle handle) const {
     CheckpointSummary result;
     static_cast<CheckpointMetadata&>(result) = checkpoint_metadata(handle);
-    result.key                               = checkpoint_key(handle, result.frontier);
+    result.key                               = checkpoint_key(handle);
     return result;
 }
 
@@ -256,6 +233,176 @@ bool Session::can_place_host(const HostRequirement& write,
 std::size_t Session::release_redundant_host(std::span<const CheckpointHandle> excluded,
                                             std::optional<SequenceHandle> keep) {
     return 0;
+}
+
+} // namespace ninfer::models::glm5next
+
+namespace ninfer::models::glm5next {
+
+context::MetadataBudget& Session::recovery_budget() const {
+    return impl_->recovery_metadata.budget();
+}
+
+std::vector<Session::RecoveryPoint>
+Session::recovery_points(const ContextReleaseSet& removed_device,
+                         std::span<const CheckpointHandle> selected) const {
+    if (!removed_device.empty()) throw std::invalid_argument("GLM has no Host demotion");
+    const auto& p = *impl_;
+    std::vector<RecoveryPoint> result;
+    for (std::uint32_t i = 0; i < p.checkpoints.size(); ++i) {
+        const auto handle = p.checkpoints.handle(i);
+        if (!p.checkpoints.valid(handle)) continue;
+        if (!selected.empty() &&
+            std::find(selected.begin(), selected.end(), handle) == selected.end())
+            continue;
+        const auto& record = p.checkpoints.at(handle);
+        runtime::RecoveryDescription value;
+        value.restores.reserve(p.placements.size());
+        value.placement = record.snapshot.continuation().metadata.placement;
+        value.prefix    = record.snapshot.input_prefix().id();
+        value.frontier  = record.frontier();
+        value.work      = record.recovery_work_cache.lock();
+        if (!value.work) {
+            value.work = context::recovery_work(recovery_budget(), p.prefixes, value.prefix,
+                                                p.shape.prefill_chunk, p.plan.vision_max_features);
+            record.recovery_work_cache = value.work;
+        }
+        for (auto target : p.placements) {
+            auto transfers =
+                target == value.placement
+                    ? record.snapshot.restore_requirements(p.directory)
+                    : detail::conversion_requirements(p.plan, record.snapshot, target.value);
+            if (target == value.placement)
+                for (std::uint32_t rank = 0; rank < p.plan.states.size(); ++rank)
+                    if (const auto& field = p.plan.states[rank].draft_context) {
+                        runtime::ContextTransferRequirement transfer;
+                        transfer.direction   = runtime::ContextTransferDirection::DeviceToDevice;
+                        transfer.rank        = rank;
+                        transfer.image_count = 1;
+                        transfer.work        = {field->bytes, 1};
+                        transfers.push_back(transfer);
+                    }
+            auto replay = target == value.placement
+                              ? record.snapshot.replay_requirements(p.directory)
+                              : std::vector<runtime::ContextTransferRequirement>{};
+            value.restores.push_back({target, std::move(transfers), std::move(replay)});
+        }
+        result.push_back(
+            {handle, context::recovery_description(recovery_budget(), std::move(value))});
+    }
+    return result;
+}
+
+std::shared_ptr<const runtime::RecoveryDescription>
+Session::recovery_target(const RequestBasePlan& base, std::uint32_t f, runtime::PlacementId target,
+                         runtime::CaptureStorage storage) const {
+    if (!base.plan_ || !f || f > base.summary().prompt_tokens ||
+        target.value >= impl_->plan.states.size() || storage == runtime::CaptureStorage::Host)
+        throw std::invalid_argument("invalid GLM recovery target");
+    runtime::RecoveryDescription value;
+    value.placement = target;
+    value.frontier  = f;
+    value.prefix    = base.plan_->query.endpoint(f);
+    value.work =
+        context::recovery_work(recovery_budget(), f, base.plan_->media, impl_->shape.prefill_chunk,
+                               impl_->plan.vision_max_features);
+    value.restores.push_back({target, {}});
+    for (std::uint32_t rank = 0; rank < impl_->plan.states.size(); ++rank)
+        if (const auto& field = impl_->plan.states[rank].draft_context) {
+            runtime::ContextTransferRequirement transfer;
+            transfer.direction   = runtime::ContextTransferDirection::DeviceToDevice;
+            transfer.rank        = rank;
+            transfer.image_count = 1;
+            transfer.work        = {field->bytes, 1};
+            value.restores.back().transfers.push_back(transfer);
+        }
+    return context::recovery_description(recovery_budget(), std::move(value));
+}
+
+runtime::PauseCostQuote Session::pause_cost(SequenceHandle h, const PauseOption& option,
+                                            std::span<const CheckpointHandle> sources,
+                                            std::span<const CheckpointHandle> victims) const {
+    const auto& p = *impl_;
+    const auto& s = p.sequence(h);
+    const auto end =
+        s.phase == detail::Phase::Replay ? s.replay_target : s.continuation.metadata.main_frontier;
+    const auto work = [&](std::uint32_t begin) {
+        return models::vision::recovery_work(
+            s.request->prompt.identity.media,
+            [](const auto& media) -> const auto& { return media.item; }, begin, end,
+            p.shape.prefill_chunk, p.plan.vision_max_features);
+    };
+    runtime::PauseCostQuote quote;
+    quote.work =
+        context::maintenance_work(p.directory.assess(option.demand, p.footprint(victims, true)));
+    if (option.action.kind == runtime::PauseKind::ReleaseAndReplay) {
+        context::PrefixQuery query(p.prefixes, s.request->domain,
+                                   s.request->identity_view(s.ledger.view()));
+        quote.recovery.push_back({work(0), {}});
+        for (auto source : sources) {
+            if (!p.checkpoints.valid(source)) continue;
+            const auto& c = p.checkpoints.at(source);
+            if (c.frontier() > end ||
+                p.prefixes.domain(c.snapshot.input_prefix().id()) != s.request->domain ||
+                !query.matches(c.snapshot.input_prefix().id()))
+                continue;
+            const auto points = recovery_points({}, {&source, 1});
+            for (const auto& restore : points.front().description->restores)
+                if (restore.placement == s.continuation.metadata.placement) {
+                    auto transfers = restore.transfers;
+                    if (c.frontier() < end)
+                        transfers.insert(transfers.end(), restore.replay_transfers.begin(),
+                                         restore.replay_transfers.end());
+                    quote.recovery.push_back({work(c.frontier()), std::move(transfers)});
+                }
+        }
+    } else {
+        if (option.action.kind == runtime::PauseKind::Relocate) {
+            std::vector<std::uint32_t> frontiers{s.continuation.metadata.main_frontier};
+            if (p.pool_count() > 1)
+                frontiers.push_back(s.continuation.metadata.mtp_frontier.value());
+            auto copies =
+                detail::conversion_requirements(p.plan, s.continuation.metadata.placement.value,
+                                                option.action.placement.value, frontiers);
+            quote.work.insert(quote.work.end(), copies.begin(), copies.end());
+        }
+        runtime::RecoveryRouteWork route{work(s.continuation.metadata.main_frontier), {}};
+        if (option.action.kind == runtime::PauseKind::KeepDevice &&
+            !p.directory.states().can_recover_exclusively(
+                s.continuation.image,
+                context::retired_state_references(p.checkpoints, s.continuation.image, victims), 1,
+                s.write_destination)) {
+            for (std::uint32_t rank = 0; rank < p.plan.states.size(); ++rank)
+                if (const auto& field = p.plan.states[rank].draft_context) {
+                    auto transfer = context::state_transfer_requirement(
+                        {field->bytes, 1}, runtime::ContextTransferDirection::DeviceToDevice);
+                    transfer.rank = rank;
+                    route.transfers.push_back(transfer);
+                }
+        }
+        quote.recovery.push_back(std::move(route));
+    }
+    return quote;
+}
+
+runtime::CaptureCostQuote Session::capture_cost(SequenceHandle h, std::uint32_t frontier,
+                                                runtime::CaptureStorage storage) const {
+    const auto& s = impl_->sequence(h);
+    runtime::CaptureCostQuote quote;
+    quote.retained = recovery_target(RequestBasePlan(s.request), frontier,
+                                     s.continuation.metadata.placement, storage);
+    quote.work     = quote.retained->restores.front().transfers;
+    return quote;
+}
+
+std::vector<runtime::ContextTransferRequirement>
+Session::maintenance_work(const ContextAssessment& assessment) const {
+    return context::maintenance_work(assessment);
+}
+
+std::vector<runtime::ContextTransferRequirement>
+Session::demotion_work(const ContextDemotion&, std::span<const CheckpointHandle>) const {
+    throw std::invalid_argument("GLM has no Host demotion");
 }
 
 } // namespace ninfer::models::glm5next

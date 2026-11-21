@@ -4,9 +4,10 @@
 #include "models/glm5next/definition.h"
 #include "models/glm5next/session/session.h"
 #include "models/glm5next/state/continuation.h"
-#include "models/glm5next/state/identity.h"
+#include "models/common/context/prefix.h"
 
 #include <deque>
+#include <unordered_map>
 
 namespace ninfer::models::glm5next::detail {
 using Image        = context::StateId;
@@ -19,13 +20,19 @@ struct CapturePoint {
     SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
 };
 
-using Identity = InputIdentity;
-
 struct RequestPlan {
     PreparedPromptData prompt;
     std::shared_ptr<const vision::ExecutionInput> vision;
     runtime::RequestPlanSummary summary;
-    std::shared_ptr<const Identity> identity;
+    context::PrefixQuery query;
+    std::uint32_t domain = 0;
+    std::vector<context::MediaIdentityView> media;
+    [[nodiscard]] context::InputIdentityView identity_view(context::TokenView tokens) const;
+
+    [[nodiscard]] context::InputIdentityView identity_view() const {
+        return identity_view(context::TokenView(prompt.token_ids));
+    }
+
     std::vector<CapturePoint> captures;
     ResolvedSamplingParameters sampling;
     bool reuse = true;
@@ -33,13 +40,15 @@ struct RequestPlan {
     [[nodiscard]] bool can_checkpoint(std::uint32_t frontier) const;
 };
 
-using Snapshot = context::ContextSnapshot<ContinuationMetadata, Identity>;
+using Snapshot = context::ContextSnapshot<ContinuationMetadata>;
 
 struct Checkpoint {
     Snapshot snapshot;
     runtime::CheckpointRole role;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
     SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
+
+    mutable std::weak_ptr<const runtime::RecoveryWork> recovery_work_cache;
 
     [[nodiscard]] std::uint32_t frontier() const {
         return snapshot.continuation().metadata.main_frontier;
@@ -50,7 +59,7 @@ using Checkpoints = context::CheckpointStore<Checkpoint>;
 
 struct PreparedCheckpoint {
     Checkpoints::Reservation record;
-    std::shared_ptr<const Identity> identity;
+    context::PrefixRef identity;
 };
 
 enum class Phase { Prefill, Replay, Active, Pending, Finished };
@@ -59,6 +68,7 @@ struct CaptureReservation {
     context::StateDirectory* states;
     Checkpoints* checkpoints;
     Image destination;
+    context::PrefixRef identity;
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> records;
     ~CaptureReservation();
 };
@@ -68,7 +78,8 @@ struct Sequence {
     std::uint32_t lane               = 0;
     std::uint64_t binding_generation = 0;
     std::shared_ptr<const RequestPlan> request;
-    Identity identity;
+    context::RequestLedger ledger;
+    context::PrefixBuilder prefix;
     Continuation continuation;
     Image write_destination;
     std::array<context::HistoryOwner, 2> histories;
@@ -81,7 +92,9 @@ struct Sequence {
     std::uint32_t last_saved = 0, last_intermediate_attempt = 0;
     std::optional<std::uint32_t> retry_frontier;
     std::unique_ptr<CaptureReservation> capture;
-    bool capture_pending = false;
+    bool capture_pending          = false;
+    std::uint64_t membership_mark = 0;
+    bool computing                = false;
     SpeculativeStats speculative;
 };
 
@@ -90,6 +103,7 @@ struct Suspended {
     std::unique_ptr<Sequence> sequence;
     std::optional<CheckpointHandle> snapshot;
     std::uint32_t frontier;
+    context::PrefixQuery query;
     ~Suspended();
 };
 
@@ -289,13 +303,28 @@ public:
     runtime::Executor<ExecutionTypes>* executor = nullptr;
     std::unique_ptr<context::ContextDirectory> directory_owner;
     context::ContextDirectory& directory;
+    context::PrefixStore prefixes{directory.metadata_budget()};
     std::vector<runtime::PlacementId> placements;
-    mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget()};
+    context::RecoveryMetadata recovery_metadata;
+    mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget(),
+                                                    &recovery_metadata};
     Checkpoints checkpoints;
     context::MetadataAccount count_storage{directory.metadata_budget()};
     TokenCountBuilder count_builder;
-    std::array<std::unique_ptr<Sequence>, kMaximumConcurrency> sequences;
-    std::array<std::uint64_t, kMaximumConcurrency> epochs{};
+    std::vector<std::unique_ptr<Sequence>> sequences;
+    std::unordered_map<std::uint64_t, Sequence*> resident_sequences;
+    std::uint64_t membership_clock = 0;
+
+    std::uint64_t next_membership_mark() {
+        if (!++membership_clock) {
+            for (auto& s : sequences)
+                if (s) s->membership_mark = 0;
+            ++membership_clock;
+        }
+        return membership_clock;
+    }
+
+    std::vector<std::uint64_t> epochs;
     std::vector<runtime::KvPoolDescriptor> pools;
     std::unique_ptr<ContextOperation> operation;
     std::optional<ContextAssessment> pending_maintenance;
@@ -312,8 +341,8 @@ public:
 
 [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
 conversion_requirements(const SessionPlan&, const Snapshot&, std::uint32_t to);
-
-[[nodiscard]] std::shared_ptr<const Identity> capture_identity(const Sequence&);
-[[nodiscard]] PrefixShortlistKey key(const Identity&, std::uint32_t);
+[[nodiscard]] std::vector<runtime::ContextTransferRequirement>
+conversion_requirements(const SessionPlan&, std::uint32_t from, std::uint32_t to,
+                        std::span<const std::uint32_t> frontiers);
 
 } // namespace ninfer::models::glm5next::detail

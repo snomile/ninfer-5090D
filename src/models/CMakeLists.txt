@@ -19,6 +19,7 @@ target_link_libraries(ninfer_model_loading PUBLIC ninfer_artifact ninfer_text ni
 
 # Coordinator-owned sessions, context directories and frontend policy.
 add_library(ninfer_model_control STATIC
+  common/batch.cpp
   common/token_input.cpp
   common/frontend/chat_template.cpp
   common/frontend/prompt.cpp
@@ -43,6 +44,8 @@ add_library(ninfer_model_control STATIC
   common/context/directory/state.cpp
   common/context/directory/pages.cpp
   common/context/directory/history.cpp
+  common/context/prefix.cpp
+  common/context/request_ledger.cpp
   common/context/work.cpp)
 ninfer_internal_includes(ninfer_model_control)
 target_link_libraries(ninfer_model_control

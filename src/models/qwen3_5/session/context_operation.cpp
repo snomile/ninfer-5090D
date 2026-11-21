@@ -12,17 +12,10 @@ bool SessionImpl::has_context_operation() const noexcept {
 
 runtime::ContextStart SessionImpl::start_maintenance(const ContextAssessment& assessment) {
     if (has_context_operation() || execution || !events.empty()) {
-        pending_maintenance_ = assessment;
-        directory.request_maintenance();
         return runtime::ContextStart::Deferred;
     }
     auto frame = executor().try_reserve(runtime::FrameKind::Context);
-    if (!frame) {
-        pending_maintenance_ = assessment;
-        directory.request_maintenance();
-        return runtime::ContextStart::Deferred;
-    }
-    pending_maintenance_.reset();
+    if (!frame) { return runtime::ContextStart::Deferred; }
     auto prepared = directory.prepare_maintenance(assessment);
     if (!prepared) return runtime::ContextStart::Stale;
     context_operation_ =
@@ -200,6 +193,8 @@ void SessionImpl::abort_context() noexcept {
                     release_sequence_kv(state);
                     requests[action.lane] = {};
                     invalidate_lane(action.lane);
+                    state      = {};
+                    state.lane = action.lane;
                     action.source_lease.reset();
                     action.carried_pins.clear();
                     for (const auto& [from, to] : action.carried_clones) {
