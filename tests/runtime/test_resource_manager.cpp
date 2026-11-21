@@ -2956,7 +2956,16 @@ void test_pause_prices_save_restore_and_victim_loss() {
                 f.cache.pause_cost(f.program, rebuild, replay, {}) == 10 &&
                 f.cache.pause_cost(f.program, save, host, std::array{victim}) == 13,
             "pause ranking lost immediate save, future restore, or Host victim loss");
-    auto unknown          = save;
+    auto prepared                    = save;
+    prepared.preparation_upper_bound = rt::make_prefill_work(0, 8, 0, 0, 128);
+    require(f.cache.pause_cost(f.program, prepared, host, {}) == 16 &&
+                f.cache.pause_cost(f.program, prepared, host, std::array{victim}) == 21,
+            "pause did not price padded preparation in addition to save and restore");
+    auto overflow = prepared;
+    overflow.preparation_upper_bound.tokens = UINT64_MAX;
+    require(f.cache.pause_cost(f.program, overflow, host, {}) == UINT64_MAX,
+            "pause preparation cost overflowed into an affordable snapshot");
+    auto unknown          = prepared;
     unknown.unpriced_work = true;
     require(f.cache.pause_cost(f.program, unknown, host, {}) == UINT64_MAX,
             "unpriced normalization was ranked as a free pause");
@@ -3383,11 +3392,15 @@ void test_pause_uses_parent_recovery_obligations() {
                 f.cache.pause_cost(f.program, save, host, {}, &cursor) == 80 &&
                 f.cache.pause_cost(f.program, recompute, replay, {}, &cursor) == 75,
             "pause forgot the two previously revoked recovery branches");
-    const auto accepted = f.cache.quote_pause_action(f.program, save, host, {}, cursor);
-    require(accepted.loss_after == 170 && accepted.action_cost == 30,
+    auto prepared                    = save;
+    prepared.preparation_upper_bound = rt::make_prefill_work(0, 3, 0, 0, 128);
+    require(f.cache.pause_cost(f.program, prepared, host, {}, &cursor) == 84,
+            "pause preparation lost the parent decision's recovery obligations");
+    const auto accepted = f.cache.quote_pause_action(f.program, prepared, host, {}, cursor);
+    require(accepted.loss_after == 170 && accepted.action_cost == 34,
             "pause charged future recovery as already paid or lost its joint degradation");
     f.cache.accept_pause(f.program, cursor, accepted);
-    require(cursor.ledger->paid_actions == 30 && cursor.ledger->loss_after == 170,
+    require(cursor.ledger->paid_actions == 34 && cursor.ledger->loss_after == 170,
             "accepted pause did not belong to the parent decision");
 }
 

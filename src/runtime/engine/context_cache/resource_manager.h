@@ -907,7 +907,9 @@ public:
         for (const auto& route : quote.recovery)
             future = std::min(future, add_recovery_cost(price(route.transfers),
                                                         costs_.prefill_ns(route.rebuild)));
-        auto cost = add_recovery_cost(price(quote.work), future);
+        const auto preparation = add_recovery_cost(
+            price(quote.work), costs_.prefill_ns(quote.preparation_upper_bound));
+        auto cost = add_recovery_cost(preparation, future);
         if (victims.empty() && !option.host_write) return cost;
         if (decision) {
             const auto action = quote_pause_action(session, quote, option, victims, *decision);
@@ -935,7 +937,9 @@ public:
                                   cursor.ledger->revision,
                                   {victims.begin(), victims.end()},
                                   values.total_loss(victims),
-                                  action_cost(quote.work)};
+                                   add_recovery_cost(
+                                       action_cost(quote.work),
+                                       costs_.prefill_ns(quote.preparation_upper_bound))};
         result.changed = std::move(changed);
         return result;
     }

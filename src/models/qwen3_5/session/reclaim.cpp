@@ -551,9 +551,16 @@ runtime::PauseCostQuote Session::pause_cost(SequenceHandle h, const PauseOption&
             quote.recovery.push_back({work(c.frontier()), std::move(transfers)});
         }
     } else {
-        quote.unpriced_work = is_masked_draft_backend(p.speculative_backend) &&
-                              s.continuation.metadata.dflash_context_frontier <
-                                  s.continuation.metadata.execution_frontier;
+        if (is_masked_draft_backend(p.speculative_backend) &&
+            s.continuation.metadata.dflash_context_frontier <
+                s.continuation.metadata.execution_frontier) {
+            // Normalize only projects and materializes features already produced by the target.
+            // Its kernels process a padded draft_window + 1 columns even for a shorter tail.
+            // A full target prefill for that width conservatively prices this preparation
+            // without treating an unmeasured draft-only operation as free or impossible.
+            quote.preparation_upper_bound = runtime::make_prefill_work(
+                0, std::uint64_t(p.draft_window) + 1, 0, 0, p.prefill_chunk);
+        }
         runtime::RecoveryRouteWork route{work(s.continuation.metadata.text_kv_valid), {}};
         if (option.host_write) {
             auto copies = context::host_write_work(p.directory, *option.host_write);

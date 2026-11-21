@@ -79,6 +79,9 @@ struct PauseCostQuote {
     std::vector<RecoveryRouteWork> recovery;
     // An operation without a matching static coefficient cannot be priced as free.
     bool unpriced_work = false;
+    // Immediate preparation may use full target prefill as a conservative compute bound.
+    // This is paid when pausing, separately from the chosen future recovery route.
+    PrefillWork preparation_upper_bound;
 };
 
 struct CaptureCostQuote {
