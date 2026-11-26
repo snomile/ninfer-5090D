@@ -6,10 +6,11 @@ Start Serve separately with the same model, runtime flags, and JSONL logging.
 Use a fresh process for each sample and for each different `--case` selection.
 Compare fixed/FP32 to fixed/FP32 first, then fixed to adaptive on the same
 revision, then FP32 to BF16 with the speculation policy held constant.
-Use five independent rounds for performance decisions. The ledger case covers
-low acceptance only if its fixed-K7 baseline measures at most 70% acceptance
-and emits at least 512 tokens. Keep the native ReplaySSM, perplexity, and
-release recovery gates alongside the HTTP cases.
+Use five independent rounds for performance decisions. The ledger case remains
+available for historical comparisons; use free-decode-retrieval for long decode.
+This needs at most 70% fixed-K7 acceptance and at least 512 generated tokens.
+Keep the native ReplaySSM, perplexity, and release recovery gates alongside the
+HTTP cases.
 """
 
 from __future__ import annotations
@@ -31,8 +32,10 @@ ROOT = Path(__file__).resolve().parents[2]
 MODEL = "qwen3.8-27b-nvfp4"
 ASYMMETRIC = "p32768-p65536-c2"
 LEDGER = "free-decode-ledger"
+LONG_DECODE = "free-decode-retrieval"
 NEEDLES = {"retrieval-p32768": 32768, "retrieval-p65536": 65536}
 SUPPLEMENTAL = (ASYMMETRIC, LEDGER, *NEEDLES)
+CASE_CHOICES = ("matched", "supplemental", *SUPPLEMENTAL, LONG_DECODE)
 ENGINE_KEYS = ("max_context", "max_concurrency", "prefill_chunk", "kv_cache", "vision",
                "cuda_graph", "prefix_reuse", "proposal_head", "speculative_backend",
                "speculative_draft_window", "host_mapped_embedding",
@@ -115,7 +118,28 @@ def fixture(case_id, archived):
     if case_id == ASYMMETRIC:
         lanes = [by_id["p32768-c2"]["requests"][0], by_id["p65536-c2"]["requests"][1]]
         return {"id": case_id, "requests": lanes}
-    if case_id == LEDGER:
+    if case_id == LONG_DECODE:
+        # Freeze the screened payload. Spread long, unrelated codes out in an
+        # order different from the answer so the output cannot be copied as a block.
+        identity = "lookup-array-12x144"
+        labels = [f"A{i:02d}" for i in range(1, 13)]
+        codes = {label: hashlib.shake_256(f"{identity}:{label}".encode()).hexdigest(72)
+                 for label in labels}
+        records = [f"Inventory lookup task {identity}. Only the records labeled ACTIVE contain codes."]
+        for label in sorted(labels, key=lambda key: digest([identity, key])):
+            records.append(f"\nACTIVE record {label}: {codes[label]}\n" + " x" * 640)
+        order = ", ".join(labels)
+        lane = deepcopy(by_id["ordinary-cold-p2048-c1"]["requests"][0])
+        lane["payload"].update(
+            max_tokens=1900,
+            system="".join(records),
+            messages=[{"role": "user", "content":
+                       "Return only a JSON array of verification code strings, in the "
+                       "exact order of the requested IDs. Copy every code character exactly. "
+                       f"Omit the IDs and any Markdown. Requested IDs: {order}."}],
+        )
+        lane.update(expected_output=list(codes.values()), json_output=True, expected_prompt_tokens=9438)
+    elif case_id == LEDGER:
         lane = deepcopy(by_id["ordinary-cold-p2048-c1"]["requests"][0])
         rows = [{"id": i, "rack": digest(["rack", i])[:9],
                  "ticket": digest(["ticket", i])[:11]} for i in range(1, 49)]
@@ -269,7 +293,7 @@ def summarize(samples):
         result[name] = {"samples": len(cases), "lanes": lanes,
                         "makespan_seconds": {"min": min(ranged), "median": median(ranged),
                                              "max": max(ranged)}}
-        if name == LEDGER:
+        if name in (LEDGER, LONG_DECODE):
             result[name]["long_low_acceptance_samples"] = sum(
                 good_quality(lane) and lane["output_tokens"] >= 512 and
                 lane["draft_acceptance"] is not None and lane["draft_acceptance"] <= 0.70
@@ -362,7 +386,7 @@ def run(args, fixtures):
                 require(not context.failures, f"{case['id']}: {context.failures}")
                 collect_logs(stream, startup, records, time.monotonic() + 30)
                 cases.append(measurement(case, {"id": case["id"], "requests": records}, startup,
-                                         include_text=case["id"] in (LEDGER, *NEEDLES)))
+                                         include_text=case["id"] in (LEDGER, *NEEDLES, LONG_DECODE)))
             finally:
                 context.cancel_live()
     samples = [{"server_instance_id": startup["server_instance_id"], "schema_version": startup["schema_version"],
@@ -396,9 +420,13 @@ def compare(args):
     changed = {key: [old[key], new[key]] for key in switches if old[key] != new[key]}
     require(len(changed) <= 1 and (not changed or before["revision"] == after["revision"]),
             "isolate each switch on the same source revision")
-    require(a.keys() == b.keys(), "cases differ; compare the same selection on both sides")
+    if args.case:
+        require(set(args.case) <= (a.keys() & b.keys()), "requested case is missing on either side")
+    else:
+        require(a.keys() == b.keys(), "cases differ; compare the same selection on both sides")
     cases, failures = {}, []
-    for name, case in a.items():
+    for name in args.case or a:
+        case = a[name]
         current = b[name]
         lane_comparisons = []
         for i, (left, right) in enumerate(zip(case["lanes"], current["lanes"], strict=True)):
@@ -426,7 +454,7 @@ def compare(args):
                        "before_makespan_seconds": case["makespan_seconds"],
                        "after_makespan_seconds": current["makespan_seconds"],
                        "lanes": lane_comparisons}
-        if name == LEDGER:
+        if name in (LEDGER, LONG_DECODE):
             cases[name]["before_long_low_acceptance_samples"] = case["long_low_acceptance_samples"]
             cases[name]["after_long_low_acceptance_samples"] = current["long_low_acceptance_samples"]
     return {"before_revision": before["revision"], "after_revision": after["revision"],
@@ -438,7 +466,7 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("list", help="list the frozen and new workloads")
     live = commands.add_parser("run", help="replay fixtures against an isolated loopback server")
-    live.add_argument("--case", required=True, choices=("matched", "supplemental", *SUPPLEMENTAL))
+    live.add_argument("--case", required=True, choices=CASE_CHOICES)
     live.add_argument("--base-url", required=True)
     live.add_argument("--request-log", required=True, type=Path)
     live.add_argument("--revision", required=True, help="full source revision from the tested image")
@@ -447,12 +475,14 @@ def main():
     delta = commands.add_parser("compare", help="compare one or more independent samples on each side")
     delta.add_argument("--before", type=Path, nargs="+", required=True)
     delta.add_argument("--after", type=Path, nargs="+", required=True)
+    delta.add_argument("--case", action="append", help="compare the named case; can be repeated")
     args = parser.parse_args()
     try:
         if args.command == "compare":
             report = compare(args)
         elif args.command == "list":
-            report = {"matched": [case["id"] for case in matched_fixtures()], "supplemental": list(SUPPLEMENTAL)}
+            report = {"matched": [case["id"] for case in matched_fixtures()],
+                      "supplemental": list(SUPPLEMENTAL), "long_low_acceptance": LONG_DECODE}
         else:
             require(args.timeout_seconds > 0, "timeout must be positive")
             report = run(args, matched_fixtures())
