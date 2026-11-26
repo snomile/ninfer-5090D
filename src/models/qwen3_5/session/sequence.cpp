@@ -121,9 +121,9 @@ std::uint32_t SessionImpl::window_end(const SequenceState& state, const RequestC
         // Bound the non-preemptible forward pass while another lane can publish output.
         // Keep requests fitting two nominal chunks intact to avoid extra short-tail passes.
         // Demand and execution use this same window, and pure prefill keeps the full chunk.
-        // Packed prefill can leave a peer decoding while a non-trivial prompt
-        // tail remains. Keep that tail out of the peer's token latency budget.
-        const auto peer_chunk = std::clamp(prefill_chunk / 16, 1U, 32U);
+        // A packed prompt can still have work left after its peer starts streaming.
+        // Bound each intervening forward, including at long attention frontiers.
+        const auto peer_chunk = std::clamp(prefill_chunk / 16, 1U, 16U);
         end = std::min(end, begin + peer_chunk);
     }
     if (request.capture_reservation) end = std::min(end, request.capture_reservation->frontier);
