@@ -1,0 +1,37 @@
+{
+  "revision": "67696fed9f761fa8613869df50e0917e9c0c0b63",
+  "model_sha256": "c76ffdba7ed4c8a50f9ca767bb000530665a1af4c2bdc6fe810fd1aef9fb818e",
+  "serve": {
+    "runner": "tools/bench/run_optimization_ab.py",
+    "args": ["run", "--case", "supplemental"],
+    "independent_samples": 5,
+    "speculative_backend": "dflash2",
+    "speculative_draft_window": 7,
+    "speculative_length_policy": "fixed",
+    "linear_state_dtype": "fp32"
+  },
+  "replayssm": {
+    "target": "ninfer_gdn_replay_bench",
+    "common_args": [
+      "--qk-heads", "16", "--value-heads", "48", "--tokens", "8",
+      "--execution", "graph", "--cache", "both", "--warmup", "10", "--repeat", "100"
+    ],
+    "cases": {
+      "record-c1": ["--op", "record", "--batch", "1"],
+      "record-c2": ["--op", "record", "--batch", "2"],
+      "fold-c1-one": ["--op", "fold", "--layers", "48", "--conv-channels", "10240", "--batch", "1", "--commits", "one"],
+      "fold-c1-dense": ["--op", "fold", "--layers", "48", "--conv-channels", "10240", "--batch", "1", "--commits", "dense"],
+      "fold-c2-asymmetric": ["--op", "fold", "--layers", "48", "--conv-channels", "10240", "--batch", "2", "--commits", "1,8"],
+      "fold-c2-dense": ["--op", "fold", "--layers", "48", "--conv-channels", "10240", "--batch", "2", "--commits", "dense"]
+    }
+  },
+  "perplexity": {
+    "target": "ninfer-perplexity",
+    "args": [
+      "--corpus", "eval/corpora/perplexity-1m/manifest.json",
+      "--quick", "--context", "65536", "--stride", "32768",
+      "--kv-dtype", "fp8", "--prefill-chunk", "1024", "--host-mapped-embedding"
+    ],
+    "linear_state_dtype": "fp32"
+  }
+}
