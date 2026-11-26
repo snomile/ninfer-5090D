@@ -1,0 +1,25 @@
+{
+  "binary_sha256": {
+    "ninfer-perplexity": "8302264f5bee1f0ef68b6abe0c7e415b91dc190f4dba3e2d8909f5828bacd6e0",
+    "ninfer_gdn_replay_bench": "d52cc535ab7f62891497b0023263da8bdd74750fe7075278b9728498bd0071f4"
+  },
+  "build_image_id": "sha256:4caa40125de98c51435d3634edc5aaec57c4879610ff5cffe414d9a951a479f0",
+  "fixture_revision": "1a99b73a4af0e9180d7285f614e5802d5110619d",
+  "host": "deepthink",
+  "image_id": "sha256:8981ac7450efeea7dbca3d139c595d3ecf437284f87784a1090ae035a2b0783e",
+  "model_sha256": "c76ffdba7ed4c8a50f9ca767bb000530665a1af4c2bdc6fe810fd1aef9fb818e",
+  "monitoring": {
+    "gpu_used_max_mib": 31630,
+    "host_available_min_kib": 18796192,
+    "production_recovered": true,
+    "samples": 212,
+    "temperature_max_c": 71
+  },
+  "run_id": "run-20261126T174419Z",
+  "sha256": {
+    "perplexity.json": "a0748bdc7eae100b99f0d37471c7b31983a7a656a646c11888f8b01244670859",
+    "replayssm.csv": "a58b83f62dc1d5bf311e11048f7b883a7fafe204558b5b8bf9f195d2c0feb08c",
+    "supplemental-serve.json": "1befb994af2e5b8eb54b51decb05a69c20383c33f7bad785fd00eebcb0e6a726"
+  },
+  "source_revision": "67696fed9f761fa8613869df50e0917e9c0c0b63"
+}

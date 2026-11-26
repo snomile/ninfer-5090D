@@ -1,0 +1,332 @@
+{
+  "argv": [
+    "/bench/ninfer-perplexity",
+    "/models/qwen3_8_27b_nvfp4_full_precision.ninfer",
+    "--corpus",
+    "eval/corpora/perplexity-1m/manifest.json",
+    "--quick",
+    "--context",
+    "65536",
+    "--stride",
+    "32768",
+    "--kv-dtype",
+    "fp8",
+    "--prefill-chunk",
+    "1024",
+    "--host-mapped-embedding",
+    "--output",
+    "/measurements/perplexity"
+  ],
+  "artifact": {
+    "architecture": "Qwen3_5ForCausalLM",
+    "formats": [
+      "bf16",
+      "fp32",
+      "fp8_e4m3fn_row_bf16",
+      "nvfp4"
+    ],
+    "name": "qwen3.8-27b",
+    "path": "/models/qwen3_8_27b_nvfp4_full_precision.ninfer",
+    "prefill_signature": "469a201773e29ecd3cc739e40e76d80471a138e4f0ec6f309ea9c4bb56bfcbf7"
+  },
+  "config_path": "",
+  "configuration": {
+    "engine.context_capacity": "auto",
+    "engine.device": 0,
+    "engine.kv_dtype": "fp8",
+    "engine.max_context": 65536,
+    "engine.memory_headroom": 536870912,
+    "engine.prefill_chunk": 1024,
+    "logging.level": "info",
+    "model.host_mapped_embedding": true,
+    "model.path": "/models/qwen3_8_27b_nvfp4_full_precision.ninfer",
+    "observability.gpu_timing": false
+  },
+  "corpus": {
+    "id": "ninfer-ppl-1m-v1",
+    "manifest_sha256": "81ce9a3b9ccdcbd80f403a7b4dfab8f2391a7269cf947111a125eb0dffe6300f",
+    "mode": "quick",
+    "source": "/source/eval/corpora/perplexity-1m/manifest.json",
+    "stream_count": 4,
+    "stream_sha256": {
+      "ninfer-00": "ffa159736c11bdafd29e2903bdfd3ae75294c9d26a03b37df071fcbecdc73312",
+      "pg19-00": "51195c4b1f8f61ce8564b31b5d7dbe808ef488e6403299f5a38a9f025c72fc6a",
+      "wikitext-00": "9dc7c437f80afc9b7a6c2da214bf190c9381d8eacec1edc12e841ba1e96a2a22",
+      "zhwiki-00": "a6bb7daee717c80921c79b601f8787215b49a9134213b785b5c6acb88d3ffbb2"
+    }
+  },
+  "domains": [
+    {
+      "domain": "chinese_reference",
+      "mean_nll": 1.5595828450674916,
+      "perplexity": 4.7568364933857925,
+      "scored_tokens": 65510,
+      "total_nll": 102168.27218037138
+    },
+    {
+      "domain": "english_long_form",
+      "mean_nll": 1.8742542611384485,
+      "perplexity": 6.515958104852287,
+      "scored_tokens": 65455,
+      "total_nll": 122679.31266281714
+    },
+    {
+      "domain": "english_reference",
+      "mean_nll": 1.7467272569389836,
+      "perplexity": 5.735800124771068,
+      "scored_tokens": 65304,
+      "total_nll": 114068.27678714339
+    },
+    {
+      "domain": "ninfer_code",
+      "mean_nll": 0.41585329538509,
+      "perplexity": 1.5156634977297638,
+      "scored_tokens": 64898,
+      "total_nll": 26988.047163901574
+    }
+  ],
+  "environment": {},
+  "execution": {
+    "context_pools": [
+      {
+        "block_bytes": 153954304,
+        "capacity_bytes": 12932161536,
+        "domain": "device",
+        "rank": 0
+      },
+      {
+        "block_bytes": 153954304,
+        "capacity_bytes": 0,
+        "domain": "host",
+        "rank": 0
+      }
+    ],
+    "context_token_capacity_estimate": 344064,
+    "context_tokens": 65536,
+    "kv_dtype": "fp8",
+    "max_context_tokens": 65536,
+    "prefill_chunk_tokens": 1024,
+    "purpose": "causal_scoring",
+    "stride_tokens": 32768
+  },
+  "linear_state_dtype": "fp32",
+  "metric": {
+    "log_base": "natural",
+    "name": "fixed-window truncated-context causal perplexity"
+  },
+  "model_sha256": "c76ffdba7ed4c8a50f9ca767bb000530665a1af4c2bdc6fe810fd1aef9fb818e",
+  "overall": {
+    "mean_nll": 1.4010342378410499,
+    "perplexity": 4.059396177669383,
+    "scored_tokens": 261167,
+    "total_nll": 365903.90879423346
+  },
+  "schema_version": 2,
+  "source_revision": "67696fed9f761fa8613869df50e0917e9c0c0b63",
+  "startup": {
+    "ranks": [
+      {
+        "budget": {
+          "available_after_startup_bytes": 668008448,
+          "available_after_weights_bytes": 14123335680,
+          "context_capacity_bytes": 12932161536,
+          "context_control_budget_bytes": 7108323,
+          "graph_calibration": null,
+          "headroom_bytes": 536870912,
+          "host_reservation_bytes": 0,
+          "limit_bytes": 33232584704,
+          "minimum_context_capacity_bytes": 2463268864,
+          "minimum_runtime_reservation_bytes": 2982359808,
+          "planned_slack_bytes": 135212288,
+          "retained_bytes": 5522432,
+          "runtime_reservation_bytes": 13451252480
+        },
+        "device": 0,
+        "hardware": "NVIDIA GeForce RTX 5090 D",
+        "node": 0,
+        "rank": 0,
+        "resources": {
+          "allocations": {
+            "context_device_bytes": 12932161536,
+            "device_bytes": 32554979072,
+            "device_weights_bytes": 19103726592,
+            "expert_device_bytes": 0,
+            "expert_host_bytes": 0,
+            "expert_pinned_bytes": 0,
+            "host_bytes": 2542842624,
+            "host_context_bytes": 0,
+            "host_weights_bytes": 2542800896,
+            "io_pinned_bytes": 41728,
+            "mapped_weights_bytes": 2542796800,
+            "persistent_device_bytes": 10523392,
+            "ple_device_bytes": 0,
+            "ple_host_bytes": 0,
+            "ple_pinned_bytes": 0,
+            "registered_weights_bytes": 2542800896,
+            "workspace_device_bytes": 508567552
+          },
+          "communication": [],
+          "experts": null,
+          "hardware": "NVIDIA GeForce RTX 5090 D",
+          "node": 0,
+          "physical_memory": {
+            "cuda_free_bytes": 668008448,
+            "cuda_total_bytes": 33766572032,
+            "sampled_ns": 106466930392290,
+            "shared_physical_memory": false,
+            "system_available_bytes": 27086471168,
+            "system_total_bytes": 32197763072
+          },
+          "ple": null,
+          "rank": 0,
+          "received_ns": 106466930392340,
+          "sample_sequence": 1,
+          "sampled_ns": 106466930392340,
+          "vision": null,
+          "workspace": {
+            "allocation_cursor_bytes": 0,
+            "measurement_peak_bytes": 0,
+            "required_peak_bytes": 0
+          }
+        },
+        "shared_physical_memory": false
+      }
+    ],
+    "total_allocations": {
+      "context_device_bytes": 12932161536,
+      "device_bytes": 32554979072,
+      "device_weights_bytes": 19103726592,
+      "expert_device_bytes": 0,
+      "expert_host_bytes": 0,
+      "expert_pinned_bytes": 0,
+      "host_bytes": 2542842624,
+      "host_context_bytes": 0,
+      "host_weights_bytes": 2542800896,
+      "io_pinned_bytes": 41728,
+      "mapped_weights_bytes": 2542796800,
+      "persistent_device_bytes": 10523392,
+      "ple_device_bytes": 0,
+      "ple_host_bytes": 0,
+      "ple_pinned_bytes": 0,
+      "registered_weights_bytes": 2542800896,
+      "workspace_device_bytes": 508567552
+    }
+  },
+  "streams": [
+    {
+      "domain": "english_reference",
+      "id": "wikitext-00",
+      "input_tokens": 65305,
+      "mean_nll": 1.7467272569389836,
+      "path": "data/wikitext/00.txt",
+      "perplexity": 5.735800124771068,
+      "scored_tokens": 65304,
+      "seconds": 9.465396619,
+      "total_nll": 114068.27678714339,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 65305,
+          "mean_nll": 1.7467272569389836,
+          "perplexity": 5.735800124771068,
+          "scored_tokens": 65304,
+          "seconds": 9.465388189,
+          "target_begin": 1,
+          "target_end": 65305,
+          "total_nll": 114068.27678714339
+        }
+      ]
+    },
+    {
+      "domain": "english_long_form",
+      "id": "pg19-00",
+      "input_tokens": 65456,
+      "mean_nll": 1.8742542611384485,
+      "path": "data/pg19/00.txt",
+      "perplexity": 6.515958104852287,
+      "scored_tokens": 65455,
+      "seconds": 8.184543798,
+      "total_nll": 122679.31266281714,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 65456,
+          "mean_nll": 1.8742542611384485,
+          "perplexity": 6.515958104852287,
+          "scored_tokens": 65455,
+          "seconds": 8.184487439,
+          "target_begin": 1,
+          "target_end": 65456,
+          "total_nll": 122679.31266281714
+        }
+      ]
+    },
+    {
+      "domain": "chinese_reference",
+      "id": "zhwiki-00",
+      "input_tokens": 65511,
+      "mean_nll": 1.5595828450674916,
+      "path": "data/zhwiki/00.txt",
+      "perplexity": 4.7568364933857925,
+      "scored_tokens": 65510,
+      "seconds": 8.198051844,
+      "total_nll": 102168.27218037138,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 65511,
+          "mean_nll": 1.5595828450674916,
+          "perplexity": 4.7568364933857925,
+          "scored_tokens": 65510,
+          "seconds": 8.198004894,
+          "target_begin": 1,
+          "target_end": 65511,
+          "total_nll": 102168.27218037138
+        }
+      ]
+    },
+    {
+      "domain": "ninfer_code",
+      "id": "ninfer-00",
+      "input_tokens": 64899,
+      "mean_nll": 0.41585329538509,
+      "path": "data/ninfer/00.txt",
+      "perplexity": 1.5156634977297638,
+      "scored_tokens": 64898,
+      "seconds": 8.12423251,
+      "total_nll": 26988.047163901574,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 64899,
+          "mean_nll": 0.41585329538509,
+          "perplexity": 1.5156634977297638,
+          "scored_tokens": 64898,
+          "seconds": 8.12414481,
+          "target_begin": 1,
+          "target_end": 64899,
+          "total_nll": 26988.047163901574
+        }
+      ]
+    }
+  ],
+  "timing": {
+    "load_seconds": 2.737298245,
+    "read_and_tokenize_seconds": 0.045703904,
+    "score_seconds": 33.972334081,
+    "scored_tokens_per_second": 7687.637810734504,
+    "total_seconds": 36.757017708
+  }
+}
