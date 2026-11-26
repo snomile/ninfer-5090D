@@ -19,26 +19,26 @@ void kda(const Tensor& input, const ModelProfile& profile, const KdaParameters& 
     const int heads = dimension(profile.local.kda_heads.size), d = dimension(c.head_dim),
               width    = heads * d;
     const auto* record = std::get_if<RecordWindow>(&update);
+    const auto* packed = std::get_if<PackedPrefillUpdate>(&update);
     auto scope         = arena.scope();
-    auto b             = workspace::kda(arena, profile, m, record != nullptr);
+    auto b             = workspace::kda(arena, profile, m);
     auto before        = states.layer_view(layer, batch.source_offsets);
     auto after         = states.layer_view(layer, batch.destination_offsets);
     auto q             = b.query.view({d, heads, t, rows});
-    Tensor key, value;
+    auto key           = b.key.view({d, heads, t, rows});
+    auto value         = b.value.view({d, heads, t, rows});
     std::optional<KdaReplayRecordLayer> records;
     if (record) {
         if (record->kda.spec.width != t)
             throw std::logic_error("KDA record width differs from physical forward");
         records = record->kda.layer(layer, rows);
-        key     = records->key.view({d, heads, t, rows});
-        value   = records->value.view({d, heads, t, rows});
-    } else {
-        key   = b.key.view({d, heads, t, rows});
-        value = b.value.view({d, heads, t, rows});
     }
     const ops::KdaConvOutputs outputs{q.view({width, t, rows}), key.view({width, t, rows}),
                                       value.view({width, t, rows})};
-    if (records)
+    if (packed)
+        ops::kda_input_proj_conv_update(input, p.qkv, p.convolution, {before.conv, after.conv},
+                                        packed->ragged, {b.query, b.key, b.value}, arena, cuda);
+    else if (records)
         ops::kda_input_proj_conv_record(input.view({input.ne[0], t, rows}), p.qkv, p.convolution,
                                         {before.conv}, batch.valid_columns, outputs, records->conv,
                                         arena, cuda);
@@ -54,7 +54,13 @@ void kda(const Tensor& input, const ModelProfile& profile, const KdaParameters& 
     auto beta         = b.beta.view({heads, t, rows});
     auto recurrent    = b.output.view({d, heads, t, rows});
     const float scale = static_cast<float>(1.0 / std::sqrt(double(c.head_dim)));
-    if (const auto* sequence = std::get_if<SequenceUpdate>(&update)) {
+    if (packed) {
+        ops::kimi_delta_attention(q.view({d, heads, m}), key.view({d, heads, m}),
+                                  value.view({d, heads, m}), forget.view({d, heads, m}),
+                                  beta.view({heads, m}), p.a_log, p.dt_bias, c.gate_lower_bound,
+                                  scale, packed->ragged, arena, before.recurrent, after.recurrent,
+                                  recurrent, cuda);
+    } else if (const auto* sequence = std::get_if<SequenceUpdate>(&update)) {
         auto source      = states.recurrent_tensor(layer, sequence->source);
         auto destination = states.recurrent_tensor(layer, sequence->destination);
         ops::kimi_delta_attention(q.view({d, heads, t}), key.view({d, heads, t}),
@@ -64,10 +70,7 @@ void kda(const Tensor& input, const ModelProfile& profile, const KdaParameters& 
     } else if (records) {
         ops::kimi_delta_attention_replay_record(
             q, key, value, forget, beta, p.a_log, p.dt_bias, c.gate_lower_bound, scale,
-            before.recurrent, batch.valid_columns,
-            {key, value, records->log_decay.view({d, heads, t, rows}),
-             records->beta.view({heads, t, rows})},
-            recurrent, cuda);
+            before.recurrent, batch.valid_columns, records->recurrence, recurrent, cuda);
     } else {
         ops::kimi_delta_attention_batch_update(
             q, key, value, forget, beta, p.a_log, p.dt_bias, c.gate_lower_bound, scale,

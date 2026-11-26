@@ -46,7 +46,12 @@ add_library(ninfer_model_control STATIC
   common/context/directory/history.cpp
   common/context/prefix.cpp
   common/context/request_ledger.cpp
-  common/context/work.cpp)
+  common/context/work.cpp
+  common/speculative/calibration.cpp
+  common/speculative/controller.cpp
+  common/speculative/cost_model.cpp
+  common/speculative/growth.cpp
+  common/speculative/round_plan.cpp)
 ninfer_internal_includes(ninfer_model_control)
 target_link_libraries(ninfer_model_control
   PUBLIC ninfer_model_loading ninfer_runtime_support
@@ -65,6 +70,9 @@ endif()
 # Rank-owned storage, mathematical execution and graph preparation.
 add_library(ninfer_model_execution STATIC
   common/graph.cpp
+  common/graph/patch_site.cpp
+  common/graph/target_body.cpp
+  common/graph/suite.cpp
   common/graph_preparation.cpp
   common/vocabulary.cpp
   common/vision/execution.cpp

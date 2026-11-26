@@ -10,7 +10,26 @@
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/rmsnorm.h"
 
+#include <optional>
+
 namespace ninfer::bench::kda {
+
+inline ops::LinearPolicy input_policy(const Options& o) {
+    return o.policy == "a8" || (o.policy == "default" && o.format == "mxfp8")
+               ? ops::LinearPolicy::AllowA8
+               : ops::LinearPolicy::A16Only;
+}
+
+inline PackedQuantizedWeight make_input_weight(const Options& o) {
+    return o.format == "mxfp8" ? make_mxfp8_weight(12288, 4096, 101)
+                               : make_row_split_weight(QType::Q8_G32_FP16, 12288, 4096, 4096, 101);
+}
+
+inline DeviceBuffer make_conv_weight(const Options& o) {
+    return o.format == "mxfp8" ? make_bf16(12288 * 4, 105, -0.1F, 0.1F)
+                               : make_f32(12288 * 4, 105, -0.1F, 0.1F);
+}
+
 struct Fixture {
     const Options& o;
     int t, b, h, qh, layers, channels;
@@ -66,7 +85,8 @@ struct Fixture {
         StateImageBuilder builder;
         (void)builder.add(DType::I32, {64}, 1, "unrelated field");
         fields = plan_linear_attention_state(
-            builder, {static_cast<unsigned>(layers), channels, 3, h, 128, 128, DType::BF16});
+            builder,
+            {static_cast<unsigned>(layers), channels, 3, h, 128, 128, DType::BF16, o.state_dtype});
         state_layout       = builder.finish();
         std::size_t cursor = 256;
         for (int i = 0; i < b; ++i) {
@@ -80,9 +100,11 @@ struct Fixture {
         sources.copy_from_host(so.data(), sources.size());
         destinations = make_buffer(b * sizeof(std::int64_t));
         destinations.copy_from_host(ds.data(), destinations.size());
-        storage           = std::make_unique<StateImageStorage>(state.span(), state_layout);
-        states            = std::make_unique<LinearAttentionStateView>(*storage, fields);
-        auto recurrent    = make_f32(std::size_t(128) * 128 * h * layers * b, 19, -0.1F, 0.1F);
+        storage        = std::make_unique<StateImageStorage>(state.span(), state_layout);
+        states         = std::make_unique<LinearAttentionStateView>(*storage, fields);
+        const auto n_r = std::size_t(128) * 128 * h * layers * b;
+        auto recurrent = o.state_dtype == DType::BF16 ? make_bf16(n_r, 19, -0.1F, 0.1F)
+                                                      : make_f32(n_r, 19, -0.1F, 0.1F);
         auto conv         = make_bf16(std::size_t(channels) * 3 * layers * b, 23, -0.1F, 0.1F);
         const auto stream = device_context().execution_view().stream();
         for (int i = 0; i < b; ++i)
@@ -109,24 +131,14 @@ struct Fixture {
                 CUDA_CHECK(cudaMemcpyAsync(records.conv.data, conv_records.data(),
                                            records.conv.bytes(), cudaMemcpyDeviceToDevice, stream));
             }
-            if (o.op == "record" && o.alias_records) {
-                auto layer = records.layer(0, b);
-                CUDA_CHECK(cudaMemcpyAsync(layer.key.data, k.data(), k.size(),
-                                           cudaMemcpyDeviceToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(layer.value.data, v.data(), v.size(),
-                                           cudaMemcpyDeviceToDevice, stream));
-            }
         }
         if (o.op == "core" || o.op == "layer-prefill")
             capacity = ops::kimi_delta_attention_workspace_capacity_bytes(qh, h, t, t);
         if (o.op.starts_with("input-") || o.op == "chain" || full_layer() || projects_fold()) {
             if (qh != 32 || h != 32) throw std::invalid_argument("input geometry is Hq=Hv=32");
-            weight      = o.format == "mxfp8"
-                              ? make_mxfp8_weight(12288, 4096, 101)
-                              : make_row_split_weight(QType::Q8_G32_FP16, 12288, 4096, 4096, 101);
+            weight      = make_input_weight(o);
             input       = make_bf16(std::size_t(4096) * t * b, 103, -0.01F, 0.01F);
-            conv_weight = o.format == "mxfp8" ? make_bf16(12288 * 4, 105, -0.1F, 0.1F)
-                                              : make_f32(12288 * 4, 105, -0.1F, 0.1F);
+            conv_weight = make_conv_weight(o);
             const ops::LinearProfile profile{weight.weight.qtype, 12288, 4096, input_policy(),
                                              weight.weight.layout};
             const bool update =
@@ -176,42 +188,30 @@ struct Fixture {
 
     Tensor ct() { return Tensor(commits.span(), DType::I32, {b}); }
 
-    ops::LinearPolicy input_policy() const {
-        return o.policy == "a8" || (o.policy == "default" && o.format == "mxfp8")
-                   ? ops::LinearPolicy::AllowA8
-                   : ops::LinearPolicy::A16Only;
-    }
+    ops::LinearPolicy input_policy() const { return kda::input_policy(o); }
 
     Tensor vector(DeviceBuffer& x, int heads) {
         return Tensor(x.span(), DType::BF16, {128, heads, t, b});
     }
 
-    bool aliases_kv_records() const {
-        return o.op == "chain" || recorded_layer() || projects_fold() ||
-               (o.op == "record" && o.alias_records);
-    }
-
     void record(int layer, CudaExecutionView cuda) {
-        auto rr          = records.layer(layer, b);
-        auto y           = vector(out, h);
-        const bool alias = aliases_kv_records();
+        const auto rr = records.layer(layer, b);
+        auto y        = vector(out, h);
         ops::kimi_delta_attention_replay_record(
-            vector(q, qh), alias ? rr.key : vector(k, qh), alias ? rr.value : vector(v, h),
+            vector(q, qh), vector(k, qh), vector(v, h),
             vector(g, h), Tensor(beta.span(), DType::BF16, {h, t, b}),
             Tensor(a_log.span(), DType::FP32, {h}), Tensor(bias.span(), DType::FP32, {128, h}), -5,
             0.08838834764831845F, states->layer_view(layer, st()).recurrent, vt(),
-            {rr.key, rr.value, rr.log_decay, rr.beta}, y, cuda);
+            rr.recurrence, y, cuda);
     }
 
     void input_call(bool record_mode, CudaExecutionView cuda, int layer = 0) {
         auto x = Tensor(input.span(), DType::BF16, {4096, t, b}),
              w = Tensor(conv_weight.span(), o.format == "mxfp8" ? DType::BF16 : DType::FP32,
                         {12288, 4});
-        const bool alias = o.op == "chain" || recorded_layer() || projects_fold();
-        const auto key   = alias ? records.layer(layer, b).key : vector(k, qh);
-        const auto value = alias ? records.layer(layer, b).value : vector(v, h);
-        const ops::KdaConvOutputs outputs{vector(q, qh).view({4096, t, b}), key.view({4096, t, b}),
-                                          value.view({4096, t, b})};
+        const ops::KdaConvOutputs outputs{vector(q, qh).view({4096, t, b}),
+                                          vector(k, qh).view({4096, t, b}),
+                                          vector(v, h).view({4096, t, b})};
         const ops::SingleProjectionWeight qw{weight.weight, input_policy()};
         if (record_mode) {
             auto rr = records.layer(layer, b);
@@ -299,6 +299,114 @@ struct Fixture {
         ops::linear(norm.view({4096, m}), output_weight.weight, result, ops::LinearPolicy::AllowA8,
                     *workspace, cuda);
         if (o.op == "layer-chain") fold->execute(st(), dt(), ct(), cuda);
+    }
+};
+
+struct RaggedWeights {
+    PackedQuantizedWeight projection;
+    DeviceBuffer conv, a_log, bias;
+    ops::LinearPolicy policy;
+    DType conv_dtype;
+
+    explicit RaggedWeights(const Options& o)
+        : policy(input_policy(o)), conv_dtype(o.format == "mxfp8" ? DType::BF16 : DType::FP32) {
+        if (o.op == "input-update") {
+            if (o.qk_heads != 32 || o.heads != 32)
+                throw std::invalid_argument("input geometry is Hq=Hv=32");
+            projection = make_input_weight(o);
+            conv       = make_conv_weight(o);
+        } else {
+            a_log = make_f32(o.heads, 16, -0.5, 0.5);
+            bias  = make_f32(128 * o.heads, 17, -1, 1);
+        }
+    }
+
+    ops::SingleProjectionWeight projection_view() const { return {projection.weight, policy}; }
+};
+
+struct RaggedFixture {
+    RaggedWeights& weights;
+    const bool input_update;
+    const int h, qh, channels;
+    const ragged::RaggedDeviceFixture workload;
+    const int n, s;
+    const std::size_t state_bytes;
+    const ragged::StateOffsets offsets;
+    DeviceBuffer sources, destinations, state;
+    std::optional<SavedBuffer> initial;
+    DeviceBuffer x, q, k, v, g, beta, out, scratch;
+    StateFieldLayout layout;
+    std::size_t capacity;
+    std::unique_ptr<MemoryArena> workspace;
+
+    RaggedFixture(const Options& o, const ragged::SegmentSpec& lengths, RaggedWeights& w)
+        : weights(w), input_update(o.op == "input-update"), h(o.heads), qh(o.qk_heads),
+          channels((2 * qh + h) * 128), workload(lengths, device_context().device()),
+          n(workload.view().total_tokens()), s(workload.view().num_seqs()),
+          state_bytes(input_update ? 6ULL * channels
+                                   : dtype_size(o.state_dtype) * 128ULL * 128 * h),
+          offsets(ragged::make_state_offsets(s, o.state_form, state_bytes, 16, 16)),
+          sources(ragged::upload_offsets(device_context().device(), offsets.source_offsets_host)),
+          destinations(
+              ragged::upload_offsets(device_context().device(), offsets.destination_offsets_host)) {
+        const auto qk_elements    = std::size_t(128) * qh * n;
+        const auto value_elements = std::size_t(128) * h * n;
+        if (input_update) {
+            state    = make_bf16(offsets.backing_bytes() / 2, 23, -0.1F, 0.1F);
+            layout   = {{{0, state_bytes, 16}, DType::BF16, {channels, 3, 1, 1}}, 1, 0};
+            x        = make_bf16(std::size_t(4096) * n, 103, -0.01F, 0.01F);
+            q        = make_zeros(qk_elements * 2);
+            k        = make_zeros(qk_elements * 2);
+            v        = make_zeros(value_elements * 2);
+            capacity = ops::kda_input_proj_conv_update_ragged_workspace_capacity_bytes(
+                ops::linear_profile(weights.projection_view()), n, n, s, s);
+        } else {
+            state = o.state_dtype == DType::BF16
+                        ? make_bf16(offsets.backing_bytes() / 2, 19, -0.1F, 0.1F)
+                        : make_f32(offsets.backing_bytes() / 4, 19, -0.1F, 0.1F);
+            layout = {{{0, state_bytes, 16}, o.state_dtype, {128, 128, h, 1}}, 1, 0};
+            q        = make_bf16(qk_elements, 11);
+            k        = make_bf16(qk_elements, 12);
+            v        = make_bf16(value_elements, 13);
+            g        = make_bf16(value_elements, 14, -4, 4);
+            beta     = make_bf16(std::size_t(h) * n, 15);
+            out      = make_zeros(value_elements * 2);
+            capacity = ops::kimi_delta_attention_ragged_workspace_capacity_bytes(qh, h, n, n, s, s);
+        }
+        scratch   = make_buffer(std::max<std::size_t>(256, capacity));
+        workspace = std::make_unique<MemoryArena>(scratch.span());
+        if (offsets.mutates_source) initial.emplace(state);
+    }
+
+    void restore(CudaExecutionView cuda) const {
+        if (initial) initial->restore(cuda);
+    }
+
+    void launch(CudaExecutionView cuda) {
+        const auto seq = workload.view();
+        const ConstStateFieldView source{{state.span(), ragged::offset_tensor(sources)}, layout};
+        const StateFieldView destination{{state.span(), ragged::offset_tensor(destinations)},
+                                         layout};
+        if (input_update) {
+            const ops::KdaConvOutputs outputs{Tensor(q.span(), DType::BF16, {4096, n}),
+                                              Tensor(k.span(), DType::BF16, {4096, n}),
+                                              Tensor(v.span(), DType::BF16, {4096, n})};
+            ops::kda_input_proj_conv_update(
+                Tensor(x.span(), DType::BF16, {4096, n}), weights.projection_view(),
+                Tensor(weights.conv.span(), weights.conv_dtype, {channels, 4}),
+                {source, destination}, seq, outputs, *workspace, cuda);
+        } else {
+            Tensor y(out.span(), DType::BF16, {128, h, n});
+            ops::kimi_delta_attention(Tensor(q.span(), DType::BF16, {128, qh, n}),
+                                      Tensor(k.span(), DType::BF16, {128, qh, n}),
+                                      Tensor(v.span(), DType::BF16, {128, h, n}),
+                                      Tensor(g.span(), DType::BF16, {128, h, n}),
+                                      Tensor(beta.span(), DType::BF16, {h, n}),
+                                      Tensor(weights.a_log.span(), DType::FP32, {h}),
+                                      Tensor(weights.bias.span(), DType::FP32, {128, h}), -5,
+                                      0.08838834764831845F, seq, *workspace, source, destination, y,
+                                      cuda);
+        }
     }
 };
 } // namespace ninfer::bench::kda

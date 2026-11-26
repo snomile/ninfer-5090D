@@ -24,6 +24,26 @@ public:
 private:
     LayoutBuilder builder_;
 };
+
+PackedInputLayout packed_input_layout(std::size_t begin, int tokens, int segments, bool ple) {
+    ControlLayout controls(begin);
+    PackedInputLayout out;
+    out.ids                 = controls.plane(DType::I32, {tokens});
+    out.positions           = controls.plane(DType::I32, {tokens});
+    out.rope_positions      = controls.plane(DType::I32, {tokens, 3});
+    out.cu_seqlens          = controls.plane(DType::I32, {segments + 1});
+    out.seq_lengths         = controls.plane(DType::I32, {segments});
+    out.token_to_seq        = controls.plane(DType::I32, {tokens});
+    out.source_offsets      = controls.plane(DType::I64, {segments});
+    out.destination_offsets = controls.plane(DType::I64, {segments});
+    out.table_rows          = controls.plane(DType::I32, {segments});
+    if (ple) {
+        out.raw_tail         = controls.plane(DType::I32, {2, segments});
+        out.raw_tail_offsets = controls.plane(DType::I64, {segments});
+    }
+    out.ingress = {begin, controls.end() - begin, alignof(void*)};
+    return out;
+}
 } // namespace
 
 BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions& o,
@@ -79,13 +99,13 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     };
     TensorRegion last_ingress = out.sampling ? *out.sampling : out.batch.sampling_positions;
     if (c.mtp) {
-        auto& mtp      = out.mtp.emplace();
-        mtp.extents    = rows();
-        mtp.skip_first = rows();
+        auto& mtp         = out.mtp.emplace();
+        mtp.extents       = rows();
+        mtp.previous_rope = tensor(DType::I32, {3, batch}, "previous anchor coordinates");
         for (int step = 0; step < width - 1; ++step)
             mtp.draft_steps.push_back(metadata(batch, {}, false));
         last_ingress =
-            mtp.draft_steps.empty() ? mtp.skip_first : mtp.draft_steps.back().record_offsets;
+            mtp.draft_steps.empty() ? mtp.previous_rope : mtp.draft_steps.back().record_offsets;
     }
     out.ingress = {
         out.anchors.region.offset,
@@ -95,9 +115,11 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     out.batch.count_columns        = rows();
     TensorRegion last_commit       = out.batch.count_columns;
     if (out.mtp) {
-        out.mtp->last_columns   = rows();
-        out.mtp->active_columns = rows();
-        last_commit             = out.mtp->active_columns;
+        out.mtp->last_columns           = rows();
+        out.mtp->active_columns         = rows();
+        out.mtp->skip_first             = rows();
+        out.mtp->history_base_positions = rows();
+        last_commit                     = out.mtp->history_base_positions;
     }
     out.commit_ingress        = {out.commit_destination_offsets.region.offset,
                                  last_commit.region.offset + last_commit.region.bytes -
@@ -123,6 +145,26 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     }
     out.host_region = {out.ingress.offset,
                        last_host.region.offset + last_host.region.bytes - out.ingress.offset, 256};
+    if (!scoring) {
+        const auto packed = [&](bool ple) {
+            const auto capacity   = packed_input_layout(0, dimension(chunk), batch, ple);
+            const auto region     = b.add(capacity.ingress.bytes, capacity.ingress.alignment,
+                                          "packed prefill metadata");
+            out.host_region.bytes = region.offset + region.bytes - out.host_region.offset;
+            return packed_input_layout(region.offset, dimension(chunk), batch, ple);
+        };
+        out.packed_main = packed(device_ple);
+        if (c.mtp) out.packed_history = packed(false);
+        out.prefill_sampled_offsets =
+            tensor(DType::I64, {batch}, "prefill sampled State offsets");
+        out.host_region.bytes = out.prefill_sampled_offsets->region.offset +
+                                out.prefill_sampled_offsets->region.bytes - out.host_region.offset;
+        out.prefill_sampled_hidden = tensor(DType::BF16, {hidden, batch}, "prefill sampled hidden");
+        if (c.mtp)
+            out.prefill_aligned =
+                tensor(DType::BF16, {channels, sequence.local_capacity(dimension(chunk))},
+                       "packed MTP conditioning");
+    }
     if (out.mtp) out.mtp->verify_ids = tensor(DType::I32, {width * batch}, "verify IDs");
     out.prefill_sample = tensor(
         DType::BF16, {hidden, sequence.partition(dimension(chunk), 0).padded}, "prefill sample");
@@ -175,7 +217,8 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
         out.ple_embedding = tensor(DType::BF16, {dimension(c.text.ple.embedding), positions},
                                    "PLE lookup and merge");
     if (ranks > 1) {
-        constexpr int candidates = DistributedVocabulary::candidates;
+        const int candidates = width > 1 ? DistributedVocabulary::candidates_with_lse
+                                         : DistributedVocabulary::candidates;
         out.vocabulary_local =
             tensor(DType::I64, {candidates, width, batch}, "local vocabulary candidates");
         out.vocabulary_gathered = tensor(DType::I64, {candidates, width, batch, dimension(ranks)},
@@ -190,6 +233,10 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
                    "head logits");
         out.sampled_ids   = tensor(DType::I32, {width, batch}, "generated IDs");
         out.output_counts = rows();
+        if (out.mtp) {
+            out.top1_probabilities = tensor(DType::FP32, {batch}, "target top-1 probabilities");
+            out.draft_confidences  = tensor(DType::FP32, {batch, width - 1}, "draft confidences");
+        }
         out.token_counts =
             tensor(DType::I32, {static_cast<std::int32_t>(public_tokens), batch}, "token counts");
         out.grammar_masks =
@@ -227,6 +274,15 @@ MtpBatchLayout history_control_view(const MtpBatchLayout& backing, std::uint32_t
     return out;
 }
 
+PackedInputLayout packed_input_view(const PackedInputLayout& backing, std::int32_t tokens,
+                                    std::int32_t segments) {
+    if (tokens < 1 || tokens > backing.ids.shape[0] || segments < 1 ||
+        segments > backing.seq_lengths.shape[0])
+        throw std::invalid_argument("Qwen4Exp packed metadata exceeds frame capacity");
+    return packed_input_layout(backing.ingress.offset, tokens, segments,
+                               backing.raw_tail.has_value());
+}
+
 void select_buffer_rows(BufferLayout& out, const BufferLayout& backing, std::uint32_t rows) {
     if (!rows || rows > static_cast<std::uint32_t>(backing.batch.live_rows.shape[0]))
         throw std::invalid_argument("Qwen4Exp control rows exceed frame capacity");
@@ -254,8 +310,8 @@ void select_buffer_rows(BufferLayout& out, const BufferLayout& backing, std::uin
     if (out.sampling)
         out.sampling = plane(DType::I32, {static_cast<int>(sizeof(ops::SamplingConfig) / 4), n});
     if (out.mtp) {
-        out.mtp->extents    = row();
-        out.mtp->skip_first = row();
+        out.mtp->extents       = row();
+        out.mtp->previous_rope = plane(DType::I32, {3, n});
         for (std::size_t step = 0; step < out.mtp->draft_steps.size(); ++step) {
             auto& draft               = out.mtp->draft_steps[step];
             draft.positions           = row();
@@ -278,8 +334,10 @@ void select_buffer_rows(BufferLayout& out, const BufferLayout& backing, std::uin
     out.batch.accepted_columns     = row();
     out.batch.count_columns        = row();
     if (out.mtp) {
-        out.mtp->last_columns   = row();
-        out.mtp->active_columns = row();
+        out.mtp->last_columns           = row();
+        out.mtp->active_columns         = row();
+        out.mtp->skip_first             = row();
+        out.mtp->history_base_positions = row();
     }
     out.commit_ingress = {commit_begin, layout.end() - commit_begin, alignof(void*)};
     if (layout.end() > backing.commit_ingress.offset + backing.commit_ingress.bytes)
@@ -288,6 +346,10 @@ void select_buffer_rows(BufferLayout& out, const BufferLayout& backing, std::uin
         ControlLayout result(backing.sampled_ids->region.offset);
         out.sampled_ids   = result.plane(DType::I32, {dimension(width), n});
         out.output_counts = result.plane(DType::I32, {n});
+        if (out.mtp) {
+            out.top1_probabilities = result.plane(DType::FP32, {n});
+            out.draft_confidences  = result.plane(DType::FP32, {n, dimension(width - 1)});
+        }
     }
     const auto positions = out.decode.positions, rope = out.decode.rope_positions;
     out.decode                = out.batch;

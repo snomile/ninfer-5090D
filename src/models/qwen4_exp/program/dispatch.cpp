@@ -21,8 +21,13 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
     f.request           = std::move(request);
     f.physical          = work_shape(f.request.work);
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
-    f.graphable         = std::holds_alternative<MtpWork>(f.request.work.operation) ||
-                  (forward && forward->kind == ForwardKind::Ordinary);
+    const auto* mtp     = std::get_if<MtpWork>(&f.request.work.operation);
+    if (graphs && (mtp || (forward && forward->kind == ForwardKind::Ordinary))) {
+        const auto& geometry = mtp ? mtp->speculative : forward->speculative;
+        f.graph_route        = resources.plan.decode_routes->select_route(
+            f.physical, geometry ? SpeculativeBackend::Mtp : SpeculativeBackend::None,
+            geometry ? geometry->mtp_steps : 0);
+    }
     resources.select_batch(f.physical.rows);
     f.retirement = f.request.command;
     std::visit(
@@ -34,6 +39,17 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
                 f.rows = {&work.row, 1};
         },
         f.request.work.operation);
+    if (forward && forward->kind == ForwardKind::Prefill && !forward->visual) {
+        auto& packed = f.packed.emplace();
+        packed.last_columns.reserve(f.rows.size());
+        for (std::uint32_t b = 0; b < f.rows.size(); ++b) {
+            const auto& row = f.rows[b];
+            f.tokens += row.ids.size();
+            if (!row.ids.empty()) packed.segments.push_back(b);
+            if (row.sample) packed.sampled_members.push_back(b);
+            packed.last_columns.push_back(row.ids.empty() ? -1 : dimension(f.tokens) - 1);
+        }
+    }
     resources.compute_actions->submit(
         local_actions(f.request.work.actions, parameters.profile->local.rank));
     advance_compute();
@@ -52,7 +68,7 @@ void RankProgramImpl::advance_compute() {
             if (f.phase == ComputePhase::Prepare) return;
             break;
         case ComputePhase::Prefix:
-            if (f.graph ? !f.graph->advance_prefix(cuda)
+            if (f.graph ? f.graph->advance_until(*f.graph->hook_layer()) != TargetProgress::Complete
                         : !advance_layers(parameters.profile->config.text.ple.layer))
                 return;
             f.phase = ComputePhase::AwaitPle;
@@ -71,10 +87,12 @@ void RankProgramImpl::advance_compute() {
             if (f.graph) {
                 std::optional<nvtx::ScopedRange> range;
                 if (f.verify) range.emplace(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp);
-                if (f.graph->resident())
-                    f.graph->replay(f.ple->slot, cuda);
-                else
-                    f.graph->consume_ple(f.ple->slot, cuda);
+                if (f.graph->hook_layer()) {
+                    f.graph->launch_hook(f.ple->slot);
+                } else {
+                    f.target_replay.slot = f.ple->slot;
+                    (void)graphs->start_target(*f.graph_route, f.target_replay);
+                }
             } else {
                 embedding->ready.wait(cuda.stream());
                 f.run->consume_ple(embedding->values);
@@ -91,12 +109,12 @@ void RankProgramImpl::advance_compute() {
                 host_ple->prefetch(next.ids.size(), {&input, 1});
             }
             f.phase =
-                f.graph && f.graph->resident() ? ComputePhase::AfterMain : ComputePhase::Suffix;
+                f.graph && !f.graph->hook_layer() ? ComputePhase::AfterMain : ComputePhase::Suffix;
             break;
         }
         case ComputePhase::Suffix:
             if (f.graph) {
-                if (!f.graph->advance_suffix(cuda)) return;
+                if (f.graph->poll() != TargetProgress::Complete) return;
             } else {
                 if (!advance_layers(parameters.text.layers.size())) return;
                 Tensor logits;
@@ -168,10 +186,21 @@ void RankProgramImpl::finish_result() {
     auto& f      = *compute;
     auto& result = f.result;
     result.rows.resize(f.rows.size());
-    const auto& buffers        = resources.buffers();
-    const auto* ids            = static_cast<const TokenId*>(resources.egress().data);
-    const auto* forward        = std::get_if<ForwardWork>(&f.request.work.operation);
-    const bool sampled         = f.verify || (forward && forward->sample != SampleKind::None);
+    const auto& buffers      = resources.buffers();
+    const auto* ids          = static_cast<const TokenId*>(resources.egress().data);
+    const auto* forward      = std::get_if<ForwardWork>(&f.request.work.operation);
+    const bool sampled       = f.verify || (forward && forward->sample != SampleKind::None);
+    const auto probabilities = [&](const TensorRegion& region) {
+        return static_cast<const float*>(
+            resources.egress()
+                .subspan(region.region.offset - buffers.sampled_ids->region.offset)
+                .data);
+    };
+    const auto* top1 =
+        forward && forward->sample == SampleKind::NextToken && buffers.top1_probabilities
+            ? probabilities(*buffers.top1_probabilities)
+            : nullptr;
+    const auto* confidence     = f.verify ? probabilities(*buffers.draft_confidences) : nullptr;
     const std::int32_t* counts = nullptr;
     if (f.verify) {
         counts = reinterpret_cast<const std::int32_t*>(
@@ -183,7 +212,10 @@ void RankProgramImpl::finish_result() {
         auto& row     = result.rows[b];
         row.processed = f.verify ? 0 : f.rows[b].ids.size();
         row.drafts    = f.verify ? f.verify->extents[b] : 0;
-        if (sampled) {
+        if (top1) row.target_top1_probability = top1[b];
+        for (std::uint32_t step = 0; step < row.drafts; ++step)
+            row.draft_confidences.push_back(confidence[step * f.physical.rows + b]);
+        if (sampled && !f.packed) {
             const auto count = counts ? counts[b] : 1;
             if (count < 1 || static_cast<std::uint32_t>(count) > row.drafts + 1)
                 throw std::logic_error("Qwen4Exp generated prefix exceeds its licensed extent");
@@ -194,6 +226,14 @@ void RankProgramImpl::finish_result() {
         }
         if (auto ns = collect_vision_timing(binding(f.rows[b].member.residency)))
             f.gpu.add_vision(*ns);
+    }
+    if (f.packed) {
+        const auto& members = f.packed->sampled_members;
+        for (std::size_t i = 0; i < members.size(); ++i) {
+            auto& row          = result.rows[members[i]];
+            row.tokens         = {ids[i]};
+            row.dead_positions = f.dead_positions[members[i]];
+        }
     }
     if (f.timer_started)
         f.gpu.add_prefill(
@@ -213,18 +253,21 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
         throw std::logic_error("Qwen4Exp commit refers to an inactive execution");
     auto& f = *compute;
     gpu_timer.resolve();
-    if (f.verify)
-        commit_verify(commit);
+    const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
+    if (f.verify || (parameters.mtp && forward && forward->kind == ForwardKind::Ordinary))
+        commit_mtp(commit);
     else if (const auto* work = std::get_if<ForwardWork>(&f.request.work.operation);
              work && work->sample != SampleKind::None) {
-        const auto& io  = resources.buffers();
-        const int batch = commit.rows.size();
-        auto* lengths   = static_cast<std::int32_t*>(host_tensor(io.batch.count_columns).data);
-        bool any        = false;
+        const auto& io = resources.buffers();
+        const int batch =
+            f.packed ? dimension(f.packed->sampled_members.size()) : dimension(commit.rows.size());
+        auto* lengths = static_cast<std::int32_t*>(host_tensor(io.batch.count_columns).data);
+        bool any      = false;
         for (int b = 0; b < batch; ++b) {
-            const auto& sampling = f.rows[b].sampling;
+            const auto member    = f.packed ? f.packed->sampled_members[b] : b;
+            const auto& sampling = f.rows[member].sampling;
             lengths[b]           = sampling.presence_penalty || sampling.frequency_penalty
-                                       ? commit.rows[b].accepted
+                                       ? commit.rows[member].accepted
                                        : 0;
             any |= lengths[b] != 0;
         }
@@ -293,10 +336,9 @@ void RankProgramImpl::retire_compute() {
     observation.gpu = compute->gpu;
     const auto work = ExecutionTypes::describe_work(compute->request.work);
     if (compute->attention.forwards) observation.attention = {work.kind, compute->attention};
-    observation.path = compute->graph_main || (compute->graph && compute->graph->resident())
-                           ? ExecutionPath::Graph
-                       : compute->graph ? ExecutionPath::Mixed
-                                        : ExecutionPath::Eager;
+    observation.path = !compute->graph     ? ExecutionPath::Eager
+                       : resources.experts ? ExecutionPath::Mixed
+                                           : ExecutionPath::Graph;
     compute.reset();
     events.emplace_back(runtime::DeviceRetired{ticket, command, observation});
 }

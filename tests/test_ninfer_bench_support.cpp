@@ -36,14 +36,16 @@ void rejects(std::vector<std::string> args) {
 void options_test() {
     expect(parse({"bench", "--help"}).help_requested, "help without model");
     const auto mixed = parse({"bench", "model.ninfer", "--messages", "first.json", "--prompt",
-                              "--messages", "--kv-dtype", "k8v4", "--spec", "mtp", "--draft-tokens",
-                              "3", "--max-tokens", "64", "--no-cuda-graph", "--gpu-timing"});
+                              "--messages", "--kv-dtype", "k8v4", "--linear-state-dtype", "bf16",
+                              "--spec", "mtp", "--draft-tokens", "3", "--max-tokens", "64",
+                              "--no-cuda-graph", "--gpu-timing"});
     expect(mixed.inputs.size() == 2 && mixed.inputs[0].kind == bench::InputKind::Messages &&
                mixed.inputs[1].value == "--messages",
            "ordered inputs and literal flag-like values");
     expect(mixed.concurrency == 2 && mixed.launch.engine.max_concurrency == 2,
            "inferred concurrency");
     expect(mixed.launch.engine.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value &&
+               mixed.launch.engine.linear_state_dtype == LinearStateDType::BFloat16 &&
                mixed.launch.engine.speculative.backend == SpeculativeBackend::Mtp &&
                mixed.launch.engine.speculative.draft_tokens == 3 &&
                !mixed.launch.engine.use_cuda_graph &&
@@ -67,8 +69,11 @@ void options_test() {
     const auto defaults =
         parse({"bench", "model.ninfer", "--prompt", "x", "--prefix-reuse=default"});
     expect(defaults.launch.engine.context_cache.enabled, "explicit default uses decode defaults");
-    expect(bench::usage_text("bench").find("--kv-dtype") != std::string::npos, "shared help");
+    expect(bench::usage_text("bench").find("--kv-dtype") != std::string::npos &&
+               bench::usage_text("bench").find("--linear-state-dtype") != std::string::npos,
+           "shared help");
     rejects({"bench", "model.ninfer"});
+    rejects({"bench", "model.ninfer", "--prompt", "a", "--linear-state-dtype", "fp16"});
     rejects({"bench", "model.ninfer", "--prompt", "a", "--prompt", "b", "--concurrency", "3"});
     rejects({"bench", "model.ninfer", "--prompt", "a", "--repetitions", "0"});
     rejects({"bench", "model.ninfer", "--prompt", "a", "--profile-measured"});
@@ -84,14 +89,17 @@ void config_test() {
     {
         std::ofstream file(path);
         file << "[model]\npath = 'model.ninfer'\n[engine]\nmax_context = 2048\n"
-                "kv_dtype = 'int8'\nmax_concurrency = 2\n[speculative]\nbackend = 'mtp'\n"
+                "kv_dtype = 'int8'\nlinear_state_dtype = 'bf16'\nmax_concurrency = 2\n"
+                "[speculative]\nbackend = 'mtp'\n"
                 "draft_tokens = 3\n[generation]\nmax_tokens = 32\n[cli]\nprompt = 'ignored'\n";
     }
-    const auto options = parse({"bench", "--config", path.string(), "--prompt", "input",
-                                "--kv-dtype", "bf16", "--max-tokens", "48", "--concurrency", "3"});
+    const auto options =
+        parse({"bench", "--config", path.string(), "--prompt", "input", "--kv-dtype", "bf16",
+               "--linear-state-dtype", "fp32", "--max-tokens", "48", "--concurrency", "3"});
     expect(options.launch.engine.artifact_path == directory / "model.ninfer",
            "config-relative artifact");
     expect(options.launch.engine.kv_cache == KvCacheStorage::BFloat16 &&
+               options.launch.engine.linear_state_dtype == LinearStateDType::Float32 &&
                options.launch.engine.max_context == 2048 &&
                options.launch.engine.max_concurrency == 2 &&
                options.launch.generation.max_tokens == 48,
@@ -118,8 +126,11 @@ bench::Repetition sample(std::initializer_list<std::pair<std::uint32_t, std::uin
         request.generated_token_ids.resize(4);
         request.finish_reason = FinishReason::StopToken;
         request.stats.decode_by_batch.resize(4);
+        request.stats.speculative.proposed_tokens = 12;
         request.stats.speculative.drafted_tokens  = 10;
         request.stats.speculative.accepted_tokens = 6;
+        request.stats.speculative.bypass_steps    = 2;
+        request.stats.speculative.fallback_steps  = 1;
     }
     for (const auto& [batch, ns] : steps) {
         const ExecutionLatency latency{.result_ns     = ns * 3 / 4,
@@ -160,6 +171,11 @@ void report_test() {
                batches[2]["total"]["mean_ms"].is_null(),
            "missing target batch has no latency sample");
     near(summary["speculative"]["acceptance"], 0.6, "token-weighted acceptance");
+    expect(summary["speculative"]["proposed_tokens"] == 96 &&
+               summary["speculative"]["drafted_tokens"] == 80 &&
+               summary["speculative"]["bypass_steps"] == 16 &&
+               summary["speculative"]["fallback_steps"] == 8,
+           "proposal, verification, bypass and fallback counts across repetitions");
     expect(summary["executions"]["prefill"]["total"]["mean_ms"].is_null(),
            "missing timing is null");
     std::vector<bench::Repetition> prefill_only(1);
@@ -176,12 +192,12 @@ void report_test() {
            "missing first-token timing is null");
     expect(Json::parse(bench::format_report(report, bench::OutputFormat::Json)) == report,
            "JSON round trip");
-    expect(bench::format_report(report, bench::OutputFormat::Table).find("13.333") !=
-               std::string::npos,
-           "table main metric");
-    expect(bench::format_report(report, bench::OutputFormat::Table).find("no samples") !=
-               std::string::npos,
-           "missing target is shown in table");
+    const auto table = bench::format_report(report, bench::OutputFormat::Table);
+    expect(table.find("13.333") != std::string::npos, "table main metric");
+    expect(table.find("no samples") != std::string::npos, "missing target is shown in table");
+    expect(table.find("Speculative tokens: proposed=96  drafted=80") != std::string::npos &&
+               table.find("bypass steps=16  fallback steps=8") != std::string::npos,
+           "table separates speculative counters");
     expect(bench::format_report(report, bench::OutputFormat::Csv).find("all,decode,2,false,3,") !=
                std::string::npos,
            "CSV main metric");

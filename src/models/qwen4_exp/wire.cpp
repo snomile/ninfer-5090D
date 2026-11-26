@@ -100,6 +100,7 @@ void row(Encoder& out, const WorkRow& r, std::uint32_t rank) {
     sampling(out, r.sampling);
     out.u32(r.sampling_position);
     out.boolean(r.constrained);
+    out.boolean(r.sample);
 }
 
 WorkRow row(Decoder& in, std::uint32_t rank) {
@@ -119,6 +120,7 @@ WorkRow row(Decoder& in, std::uint32_t rank) {
     r.sampling          = sampling(in);
     r.sampling_position = in.u32();
     r.constrained       = in.boolean();
+    r.sample            = in.boolean();
     return r;
 }
 
@@ -128,7 +130,7 @@ void rows(Encoder& out, const std::vector<WorkRow>& values, std::uint32_t rank) 
 }
 
 std::vector<WorkRow> rows(Decoder& in, std::uint32_t rank) {
-    std::vector<WorkRow> result(in.count(149));
+    std::vector<WorkRow> result(in.count(150));
     for (auto& value : result) value = row(in, rank);
     return result;
 }
@@ -157,6 +159,30 @@ qwen::VisionWork VisionInputBindings::get(std::uint64_t id, bool produce) const 
     return out;
 }
 
+namespace {
+void decode_route(Encoder& out, const SpeculativeExecutionGeometry& g) {
+    out.u32(g.verify_width);
+    out.u32(g.mtp_steps);
+    out.u8(static_cast<std::uint8_t>(g.path));
+    out.boolean(g.graph_entry.has_value());
+    if (g.graph_entry) out.u32(*g.graph_entry);
+}
+
+std::shared_ptr<const SpeculativeExecutionGeometry>
+decode_route(Decoder& in, PhysicalBatchShape shape, std::uint64_t positions) {
+    auto g                 = std::make_shared<SpeculativeExecutionGeometry>();
+    g->physical_rows       = shape.rows;
+    g->owner_rows          = shape.attention_rows;
+    g->valid_target_tokens = positions;
+    g->owner_target_tokens = {positions};
+    g->verify_width        = in.u32();
+    g->mtp_steps           = in.u32();
+    g->path                = static_cast<ExecutionPath>(in.u8());
+    if (in.boolean()) g->graph_entry = in.u32();
+    return g;
+}
+} // namespace
+
 void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inputs,
                  std::uint32_t rank) {
     out.u32(rank);
@@ -171,6 +197,8 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
                 out.u8(static_cast<std::uint8_t>(v.kind));
                 out.u8(static_cast<std::uint8_t>(v.sample));
                 rows(out, v.rows, rank);
+                out.boolean(static_cast<bool>(v.speculative));
+                if (v.speculative) decode_route(out, *v.speculative);
                 out.boolean(v.visual.has_value());
                 if (v.visual) {
                     out.u64(v.visual->window.id);
@@ -189,6 +217,7 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
                 out.u32(v.shape.attention_rows);
                 rows(out, v.rows, rank);
                 integers(out, v.draft_extents);
+                decode_route(out, *v.speculative);
             } else if constexpr (std::is_same_v<T, ContextWork>) {
                 out.u8(3);
                 out.u64(v.bindings.size());
@@ -222,6 +251,7 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
         v.kind   = static_cast<ForwardKind>(in.u8());
         v.sample = static_cast<SampleKind>(in.u8());
         v.rows   = rows(in, rank);
+        if (in.boolean()) v.speculative = decode_route(in, v.shape, v.rows.size());
         if (in.boolean()) {
             const auto id = in.u64();
             v.visual      = inputs.get(id, in.boolean());
@@ -238,7 +268,11 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     }
     case 2: {
         const PhysicalBatchShape shape{in.u32(), in.u32()};
-        work.operation = MtpWork{rows(in, rank), integers<std::uint32_t>(in), shape};
+        MtpWork v{rows(in, rank), integers<std::uint32_t>(in), shape};
+        std::uint64_t positions = v.rows.size();
+        for (auto n : v.draft_extents) positions += n;
+        v.speculative  = decode_route(in, shape, positions);
+        work.operation = std::move(v);
         break;
     }
     case 3: {
@@ -312,6 +346,10 @@ void encode_result(Encoder& out, const Result& result) {
                     out.u32(r.accepted_drafts);
                     integers(out, r.tokens);
                     out.u32(r.dead_positions);
+                    out.u64(r.draft_confidences.size());
+                    for (const auto value : r.draft_confidences) out.f32(value);
+                    out.boolean(r.target_top1_probability.has_value());
+                    if (r.target_top1_probability) out.f32(*r.target_top1_probability);
                 }
 
             } else if constexpr (std::is_same_v<T, ContextResult>) {
@@ -347,13 +385,16 @@ Result decode_result(Decoder& in) {
     switch (in.u8()) {
     case 1: {
         ComputeResult v;
-        v.rows.resize(in.count(4 * 4 + 8));
+        v.rows.resize(in.count(33));
         for (auto& r : v.rows) {
             r.processed       = in.u32();
             r.drafts          = in.u32();
             r.accepted_drafts = in.u32();
             r.tokens          = integers<TokenId>(in);
             r.dead_positions  = in.u32();
+            r.draft_confidences.resize(in.count(4));
+            for (auto& value : r.draft_confidences) value = in.f32();
+            if (in.boolean()) r.target_top1_probability = in.f32();
         }
 
         return v;

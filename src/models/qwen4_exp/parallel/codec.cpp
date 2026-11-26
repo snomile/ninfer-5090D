@@ -20,14 +20,15 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
         definition.options().mtp(),
         definition.options().vision,
         static_cast<std::uint32_t>(definition.resources().text.control_tokens->size()),
-        p.batches};
+        p.batches,
+        p.decode_routes};
     const auto payloads = contract.payload_capacity(scope.owners.size());
     // Generated tokens are bounded by speculative positions. Scoring emits
     // at most one prefill chunk; context observations are coalesced by resource/direction.
-    const auto event =
-        runtime::protocol::rank_execution_observation_capacity() + 96 +
-        std::max<std::size_t>({batch * (64 + 4 * positions), 4ULL * s.prefill_chunk + 64,
-                               40ULL * 3 * (p.context.pools.size() + 1)});
+    const auto event = runtime::protocol::rank_execution_observation_capacity() + 96 +
+                       std::max<std::size_t>({payloads.compute_result, batch * (64 + 4 * positions),
+                                              4ULL * s.prefill_chunk + 64,
+                                              40ULL * 3 * (p.context.pools.size() + 1)});
     wire::Encoder report;
     runtime::protocol::encode(report, rank.observation);
     return {payloads.compute_work,
@@ -57,6 +58,8 @@ GroupExecutionPlan plan_group_execution(const ParallelPlan& parallel,
             session.vision_max_features != plan.session.vision_max_features ||
             session.context.pools.size() != plan.session.context.pools.size())
             throw std::invalid_argument("Qwen4Exp rank execution semantics differ");
+        if (session.decode_path == ExecutionPath::Mixed)
+            plan.session.decode_path = ExecutionPath::Mixed;
         auto& context = plan.session.context;
         context.ranks.insert(context.ranks.end(), session.context.ranks.begin(),
                              session.context.ranks.end());
@@ -98,7 +101,8 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                 definition.options().mtp(),
                 definition.options().vision,
                 static_cast<std::uint32_t>(definition.resources().text.control_tokens->size()),
-                rank.session.batches} {
+                rank.session.batches,
+                rank.session.decode_routes} {
     rank_               = rank.observation.rank;
     ranks_              = topology.ranks.size();
     max_features_       = rank.session.vision_max_features;

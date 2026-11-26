@@ -1,4 +1,5 @@
 #include "models/qwen3_5/session/internal.h"
+#include "core/paged_kv_geometry.h"
 
 #include <stdexcept>
 #include <utility>
@@ -53,8 +54,8 @@ PreparedSession::~PreparedSession()                                     = defaul
 
 PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definition,
                                 SessionPlan plan) {
-    return PreparedSession(
-        std::make_unique<detail::SessionImpl>(std::move(definition), std::move(plan)));
+    if (!definition) throw std::invalid_argument("Session preparation is incomplete");
+    return PreparedSession(std::make_unique<detail::SessionImpl>(std::move(plan)));
 }
 
 Session::Session(PreparedSession&& prepared, runtime::Executor<ExecutionTypes>& executor)
@@ -338,8 +339,27 @@ bool Session::recovery_pending(SequenceHandle sequence) const noexcept {
 
 bool Session::has_context_operation() const noexcept { return impl_->has_context_operation(); }
 
-std::optional<runtime::ExecutionTicket> Session::start_prefill(SequenceHandle h, bool c) {
-    return impl_->start_prefill(h, c);
+runtime::PrefillBudgetPolicy Session::prefill_budget_policy() const noexcept {
+    return {.max_tokens_global           = impl_->prefill_chunk,
+            .max_tokens_per_placement    = impl_->prefill_chunk,
+            .max_sequences_per_step      = impl_->max_concurrency,
+            .max_sequences_per_placement = impl_->max_concurrency};
+}
+
+runtime::PrefillCandidateInfo Session::prefill_candidate(SequenceHandle handle) const {
+    auto info      = impl_->prefill_candidate(handle);
+    info.placement = placement(handle);
+    return info;
+}
+
+std::optional<runtime::ExecutionTicket> Session::start_prefill(SequenceHandle h, bool constrained) {
+    return impl_->start_prefill(h, constrained);
+}
+
+std::optional<runtime::ExecutionTicket>
+Session::start_prefill(std::span<const SequenceHandle> members,
+                       std::span<const runtime::PrefillGrant> grants) {
+    return impl_->start_prefill(members, grants);
 }
 
 std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle h) {
@@ -349,7 +369,14 @@ std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle h) 
 std::optional<runtime::ExecutionTicket>
 Session::start_decode(std::span<const SequenceHandle> h, std::span<const runtime::RoundBudget> b,
                       std::span<const std::uint8_t> c) {
-    return impl_->start_decode(h, b, c);
+    return start_decode_round(h, {.budgets = b}, c);
+}
+
+std::optional<runtime::ExecutionTicket>
+Session::start_decode_round(std::span<const SequenceHandle> members,
+                            speculative::DecodeRoundRequest selection,
+                            std::span<const std::uint8_t> constrained) {
+    return impl_->start_decode_round(members, selection, constrained);
 }
 
 std::optional<runtime::ExecutionTicket> Session::start_control(std::span<const SequenceHandle> h,
@@ -391,6 +418,60 @@ void Session::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 
 PhysicalUsageSnapshot Session::physical_usage() const noexcept { return impl_->physical_usage(); }
 
+std::optional<runtime::ExecutionTicket>
+Session::start_decode_probe(std::span<const SequenceHandle> members,
+                            const speculative::RoundRoute& route,
+                            std::span<const std::uint32_t> extents,
+                            std::span<const std::uint8_t> constrained, bool record_online_cost) {
+    return start_decode_round(
+        members, {.extents = extents, .route = &route, .record_online_cost = record_online_cost},
+        constrained);
+}
+
+std::optional<runtime::ExecutionTicket>
+Session::start_decode_extents(std::span<const SequenceHandle> members,
+                              std::span<const std::uint32_t> extents,
+                              std::span<const std::uint8_t> constrained) {
+    return start_decode_round(members, {.extents = extents}, constrained);
+}
+
+speculative::CostModelSummary Session::speculative_cost_summary() const noexcept {
+    return impl_->cost_model.summary();
+}
+
+std::vector<std::uint32_t> Session::decode_target_widths() const {
+    const auto& routes = impl_->plan.decode_routes;
+    return routes ? routes->target_widths() : std::vector<std::uint32_t>{};
+}
+
+speculative::CalibrationConstraints Session::calibration_constraints() const {
+    const auto& p = *impl_;
+    return {.model           = p.cost_model.config(),
+            .batches         = p.plan.batch_execution.get(),
+            .path            = p.plan.decode_path,
+            .routes          = p.plan.decode_routes.get(),
+            .max_concurrency = p.max_concurrency,
+            .max_context     = p.capacity,
+            .kv_page_tokens  = kPagedKVPageSize,
+            .available_kv_pages =
+                speculative::available_calibration_pages(p.directory, placement_descriptions())};
+}
+
+std::optional<speculative::CostQuery>
+Session::decode_cost_query(runtime::ExecutionTicket ticket) const noexcept {
+    const auto& active = impl_->execution;
+    return active && active->ticket == ticket ? active->cost_query : std::nullopt;
+}
+
+void Session::fit_speculative_cost_model(std::span<const speculative::TimedCostAnchor> anchors,
+                                         double elapsed_ms) {
+    impl_->cost_model.fit(anchors, elapsed_ms);
+}
+
+std::uint32_t Session::decode_frontier(SequenceHandle handle) const {
+    return impl_->sequences[impl_->lane(handle)].continuation.metadata.execution_frontier;
+}
+
 std::optional<SequenceHandle> Session::prefill_continuation() const {
     const auto owner = impl_->vision_window.owner();
     if (owner && impl_->valid_sequence(owner->sequence)) return owner->sequence;
@@ -425,22 +506,32 @@ bool Session::recovery_precedes(runtime::PrefixId a, std::uint32_t af, runtime::
 } // namespace ninfer::models::qwen3_5
 
 namespace ninfer::models::qwen3_5::detail {
+namespace {
+speculative::CostModelConfig cost_config(const SessionPlan& plan) {
+    const auto* moe =
+        plan.profile ? std::get_if<MoeConfig>(&plan.profile->config.text.ffn) : nullptr;
+    return {
+        plan.speculative_backend,           plan.draft_window,     1, moe ? moe->num_experts : 0,
+        moe ? moe->num_experts_per_tok : 0, plan.hybrid_max_tokens};
+}
+} // namespace
 
-SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, SessionPlan plan_in)
-    : definition(std::move(definition_in)), plan(std::move(plan_in)), directory(plan.context),
-      state_store(&directory.states()), text_kv_histories(&directory.pool(0).histories()),
+SessionImpl::SessionImpl(SessionPlan plan_in)
+    : plan(std::move(plan_in)), directory(plan.context), state_store(&directory.states()),
+      text_kv_histories(&directory.pool(0).histories()),
       backend_kv_histories(directory.pool_count() > 1 ? &directory.pool(1).histories() : nullptr),
       text_kv_pages(&directory.pool(0).pages()),
       backend_kv_pages(directory.pool_count() > 1 ? &directory.pool(1).pages() : nullptr),
       host_context_enabled(plan.context.ranks.at(0).host_bytes != 0), capacity(plan.capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
-      context_cache(plan.context_cache), vision_enabled(plan.profile->options.vision),
-      causal_scoring(plan.causal_scoring), sequences(max_concurrency), requests(max_concurrency),
-      lane_epochs(max_concurrency), lane_marks(max_concurrency),
+      cost_model(cost_config(plan)), context_cache(plan.context_cache),
+      vision_enabled(plan.profile->options.vision), causal_scoring(plan.causal_scoring),
+      sequences(max_concurrency), requests(max_concurrency), lane_epochs(max_concurrency),
+      lane_marks(max_concurrency),
       recovery_metadata(directory.metadata_budget(), plan.causal_scoring ? 0 : plan.max_concurrency,
                         1, 1) {
-    if (!definition || !plan.profile || !plan.batch_execution || plan.context.pools.empty())
+    if (!plan.profile || !plan.batch_execution || plan.context.pools.empty())
         throw std::invalid_argument("Session preparation is incomplete");
     checkpoints.configure(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                           directory.metadata_budget(), &recovery_index);

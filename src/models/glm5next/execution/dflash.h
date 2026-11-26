@@ -4,6 +4,7 @@
 #include "models/glm5next/execution/parameters.h"
 #include "models/glm5next/execution/workspace.h"
 #include "models/glm5next/state/context.h"
+#include "ninfer/ops/ragged.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
 
@@ -20,11 +21,11 @@ struct DraftExecution {
 struct DraftInputs {
     Tensor anchors, frontiers, valid_columns, state_offsets, live_rows;
     const ops::SamplingConfig* sampling;
-    std::uint32_t context_bound;
+    ops::ContextBucket bucket;
 };
 
 struct DraftOutputs {
-    Tensor ids, positions, drafts, candidate_ids, proposal_q;
+    Tensor ids, positions, drafts, candidate_ids, proposal_q, confidences;
 };
 
 struct DraftReadout {
@@ -33,8 +34,8 @@ struct DraftReadout {
     ops::AttentionHeadGeometry geometry;
     MemorySpan scratch;
 
-    [[nodiscard]] ops::SlidingWindowAttentionGraphProfile profile(std::uint32_t) const;
-    void execute(std::uint32_t, CudaExecutionView) const;
+    [[nodiscard]] ops::OpGraphProfile profile(ops::ContextBucket) const;
+    void execute(ops::ContextBucket, CudaExecutionView) const;
 };
 
 using DraftSubmit = std::function<void(const DraftReadout&)>;
@@ -76,6 +77,9 @@ private:
 void draft_append_context(const Parameters&, DraftExecution, const Tensor& features,
                           const Tensor& positions, const Tensor& counts, const Tensor& offsets,
                           ops::ContextKVMaterializeExecutionEnvelope, CudaExecutionView);
+void draft_append_context(const Parameters&, DraftExecution, const Tensor& features,
+                          const Tensor& positions, const ops::RaggedSequenceView& ragged,
+                          const Tensor& offsets, CudaExecutionView);
 
 [[nodiscard]] std::size_t draft_workspace_capacity(const ModelProfile&, int width, int max_batch);
 [[nodiscard]] std::size_t draft_context_workspace_capacity(const ModelProfile&,

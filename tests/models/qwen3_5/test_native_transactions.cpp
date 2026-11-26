@@ -79,7 +79,7 @@ struct SessionFixture {
                    std::shared_ptr<const q35::execution::ModelProfile> profile,
                    const EngineOptions& options, native::ContextBudget budget = {})
         : rank(std::move(definition), std::move(model), std::move(profile), options, budget),
-          session(rank.definition, std::move(rank.session_plan)) {
+          session(std::move(rank.session_plan)) {
         session.executor_ = &rank.executor();
     }
 };
@@ -88,7 +88,7 @@ class Fixture {
 public:
     Fixture(native::NativeRankFixture& rank, q35::detail::SessionImpl& program,
             ninfer::models::qwen::Frontend& frontend)
-        : program_(program), frontend_(frontend), empty_(program.physical_usage()),
+        : program_(program), frontend_(frontend), empty_(program.physical_usage()), rank_(rank),
           driver_(program, rank) {}
 
     q35::RequestBasePlan request(std::uint32_t tokens, bool history = false,
@@ -106,7 +106,7 @@ public:
             options);
     }
 
-    void synchronize() { driver_.synchronize(); }
+    void synchronize() { rank_.synchronize(); }
 
     q35::ContextProgress settle(bool cancelled = false) {
         auto progress = driver_.settle(cancelled);
@@ -182,10 +182,12 @@ public:
         while (processed < tokens) {
             reserve(sequence, q35::ExecutionUnitKind::Prefill);
             auto step = driver_.prefill(sequence);
-            require(!step.complete && !step.pending, "partial prefill sampled before its target");
-            require(step.processed_prompt_tokens != 0, "partial prefill made no progress");
-            processed += step.processed_prompt_tokens;
-            if (step.capture_ready) { program_.skip_capture(sequence); }
+            require(!step.rows.at(0).complete && !step.pending,
+                    "partial prefill sampled before its target");
+            require(step.rows.at(0).processed_prompt_tokens != 0,
+                    "partial prefill made no progress");
+            processed += step.rows.at(0).processed_prompt_tokens;
+            if (step.rows.at(0).capture_ready) { program_.skip_capture(sequence); }
         }
         require(processed == tokens, "partial prefill crossed its requested frontier");
     }
@@ -197,10 +199,11 @@ public:
             const bool recovering = program_.recovery_pending(sequence);
             reserve(sequence, q35::ExecutionUnitKind::Prefill);
             auto step = driver_.prefill(sequence);
-            processed += step.processed_prompt_tokens;
-            if (step.capture_ready) { program_.skip_capture(sequence); }
-            if (!step.complete) {
-                require(step.processed_prompt_tokens != 0 || step.capture_ready,
+            processed += step.rows.at(0).processed_prompt_tokens;
+            if (step.rows.at(0).capture_ready) { program_.skip_capture(sequence); }
+            if (!step.rows.at(0).complete) {
+                require(step.rows.at(0).processed_prompt_tokens != 0 ||
+                            step.rows.at(0).capture_ready,
                         "prefill made no observable progress");
                 continue;
             }
@@ -218,7 +221,7 @@ public:
                                                            : runtime::CommitDisposition::Active),
                     "prefill commit returned the wrong request phase");
             if (result.rows[0].capture_ready) { program_.skip_capture(sequence); }
-            return step.summary;
+            return step.rows.at(0).summary;
         }
         throw std::runtime_error("prefill exceeded its bounded chunk count");
     }
@@ -242,7 +245,7 @@ public:
         auto base           = request(64);
         const auto sequence = bind(base);
         finish_prefill(sequence, 64, false);
-        reserve(sequence, q35::ExecutionUnitKind::Decode, 8);
+        reserve(sequence, q35::ExecutionUnitKind::Decode, 1);
         const std::array<q35::SequenceHandle, 1> members{sequence};
         const std::array<runtime::RoundBudget, 1> budget{{{.generated_tokens_remaining = 8}}};
         auto pending = driver_.decode(members, budget);
@@ -263,8 +266,9 @@ public:
         const auto sequence = bind(long_base, 1);
         reserve(sequence, q35::ExecutionUnitKind::Prefill);
         const auto bounded = driver_.prefill(sequence);
-        require(bounded.processed_prompt_tokens == kChunk / 16 && !bounded.complete &&
-                    !bounded.pending && !bounded.capture_ready,
+        const auto& bounded_row = bounded.rows.at(0);
+        require(bounded_row.processed_prompt_tokens == kChunk / 16 && !bounded_row.complete &&
+                    !bounded.pending && !bounded_row.capture_ready,
                 "long prefill did not yield before blocking an active output lane");
         // The peer must still be able to publish and complete after the bounded forward.
         decode_and_finish(peer);
@@ -273,15 +277,17 @@ public:
         finish_prefill(replacement, 32, false);
         reserve(sequence, q35::ExecutionUnitKind::Prefill);
         const auto next = driver_.prefill(sequence);
-        require(next.processed_prompt_tokens == kChunk / 16 && !next.complete &&
-                    !next.pending && !next.capture_ready,
+        const auto& next_row = next.rows.at(0);
+        require(next_row.processed_prompt_tokens == kChunk / 16 && !next_row.complete &&
+                    !next.pending && !next_row.capture_ready,
                 "long prefill stopped yielding after its output peer was replaced");
         require(driver_.abort(replacement).status == runtime::ConsumeStatus::Consumed,
                 "active peer did not release its execution lane");
         reserve(sequence, q35::ExecutionUnitKind::Prefill);
         const auto ordinary = driver_.prefill(sequence);
-        require(ordinary.processed_prompt_tokens == kChunk && !ordinary.complete &&
-                    !ordinary.pending && !ordinary.capture_ready,
+        const auto& ordinary_row = ordinary.rows.at(0);
+        require(ordinary_row.processed_prompt_tokens == kChunk && !ordinary_row.complete &&
+                    !ordinary.pending && !ordinary_row.capture_ready,
                 "prefill did not recover its full chunk after the active peer ended");
         require(driver_.abort(sequence).status == runtime::ConsumeStatus::Consumed,
                 "bounded prefill did not release its partial continuation");
@@ -296,14 +302,43 @@ public:
         const auto sequence = bind(short_base, 1);
         reserve(sequence, q35::ExecutionUnitKind::Prefill);
         const auto ordinary = driver_.prefill(sequence);
-        require(ordinary.processed_prompt_tokens == kChunk && !ordinary.complete &&
-                    !ordinary.pending && !ordinary.capture_ready,
+        const auto& ordinary_row = ordinary.rows.at(0);
+        require(ordinary_row.processed_prompt_tokens == kChunk && !ordinary_row.complete &&
+                    !ordinary.pending && !ordinary_row.capture_ready,
                 "short prefill added forward passes while a peer was active");
         finish_prefill(sequence, kChunk, false);
         decode_and_finish(sequence);
         require(driver_.abort(peer).status == runtime::ConsumeStatus::Consumed,
                 "short-prefill peer did not release its execution lane");
         expect_empty("short peer prefill retained Context ownership");
+    }
+
+    void recovery_prefill_stays_within_grant_when_peer_finishes() {
+        auto base = request(kPromptTokens);
+        const auto sequence = bind(base);
+        prefill_prefix(sequence, kChunk);
+        require(program_.start_pause(sequence, {runtime::PauseKind::KeepDevice, {0}}),
+                "fixture could not retain its paused prefill");
+        auto saved = settle();
+        require(saved.paused && saved.paused->has_snapshot(), "fixture lost its snapshot");
+
+        const auto peer = bind(request(32), 1);
+        finish_prefill(peer, 32, false);
+        const auto resumed = bind(base, 0, &*saved.paused, q35::ExecutionUnitKind::Prefill);
+        require(program_.recovery_pending(resumed), "restored prefill has no recovery grant");
+        require(driver_.abort(peer).status == runtime::ConsumeStatus::Consumed,
+                "could not retire the active output peer");
+
+        // Binding saw a live output peer and only guaranteed its short prefill window.
+        require(program_.prefill_candidate(resumed).unit_max_tokens == kChunk / 16,
+                "retiring a peer enlarged the promised recovery window");
+        prefill_prefix(resumed, kChunk / 16);
+        require(!program_.recovery_pending(resumed) &&
+                    program_.prefill_candidate(resumed).unit_max_tokens == kChunk,
+                "new progress did not release the retained grant");
+        require(driver_.abort(resumed).status == runtime::ConsumeStatus::Consumed,
+                "restored prefill could not abort");
+        expect_empty("restored prefill retained execution resources");
     }
 
     void chat_markers_share_prefill_unit() {
@@ -327,8 +362,8 @@ public:
         require(!program_.prepare_capture(sequence),
                 "history-disabled chat fixture requested a physical capture");
         auto step = driver_.prefill(sequence);
-        require(step.complete && step.pending && !step.capture_ready &&
-                    step.processed_prompt_tokens == tokens,
+        require(step.rows.at(0).complete && step.pending && !step.rows.at(0).capture_ready &&
+                    step.rows.at(0).processed_prompt_tokens == tokens,
                 "chat markers interrupted the prefill unit");
         const std::array<runtime::CommitDecision, 1> decision{
             {{.accepted_tokens = 1, .terminal = true}}};
@@ -496,16 +531,17 @@ public:
         for (const auto frontier : marked.frontiers) {
             reserve(sequence, q35::ExecutionUnitKind::Prefill);
             const auto step = driver_.prefill(sequence);
-            require(step.processed_prompt_tokens == frontier - cursor && step.capture_ready &&
-                        !step.complete && !step.pending,
+            require(step.rows.at(0).processed_prompt_tokens == frontier - cursor &&
+                        step.rows.at(0).capture_ready && !step.rows.at(0).complete && !step.pending,
                     "Native skipped an explicitly marked prefix boundary");
             cursor = frontier;
             shared.push_back(capture(sequence, frontier, runtime::CheckpointRole::SharedPrefix));
         }
         reserve(sequence, q35::ExecutionUnitKind::Prefill);
         const auto ordinary = driver_.prefill(sequence);
-        require(ordinary.processed_prompt_tokens == kChunk && !ordinary.capture_ready &&
-                    !ordinary.complete && !ordinary.pending,
+        require(ordinary.rows.at(0).processed_prompt_tokens == kChunk &&
+                    !ordinary.rows.at(0).capture_ready && !ordinary.rows.at(0).complete &&
+                    !ordinary.pending,
                 "ordinary prefill chunk created an unrequested recovery point");
         require(driver_.abort(sequence).status == runtime::ConsumeStatus::Consumed,
                 "marker fixture did not release its active reader");
@@ -520,8 +556,9 @@ public:
             for (unsigned chunk = 0; chunk < 2; ++chunk) {
                 reserve(active, q35::ExecutionUnitKind::Prefill);
                 const auto step = driver_.prefill(active);
-                require(step.processed_prompt_tokens == kChunk && !step.capture_ready &&
-                            !step.complete && !step.pending,
+                require(step.rows.at(0).processed_prompt_tokens == kChunk &&
+                            !step.rows.at(0).capture_ready && !step.rows.at(0).complete &&
+                            !step.pending,
                         "raw prefill chunk offered an unrequested recovery point");
             }
             require(driver_.abort(active).status == runtime::ConsumeStatus::Consumed,
@@ -530,20 +567,40 @@ public:
         }
     }
 
+    std::pair<q35::CheckpointHandle, TokenId> capture_input_and_sample(q35::SequenceHandle sequence,
+                                                                       std::uint32_t frontier,
+                                                                       std::uint32_t remaining) {
+        reserve(sequence, q35::ExecutionUnitKind::Prefill);
+        const auto step = driver_.prefill(sequence);
+        const auto& row = step.rows.at(0);
+        require(row.processed_prompt_tokens == remaining && row.capture_ready && !row.complete &&
+                    !step.pending,
+                "full input did not offer its replay point before sampling");
+        const auto point = capture(sequence, frontier, runtime::CheckpointRole::InputReplay);
+        require(program_.prefill_candidate(sequence).zero_token_sample,
+                "captured input did not expose anchor-only prefill");
+        reserve(sequence, q35::ExecutionUnitKind::Prefill);
+        auto begin = driver_.prefill(sequence);
+        require(begin.rows.at(0).complete && begin.rows.at(0).processed_prompt_tokens == 0 &&
+                    begin.pending && begin.pending->row_sampled(0) &&
+                    begin.pending->row_counts()[0] == 1,
+                "input replay point did not sample its first token at the captured frontier");
+        const auto token = begin.pending->tokens().front();
+        const std::array accepted{runtime::CommitDecision{.accepted_tokens = 1}};
+        const auto committed = driver_.commit(std::move(*begin.pending), accepted);
+        require(committed.rows[0].disposition == runtime::CommitDisposition::Active &&
+                    !committed.rows[0].capture_ready,
+                "first-token commit did not activate the captured input");
+        return {point, token};
+    }
+
     void input_replay_lifecycle() {
         // The non-page-aligned P shares its directory and tail with the active continuation.
         constexpr std::uint32_t prompt_tokens = 2 * kChunk + 1;
         auto base                             = request(prompt_tokens, true);
         const auto active                     = bind(base);
         prefill_prefix(active, 2 * kChunk);
-        reserve(active, q35::ExecutionUnitKind::Prefill);
-        auto begin = driver_.prefill(active);
-        require(begin.complete && begin.pending && begin.processed_prompt_tokens == 1,
-                "input replay fixture did not reach its full input boundary");
-        const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
-        const auto committed = driver_.commit(std::move(*begin.pending), accepted);
-        require(committed.rows[0].capture_ready, "full raw input did not offer its replay point");
-        const auto input = capture(active, prompt_tokens, runtime::CheckpointRole::InputReplay);
+        const auto input = capture_input_and_sample(active, prompt_tokens, 1).first;
 
         reserve(active, q35::ExecutionUnitKind::Decode, 1);
         const std::array<q35::SequenceHandle, 1> members{active};
@@ -587,15 +644,8 @@ public:
         for (const std::uint32_t prompt_tokens : {64U, 65U}) {
             auto base           = request(prompt_tokens, true);
             const auto original = bind(base);
-            reserve(original, q35::ExecutionUnitKind::Prefill);
-            auto begin = driver_.prefill(original);
-            require(begin.complete && begin.pending,
-                    "active input fixture did not reach its full input boundary");
-            const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
-            const auto committed = driver_.commit(std::move(*begin.pending), accepted);
-            require(committed.rows[0].capture_ready, "active input fixture did not offer P");
             const auto input =
-                capture(original, prompt_tokens, runtime::CheckpointRole::InputReplay);
+                capture_input_and_sample(original, prompt_tokens, prompt_tokens).first;
 
             // Exact-input reuse needs no Main page beyond the exported prefix. The original
             // request still owns the source writer while the second lane obtains its own view.
@@ -649,13 +699,7 @@ public:
         // A's retained P must continue to carry A's own state and KV together.
         const auto source_b = checkpoint(base);
         const auto active_a = bind(base);
-        reserve(active_a, q35::ExecutionUnitKind::Prefill);
-        auto begin = driver_.prefill(active_a);
-        require(begin.complete && begin.pending, "independent-history fixture did not begin A");
-        const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
-        const auto committed = driver_.commit(std::move(*begin.pending), accepted);
-        require(committed.rows[0].capture_ready, "independent-history fixture did not offer P_A");
-        const auto input_a = capture(active_a, prompt_tokens, runtime::CheckpointRole::InputReplay);
+        const auto input_a = capture_input_and_sample(active_a, prompt_tokens, prompt_tokens).first;
         const std::array<q35::CheckpointHandle, 1> points_a{input_a};
         const auto identity = [&](q35::CheckpointHandle point) {
             const auto& snapshot = program_.checkpoints[point.index].value->snapshot;
@@ -678,6 +722,7 @@ public:
         const std::array<q35::SequenceHandle, 1> members{active_a};
         const std::array<runtime::RoundBudget, 1> budgets{{{.generated_tokens_remaining = 1}}};
         auto pending = driver_.decode(members, budgets);
+        const std::array accepted{runtime::CommitDecision{.accepted_tokens = 1}};
         (void)driver_.commit(std::move(pending), accepted);
         require(program_.start_pause(active_a, {runtime::PauseKind::ReleaseAndReplay, {0}}),
                 "independent-history fixture could not pause A for replay");
@@ -747,17 +792,10 @@ public:
         constexpr std::uint32_t prompt_tokens = 65;
         auto base                             = request(prompt_tokens, true);
         const auto active                     = bind(base);
-        reserve(active, q35::ExecutionUnitKind::Prefill);
-        auto begin = driver_.prefill(active);
-        require(begin.complete && begin.pending && begin.pending->tokens().size() == 1,
-                "Host suffix fixture did not produce one Begin token");
+        const auto [input, first] = capture_input_and_sample(active, prompt_tokens, prompt_tokens);
         std::vector<TokenId> endpoint_input(prompt_tokens, 198);
         endpoint_input.front() = 1000;
-        endpoint_input.push_back(begin.pending->tokens().front());
-        const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
-        const auto committed = driver_.commit(std::move(*begin.pending), accepted);
-        require(committed.rows[0].capture_ready, "Host suffix fixture did not offer P");
-        const auto input = capture(active, prompt_tokens, runtime::CheckpointRole::InputReplay);
+        endpoint_input.push_back(first);
 
         // Extend the same history across complete KV pages, retaining the earlier input point.
         const std::array<q35::SequenceHandle, 1> members{active};
@@ -856,7 +894,7 @@ public:
         require(program_.prepare_capture(active)->reserved, "input retry reservation missing");
         program_.skip_capture(active);
         auto step = driver_.prefill(active);
-        require(step.complete && step.pending && !step.capture_ready,
+        require(step.rows.at(0).complete && step.pending && !step.rows.at(0).capture_ready,
                 "skipped input changed the normal prefill unit");
         const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
         require(!driver_.commit(std::move(*step.pending), accepted).rows[0].capture_ready,
@@ -905,8 +943,8 @@ public:
         require(prepared && prepared->reserved && prepared->frontier == marked.frontiers.front(),
                 "capture did not retry its original boundary after capacity was reclaimed");
         const auto step = driver_.prefill(active);
-        require(step.capture_ready && !step.complete &&
-                    step.processed_prompt_tokens == marked.frontiers.front(),
+        require(step.rows.at(0).capture_ready && !step.rows.at(0).complete &&
+                    step.rows.at(0).processed_prompt_tokens == marked.frontiers.front(),
                 "retried capture advanced beyond its reserved boundary");
         const auto saved =
             capture(active, marked.frontiers.front(), runtime::CheckpointRole::SharedPrefix);
@@ -928,7 +966,8 @@ public:
                     "unavailable checkpoint metadata was reported as State capacity pressure");
         }
         const auto step = driver_.prefill(active);
-        require(step.processed_prompt_tokens == kChunk && !step.complete && !step.capture_ready,
+        require(step.rows.at(0).processed_prompt_tokens == kChunk && !step.rows.at(0).complete &&
+                    !step.rows.at(0).capture_ready,
                 "optional metadata exhaustion blocked the reserved prefill unit");
         require(driver_.abort(active).status == runtime::ConsumeStatus::Consumed,
                 "metadata pressure retained its active writer");
@@ -942,7 +981,8 @@ public:
         auto device_pressure = fill_capacity(models::context::ContextMemory::Device);
         auto host_pressure   = fill_capacity(models::context::ContextMemory::Host);
         const auto step      = driver_.prefill(active);
-        require(step.processed_prompt_tokens == kChunk && !step.complete && !step.capture_ready,
+        require(step.rows.at(0).processed_prompt_tokens == kChunk && !step.rows.at(0).complete &&
+                    !step.rows.at(0).capture_ready,
                 "unavailable optional capture changed the native prefill unit");
         require(driver_.abort(active).status == runtime::ConsumeStatus::Consumed,
                 "capture pressure retained its active writer");
@@ -978,8 +1018,8 @@ public:
         for (unsigned chunk = 0; chunk < 2; ++chunk) {
             reserve(active, q35::ExecutionUnitKind::Prefill);
             const auto step = driver_.prefill(active);
-            require(step.processed_prompt_tokens == kChunk && !step.complete &&
-                        !step.capture_ready,
+            const auto& row = step.rows.at(0);
+            require(row.processed_prompt_tokens == kChunk && !row.complete && !row.capture_ready,
                     "final semantic boundary changed an earlier nominal prefill unit");
         }
         reserve(active, q35::ExecutionUnitKind::Prefill);
@@ -992,10 +1032,10 @@ public:
                 "final semantic fixture did not exhaust optional capture destinations");
         expect_usage(full, "failed final capture retained an unpublished reservation");
         auto step = driver_.prefill(active);
-        require(step.processed_prompt_tokens == expected_final &&
-                    step.complete == (tokens != kPromptTokens) &&
-                    step.pending.has_value() == step.complete &&
-                    !step.capture_ready,
+        const auto& row = step.rows.at(0);
+        require(row.processed_prompt_tokens == expected_final &&
+                    row.complete == (tokens != kPromptTokens) &&
+                    step.pending.has_value() == row.complete && !row.capture_ready,
                 "missing optional backing changed full-chunk separation or a partial suffix");
         if (step.pending) {
             const std::array<runtime::CommitDecision, 1> decision{
@@ -1235,13 +1275,7 @@ public:
     void retired_host_image_preserves_input() {
         auto base         = request(65, true);
         const auto active = bind(base);
-        reserve(active, q35::ExecutionUnitKind::Prefill);
-        auto begin = driver_.prefill(active);
-        require(begin.pending.has_value(), "Host retirement fixture did not begin");
-        const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
-        require(driver_.commit(std::move(*begin.pending), accepted).rows[0].capture_ready,
-                "Host retirement fixture did not offer its input point");
-        const auto input = capture(active, 65, runtime::CheckpointRole::InputReplay);
+        const auto input  = capture_input_and_sample(active, 65, 65).first;
         reserve(active, q35::ExecutionUnitKind::Decode, 1);
         const std::array<q35::SequenceHandle, 1> members{active};
         const std::array<runtime::RoundBudget, 1> budgets{{{1}}};
@@ -1283,13 +1317,7 @@ public:
             constexpr std::uint32_t prefix = 65;
             auto original                  = request(prefix, true);
             const auto active              = bind(original);
-            reserve(active, q35::ExecutionUnitKind::Prefill);
-            auto begin = driver_.prefill(active);
-            require(begin.pending.has_value(), "rewind fixture did not complete input");
-            const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
-            require(driver_.commit(std::move(*begin.pending), accepted).rows[0].capture_ready,
-                    "rewind fixture did not offer input recovery");
-            const auto input = capture(active, prefix, runtime::CheckpointRole::InputReplay);
+            const auto input               = capture_input_and_sample(active, prefix, prefix).first;
             const std::array<q35::SequenceHandle, 1> members{active};
             if (releases_suffix) {
                 std::array<TokenId, kChunk> forced;
@@ -1844,6 +1872,7 @@ private:
     q35::detail::SessionImpl& program_;
     ninfer::models::qwen::Frontend& frontend_;
     q35::PhysicalUsageSnapshot empty_;
+    native::NativeRankFixture& rank_;
     native::EventDriver<q35::detail::SessionImpl> driver_;
     std::optional<runtime::ResidencyId> last_binding_;
 };
@@ -1857,7 +1886,7 @@ void shared_capture_alignment(std::shared_ptr<const q35::ModelDefinition> defini
     options.context_cache.enabled             = true;
     options.context_cache.host_capacity_bytes = 0;
     native::NativeRankFixture rank(definition, model, profile, options, {.retained_states = 2});
-    q35::detail::SessionImpl program(definition, std::move(rank.session_plan));
+    q35::detail::SessionImpl program(std::move(rank.session_plan));
     program.executor_ = &rank.executor();
     native::EventDriver driver(program, rank);
     const auto empty   = program.physical_usage();
@@ -1870,8 +1899,8 @@ void shared_capture_alignment(std::shared_ptr<const q35::ModelDefinition> defini
         auto step = driver.prefill(sequence);
         if (step.pending) {
             const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
-            const auto committed = driver.commit(std::move(*step.pending), accepted);
-            step.capture_ready   = committed.rows[0].capture_ready;
+            const auto committed          = driver.commit(std::move(*step.pending), accepted);
+            step.rows.at(0).capture_ready = committed.rows[0].capture_ready;
         }
         return step;
     };
@@ -1899,8 +1928,9 @@ void shared_capture_alignment(std::shared_ptr<const q35::ModelDefinition> defini
                 require(bound.sequence.has_value(), "aligned capture source did not publish");
                 const auto original = *bound.sequence;
                 const auto step     = advance(original);
-                require(step.processed_prompt_tokens == frontier && step.capture_ready &&
-                            step.complete == shared_input,
+                require(step.rows.at(0).processed_prompt_tokens == frontier &&
+                            step.rows.at(0).capture_ready && !step.rows.at(0).complete &&
+                            !step.pending,
                         "aligned Shared capture was skipped or crossed its frontier");
                 require(program.start_capture(original) == runtime::ContextStart::Started,
                         "aligned Shared capture could not reserve its destination");
@@ -1951,11 +1981,16 @@ void shared_capture_alignment(std::shared_ptr<const q35::ModelDefinition> defini
                         "captured aligned Shared prefix could not bind another request");
                     const auto reused = settle();
                     require(reused.sequence.has_value(), "Shared prefix binding did not publish");
-                    const auto suffix = advance(*reused.sequence);
-                    require(suffix.complete &&
-                                suffix.processed_prompt_tokens == prompt_tokens - frontier,
+                    auto suffix          = advance(*reused.sequence);
+                    const auto processed = suffix.rows.at(0).processed_prompt_tokens;
+                    if (suffix.rows.at(0).capture_ready) {
+                        program.skip_capture(*reused.sequence);
+                        suffix = advance(*reused.sequence);
+                        require(suffix.rows.at(0).processed_prompt_tokens == 0,
+                                "captured suffix repeated input before sampling");
+                    }
+                    require(suffix.rows.at(0).complete && processed == prompt_tokens - frontier,
                             "Shared prefix binding repeated or skipped the saved input");
-                    if (suffix.capture_ready) { program.skip_capture(*reused.sequence); }
                     require(driver.abort(*reused.sequence).status ==
                                 runtime::ConsumeStatus::Consumed,
                             "Shared prefix reader retained execution resources");
@@ -1982,7 +2017,7 @@ void replay_sampling_counts(std::shared_ptr<const q35::ModelDefinition> definiti
     options.context_cache.enabled             = false;
     options.context_cache.host_capacity_bytes = 0;
     native::NativeRankFixture rank(definition, model, profile, options);
-    q35::detail::SessionImpl program(definition, std::move(rank.session_plan));
+    q35::detail::SessionImpl program(std::move(rank.session_plan));
     program.executor_ = &rank.executor();
     native::EventDriver driver(program, rank);
 
@@ -2021,7 +2056,7 @@ void replay_sampling_counts(std::shared_ptr<const q35::ModelDefinition> definiti
     const auto initial = bind(0, nullptr);
     reserve(initial, q35::ExecutionUnitKind::Prefill);
     auto begin = driver.prefill(initial);
-    require(begin.complete && begin.pending && begin.pending->tokens().size() == 1,
+    require(begin.rows.at(0).complete && begin.pending && begin.pending->tokens().size() == 1,
             "sampling-count fixture did not produce exactly one Begin token");
     const TokenId first = begin.pending->tokens().front();
     const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
@@ -2396,6 +2431,7 @@ int main(int argc, char** argv) {
             fixture.consecutive_decode_terminal();
             fixture.prefill_yields_to_active_peer();
             fixture.short_prefill_keeps_full_chunks();
+            fixture.recovery_prefill_stays_within_grant_when_peer_finishes();
             fixture.chat_markers_share_prefill_unit();
             fixture.replay_carries_independent_input();
             fixture.retained_input_host_suffix();

@@ -138,6 +138,10 @@ public:
         return true;
     }
 
+    bool supports_graph_gating() const noexcept override {
+        return kind_ == CommunicationBackend::Native;
+    }
+
     std::size_t warmup_bytes() const noexcept override { return 0; }
 
     void warmup(MemorySpan, CudaExecutionView) override {}
@@ -173,6 +177,13 @@ void communication_selection() {
     require(dist::detail::select_collectives(preferences, candidates) == expected,
             "measured preference bands were confused with capability limits or candidate order");
     const std::array<dist::detail::Backend*, 1> nccl_only{&nccl}, native_only{&native};
+    const auto gate = [&](std::vector<dist::CollectiveRoute> routes, std::optional<Backend> peers) {
+        return dist::detail::supports_graph_gating({std::move(routes), peers}, candidates);
+    };
+    require(gate({range(10, 20, Backend::Native)}, Backend::Native) &&
+                !gate({range(10, 20, Backend::Nccl)}, {}) && !gate(expected, {}) &&
+                !gate({range(10, 20, Backend::Native)}, Backend::Nccl),
+            "graph gating must include every selected collective and peer backend");
     auto fallback = std::vector(preferences.begin(), preferences.end());
     for (auto& route : fallback) route.backend = Backend::Nccl;
     require(dist::detail::select_collectives(preferences, nccl_only) == fallback,
@@ -206,7 +217,9 @@ void cache_profiles_roundtrip() {
                          KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
                          KvCacheStorage::Fp8KeyNvfp4Value}) {
         q::RankLoadRequest request{};
-        request.options.kv_cache = storage;
+        request.options.kv_cache                  = storage;
+        request.options.linear_state_dtype        = LinearStateDType::BFloat16;
+        request.options.speculative.length_policy = SpeculativeLengthPolicy::Fixed;
         request.batches = models::make_batch_execution_spec(request.options.max_concurrency, 1,
                                                             request.options.use_cuda_graph);
         wire::Encoder load_out;
@@ -215,12 +228,17 @@ void cache_profiles_roundtrip() {
         wire::Decoder load_in(load_bytes);
         const auto loaded = q::decode_rank_load(load_in);
         load_in.finish();
-        require(loaded.options.kv_cache == storage, "rank load changed the KV profile");
+        require(loaded.options.kv_cache == storage &&
+                    loaded.options.linear_state_dtype == LinearStateDType::BFloat16 &&
+                    loaded.options.speculative.length_policy == SpeculativeLengthPolicy::Fixed,
+                "rank load changed the KV profile, linear state dtype, or length policy");
 
         q::RankExecutionDescription execution{};
-        execution.session.shape.kv_storage      = storage;
-        execution.session.shape.max_concurrency = request.options.max_concurrency;
+        execution.session.shape.kv_storage         = storage;
+        execution.session.shape.linear_state_dtype = LinearStateDType::BFloat16;
+        execution.session.shape.max_concurrency    = request.options.max_concurrency;
         execution.session.shape.cuda_graph      = request.options.use_cuda_graph;
+        execution.session.shape.length_policy   = request.options.speculative.length_policy;
         execution.session.batches =
             std::make_shared<const models::BatchExecutionPlan>(request.batches);
         wire::Encoder execution_out;
@@ -229,9 +247,9 @@ void cache_profiles_roundtrip() {
         wire::Decoder execution_in(execution_bytes);
         const auto decoded = q::decode_rank_execution(execution_in);
         execution_in.finish();
-        require(decoded.session.shape.kv_storage == storage &&
+        require(decoded.session.shape == execution.session.shape &&
                     decoded.session.batches->spec() == request.batches,
-                "rank execution changed the KV profile or batch plan");
+                "rank execution changed the shape or batch plan");
     }
 }
 
@@ -306,10 +324,12 @@ void model_preparation() {
     o.max_concurrency                   = 8;
     o.max_context                       = 1048576;
     o.prefill_chunk                     = 4096;
+    o.linear_state_dtype                = LinearStateDType::BFloat16;
     o.use_cuda_graph                    = false;
     o.enable_vision                     = true;
     o.vision_memory_budget_bytes        = 256ULL << 20;
-    o.speculative                       = {SpeculativeBackend::Mtp, 3, ProposalHead::Optimized};
+    o.speculative                       = {SpeculativeBackend::Mtp, 3, ProposalHead::Optimized,
+                                           SpeculativeLengthPolicy::Fixed};
     o.context_cache.host_capacity_bytes = 0;
     request.host_reservation_bytes      = 2ULL << 30;
     request.control_owner               = false;
@@ -336,7 +356,9 @@ void model_preparation() {
     wire::Encoder roundtrip;
     glm::encode_rank_load(roundtrip, decoded);
     require(std::move(roundtrip).take() == bytes && decoded.rank.kda_heads.begin == 32 &&
+                decoded.options.linear_state_dtype == LinearStateDType::BFloat16 &&
                 decoded.options.speculative.proposal_head == ProposalHead::Optimized &&
+                decoded.options.speculative.length_policy == SpeculativeLengthPolicy::Fixed &&
                 decoded.index_format == request.index_format &&
                 decoded.batches == request.batches &&
                 decoded.host_reservation_bytes == request.host_reservation_bytes,
@@ -385,6 +407,8 @@ void model_preparation() {
                                        EnginePurpose::Generation,
                                        true,
                                        false};
+    r.shape.length_policy           = SpeculativeLengthPolicy::Fixed;
+    r.shape.linear_state_dtype      = LinearStateDType::BFloat16;
     r.state                         = {{1024, 256}, {1536, 256}, {1024, 512, 256}};
     r.batches                       = request.batches;
     r.context.ranks                 = {{1, 2ULL << 30, 0}};
@@ -436,7 +460,15 @@ void native_work() {
     contract.batches = std::make_shared<const models::BatchExecutionPlan>(
         models::make_batch_execution_spec(2, 1, false));
     const auto original = row();
-    q::Work work{{}, q::MtpWork{{original}, {3}}};
+    auto geometry       = std::make_shared<SpeculativeExecutionGeometry>(
+        SpeculativeExecutionGeometry{.physical_rows       = 1,
+                                           .owner_rows          = 1,
+                                           .verify_width        = 3,
+                                           .mtp_steps           = 2,
+                                           .valid_target_tokens = 3,
+                                           .path                = ExecutionPath::Eager,
+                                           .owner_target_tokens = {3}});
+    q::Work work{{}, q::MtpWork{{original}, {2}, {}, geometry}};
     q::plan_work_batch(work, *contract.batches);
     work.actions[0].operations = {ctx::RecordClear{{ctx::ContextMemory::Device, 16384, 1024}},
                                   ctx::RecordCopy{{ctx::ContextMemory::Device, 2176, 256},
@@ -460,18 +492,18 @@ void native_work() {
     contract.validate(decoded, runtime::FrameKind::Compute);
     const auto& mtp = std::get<q::MtpWork>(decoded.operation);
     const auto& r   = mtp.rows.at(0);
-    require(mtp.draft_extents == std::vector<std::uint32_t>{3} &&
-                r.member.sequence == original.member.sequence &&
-                r.member.residency == original.member.residency && r.states.size() == 1 &&
-                r.states.at(0).destination == 4096 && r.main_table.generation == 4 &&
-                r.mtp_table.pool_id == 1 && r.mtp_frontier == 20 && r.main_frontier == 21 &&
-                r.ple_raw_tail == original.ple_raw_tail && r.ids == original.ids &&
-                r.rope_delta == -3 && r.rope_positions == original.rope_positions &&
-                r.previous_rope == original.previous_rope &&
-                r.control_last_token == original.control_last_token &&
-                r.sampling.temperature == 0.7F && r.sampling.seed == UINT64_MAX &&
-                r.sampling_position == 4 && r.constrained,
-            "native work values changed in transit");
+    require(
+        mtp.draft_extents == std::vector<std::uint32_t>{2} && mtp.speculative->verify_width == 3 &&
+            mtp.speculative->mtp_steps == 2 && r.member.sequence == original.member.sequence &&
+            r.member.residency == original.member.residency && r.states.size() == 1 &&
+            r.states.at(0).destination == 4096 && r.main_table.generation == 4 &&
+            r.mtp_table.pool_id == 1 && r.mtp_frontier == 20 && r.main_frontier == 21 &&
+            r.ple_raw_tail == original.ple_raw_tail && r.ids == original.ids &&
+            r.rope_delta == -3 && r.rope_positions == original.rope_positions &&
+            r.previous_rope == original.previous_rope &&
+            r.control_last_token == original.control_last_token && r.sampling.temperature == 0.7F &&
+            r.sampling.seed == UINT64_MAX && r.sampling_position == 4 && r.constrained,
+        "native work values changed in transit");
     const auto& actions = decoded.actions.at(0).operations;
     require(actions.size() == 4 &&
                 std::get<ctx::RecordClear>(actions[0]).destination.offset == 16384 &&
@@ -522,6 +554,7 @@ void native_work() {
     auto prefill_row           = original;
     prefill_row.ids            = {23, 24};
     prefill_row.rope_positions = {7, 8, 9, 10, 11, 12};
+    prefill_row.sample         = true;
     q::Work forward{{},
                     q::ForwardWork{q::ForwardKind::Prefill,
                                    q::SampleKind::FirstToken,
@@ -553,15 +586,41 @@ void native_work() {
                 std::get<q::ScoreWork>(score_copy.operation).targets == std::vector<TokenId>{24},
             "scoring columns changed in transit");
 
-    runtime::DecisionRequest request{0, 250, {{0, {5, 6, 7}}}};
-    runtime::DecisionInput masks{0, {{0, 4, 0, std::vector<std::uint32_t>(32, UINT32_MAX)}}};
+    // Constrained rows retain their logical member indices, including a zero-draft anchor.
+    wire::Encoder ragged;
+    runtime::protocol::encode(ragged, runtime::DecisionRequest{1, 64, {{2, {}}, {0, {9, 10}}}});
+    runtime::protocol::encode(
+        ragged, runtime::DecisionInput{1, {{2, 1, 0, {3, 7}}, {0, 3, 0, {1, 2, 3, 4, 5, 6}}}});
+    const auto ragged_bytes = std::move(ragged).take();
+    wire::Decoder ragged_in(ragged_bytes);
+    const auto lookahead = runtime::protocol::decision_request(ragged_in);
+    const auto supplied  = runtime::protocol::decision_input(ragged_in);
+    ragged_in.finish();
+    require(lookahead.rows.size() == 2 && supplied.rows.size() == 2 &&
+                lookahead.rows[0].member == 2 && lookahead.rows[0].drafts.empty() &&
+                lookahead.rows[1].drafts == std::vector<TokenId>{9, 10} &&
+                supplied.rows[0].member == 2 && supplied.rows[0].positions == 1 &&
+                supplied.rows[1].member == 0 && supplied.rows[1].positions == 3 &&
+                supplied.rows[1].words == std::vector<std::uint32_t>{1, 2, 3, 4, 5, 6},
+            "ragged speculative decisions lost member identity or valid columns");
+    runtime::DecisionRequest request{0, 250, {{0, {5, 6}}}};
+    runtime::DecisionInput masks{0, {{0, 3, 0, std::vector<std::uint32_t>(24, UINT32_MAX)}}};
     contract.validate(work, request, masks);
+    auto extra = request;
+    extra.rows[0].drafts.push_back(7);
+    rejects([&] { contract.validate(work, extra, masks); });
     masks.rows[0].words.pop_back();
     rejects([&] { contract.validate(work, request, masks); });
-    q::ComputeResult result{{{1, 3, 1, {5, 6}, 0}}};
+    q::ComputeResult result{{{.drafts            = 2,
+                              .accepted_drafts   = 1,
+                              .tokens            = {5, 6},
+                              .draft_confidences = {0.875f, 0.125f}}}};
     q::Commit commit{
         {{original.member, {{0, {2048, 6144}}, {1, {8192, 24576}}}, 2, false, false, false}}, {}};
     contract.validate(work, q::Result{result}, commit);
+    auto invalid_result = result;
+    invalid_result.rows[0].draft_confidences.pop_back();
+    rejects([&] { contract.validate(work, q::Result{invalid_result}, commit); });
     commit.rows[0].accepted = 1;
     rejects([&] { contract.validate(work, q::Result{result}, commit); });
     commit.rows[0].terminal = true;
@@ -591,8 +650,11 @@ void native_work() {
     const auto result_bytes = std::move(encoded_result).take();
     wire::Decoder result_input(result_bytes);
     const auto received_result = std::get<q::ComputeResult>(q::decode_result(result_input));
+    result_input.finish();
     require(received_result.rows[0].tokens == result.rows[0].tokens &&
-                received_result.rows[0].accepted_drafts == result.rows[0].accepted_drafts,
+                received_result.rows[0].accepted_drafts == result.rows[0].accepted_drafts &&
+                received_result.rows[0].draft_confidences == result.rows[0].draft_confidences &&
+                !received_result.rows[0].target_top1_probability,
             "result changed in transit");
 }
 
@@ -897,9 +959,9 @@ void startup_diagnostics() {
         phase.fail();
     }
     const auto failure = dist::decode_failure(
-        dist::encode_failure({"allocation rejected", reporter.failure_context()}));
-    require(failure.reason == "allocation rejected" && failure.startup &&
-                failure.startup->attempt == 1 &&
+        dist::encode_failure({"allocation rejected", reporter.failure_context(), true}));
+    require(failure.reason == "allocation rejected" && failure.device_allocation &&
+                failure.startup && failure.startup->attempt == 1 &&
                 failure.startup->phase == StartupPhase::ProgramInitialize,
             "failure lost its startup attempt or phase");
     reporter.close();

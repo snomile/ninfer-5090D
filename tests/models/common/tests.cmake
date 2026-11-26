@@ -63,3 +63,18 @@ ninfer_add_test(ninfer_vision_window_test
 ninfer_add_test(ninfer_token_input_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_token_input.cpp"
   LIBRARIES ninfer_model_control)
+
+ninfer_add_test(ninfer_speculative_round_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_round_plan.cpp"
+  LIBRARIES ninfer_model_control)
+ninfer_add_test(ninfer_speculative_controller_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_controller.cpp"
+  LIBRARIES ninfer_model_control)
+ninfer_add_test(ninfer_optional_context_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/context/test_optional.cpp"
+  LIBRARIES ninfer_model_control)
+
+ninfer_add_test(ninfer_decode_graph_suite_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_decode_graph_suite.cu"
+  LIBRARIES ninfer_model_execution ninfer_core)
+set_tests_properties(ninfer_decode_graph_suite_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")

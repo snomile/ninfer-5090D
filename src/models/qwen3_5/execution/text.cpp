@@ -36,15 +36,37 @@ void require_shape(const Tensor& value, DType dtype, std::initializer_list<std::
 }
 
 bool is_sequence(const TextStateUpdate& update) {
-    return std::holds_alternative<SequenceUpdate>(update);
+    return std::holds_alternative<SequenceUpdate>(update) ||
+           std::holds_alternative<PackedPrefillUpdate>(update);
+}
+
+CausalAttentionReadout attention_readout(const TextExecutionView& view, const TextInputs& inputs,
+                                         std::uint32_t compact_layer,
+                                         const workspace::TextAttentionProjectionRoots& projection,
+                                         const workspace::TextAttentionResultRoots& results) {
+    const auto& attn = *view.parameters.profile->config.text.attention;
+    const auto width = inputs.ids.ne[0], batch = inputs.ids.ne[1];
+    const auto dim   = dimension(attn.head_dim);
+    const auto heads = dimension(attn.num_attention_heads);
+    const auto kv    = dimension(attn.num_key_value_heads);
+    return {results.normalized_query.view({dim, heads, width, batch}),
+            results.normalized_key.view({dim, kv, width, batch}),
+            projection.value.view({dim, kv, width, batch}),
+            inputs.cache_positions,
+            inputs.valid_columns,
+            inputs.kv_table_rows,
+            results.attention.view({dim, heads, width, batch}),
+            view.cache.batch_layer_view(compact_layer),
+            {dim, heads, kv},
+            static_cast<float>(1.0 / std::sqrt(double(attn.head_dim))),
+            {}};
 }
 
 } // namespace
 
 TextRun::TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate update,
-                 ops::CausalAttentionExecutionEnvelope envelope, Tensor hidden,
-                 const DFlashFeatureSink* features)
-    : view_(execution), inputs_(std::move(inputs)), update_(update), envelope_(envelope),
+                 ops::ContextBucket bucket, Tensor hidden, const DFlashFeatureSink* features)
+    : view_(execution), inputs_(std::move(inputs)), update_(update), bucket_(bucket),
       hidden_(hidden), traversal_scope_(view_.workspace.scope()) {
     const auto& config = view_.parameters.profile->config.text;
     const auto width   = inputs_.ids.ne[0];
@@ -60,7 +82,12 @@ TextRun::TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate
         throw std::invalid_argument("Main RoPE positions require one or three axes");
     require_shape(inputs_.rope_positions, DType::I32, {columns, inputs_.rope_positions.ne[1]},
                   "Main RoPE positions");
-    require_shape(inputs_.kv_table_rows, DType::I32, {batch}, "Main KV table rows");
+    const auto* packed = std::get_if<PackedPrefillUpdate>(&update_);
+    if (packed &&
+        (batch != 1 || packed->ragged.total_tokens() != columns || inputs_.valid_columns.data))
+        throw std::invalid_argument("Main packed prefill has invalid token geometry");
+    const auto state_rows = packed ? packed->ragged.num_seqs() : batch;
+    require_shape(inputs_.kv_table_rows, DType::I32, {state_rows}, "Main KV table rows");
     if (inputs_.valid_columns.data)
         require_shape(inputs_.valid_columns, DType::I32, {batch}, "Main valid columns");
     require_shape(hidden_, DType::BF16, {channels, width, batch}, "Main hidden output");
@@ -72,8 +99,11 @@ TextRun::TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate
         if (config.gdn && (sequence->source_offset < 0 || sequence->destination_offset < 0))
             throw std::invalid_argument("Main sequence State offsets are invalid");
     } else if (config.gdn) {
-        require_shape(inputs_.state_source_offsets, DType::I64, {batch},
+        require_shape(inputs_.state_source_offsets, DType::I64, {state_rows},
                       "Main source State offsets");
+        if (packed)
+            require_shape(inputs_.state_destination_offsets, DType::I64, {state_rows},
+                          "Main destination State offsets");
         if (std::holds_alternative<StepUpdate>(update_)) {
             if (width != 1) throw std::invalid_argument("StepUpdate requires one token per row");
             require_shape(inputs_.state_destination_offsets, DType::I64, {batch},
@@ -120,8 +150,15 @@ TextRun::~TextRun() {
     }
 }
 
-void TextRun::set_attention_envelope(ops::CausalAttentionExecutionEnvelope envelope) noexcept {
-    envelope_ = envelope;
+void TextRun::bind_attention_readout(std::uint32_t layer, const CausalAttentionSubmit& submit) {
+    const auto& cfg       = view_.parameters.profile->config.text;
+    auto& work            = view_.workspace;
+    auto scope            = work.scope();
+    const auto projection = workspace::text_attention_projection(work, cfg, residual_.ne[1]);
+    const auto results    = workspace::text_attention_results(work, cfg, residual_.ne[1]);
+    auto readout =
+        attention_readout(view_, inputs_, cfg.compact_layer_indices[layer], projection, results);
+    readout.submit(work, view_.execution, submit);
 }
 
 void TextRun::prefix() {
@@ -135,15 +172,14 @@ void TextRun::prefix() {
     }
 }
 
-void TextRun::attention(const BlockParameters& block, std::uint32_t compact_layer) {
+void TextRun::attention(const BlockParameters& block, std::uint32_t compact_layer,
+                        const CausalAttentionSubmit& submit) {
     auto& work        = view_.workspace;
     const auto cuda   = view_.execution;
     const auto& cfg   = view_.parameters.profile->config.text;
     const auto& attn  = *cfg.attention;
     const auto& p     = std::get<AttentionParameters>(block.mixer);
     const auto tokens = residual_.ne[1];
-    const auto width  = inputs_.ids.ne[0];
-    const auto batch  = inputs_.ids.ne[1];
     const auto dim    = dimension(attn.head_dim);
     const auto heads  = dimension(attn.num_attention_heads);
     const auto kv     = dimension(attn.num_key_value_heads);
@@ -159,7 +195,6 @@ void TextRun::attention(const BlockParameters& block, std::uint32_t compact_laye
     query = query.view({dim, heads, tokens});
     gate  = gate.view({dim, heads, tokens});
     key   = key.view({dim, kv, tokens});
-    value = value.view({dim, kv, tokens});
 
     const auto results = workspace::text_attention_results(work, cfg, tokens);
     Tensor q           = results.normalized_query.view({dim, heads, tokens});
@@ -168,14 +203,19 @@ void TextRun::attention(const BlockParameters& block, std::uint32_t compact_laye
     ops::rmsnorm(query, p.query_norm, cfg.rms_norm_eps, true, q, cuda);
     ops::rmsnorm(key, p.key_norm, cfg.rms_norm_eps, true, k, cuda);
     text_rope(inputs_.rope_positions, *cfg.rope_parameters, q, k, cuda);
-    Tensor qb = q.view({dim, heads, width, batch});
-    Tensor kb = k.view({dim, kv, width, batch});
-    Tensor vb = value.view({dim, kv, width, batch});
-    Tensor ab = a.view({dim, heads, width, batch});
-    ops::causal_softmax_attention(
-        qb, kb, vb, inputs_.cache_positions, inputs_.valid_columns, inputs_.kv_table_rows,
-        {dim, heads, kv}, static_cast<float>(1.0 / std::sqrt(double(attn.head_dim))),
-        view_.cache.batch_layer_view(compact_layer), envelope_, work, ab, cuda);
+    if (const auto* packed = std::get_if<PackedPrefillUpdate>(&update_)) {
+        const auto scale = static_cast<float>(1.0 / std::sqrt(double(attn.head_dim)));
+        ops::causal_softmax_attention(
+            q, k, value.view({dim, kv, tokens}), packed->ragged,
+            inputs_.cache_positions.view({tokens}), inputs_.kv_table_rows, {dim, heads, kv}, scale,
+            view_.cache.batch_layer_view(compact_layer), bucket_, work, a, cuda);
+    } else {
+        auto readout = attention_readout(view_, inputs_, compact_layer, projection, results);
+        if (submit)
+            readout.submit(work, cuda, submit);
+        else
+            readout.execute(bucket_, work, cuda);
+    }
     ops::sigmoid_mul(gate, a, cuda);
     ops::linear_add(a.view({dimension(attn.query_width()), tokens}), p.output.weight, residual_,
                     p.output.policy, work, cuda);
@@ -196,6 +236,7 @@ void TextRun::gdn(const BlockParameters& block, std::uint32_t compact_layer) {
     const auto dv        = dimension(gdn.linear_value_head_dim);
     const auto scale     = static_cast<float>(1.0 / std::sqrt(double(gdn.linear_key_head_dim)));
     const auto* sequence = std::get_if<SequenceUpdate>(&update_);
+    const auto* packed   = std::get_if<PackedPrefillUpdate>(&update_);
     const auto* replay   = std::get_if<ReplayRecords>(&update_);
 
     const auto control = workspace::gdn_control(work, cfg, tokens);
@@ -209,13 +250,24 @@ void TextRun::gdn(const BlockParameters& block, std::uint32_t compact_layer) {
     Tensor qc             = projection.query;
     Tensor kc             = projection.key;
     Tensor vc             = projection.value;
-    if (sequence) {
+    if (sequence || packed) {
         Tensor qkv    = workspace::gdn_prefill_conv(work, cfg, tokens);
         Tensor z_flat = z.view({dimension(gdn.value_width()), tokens});
         gdn_projection(h, p, qkv, z_flat, work, cuda);
-        Tensor source      = view_.states.conv_tensor(compact_layer, sequence->source_offset);
-        Tensor destination = view_.states.conv_tensor(compact_layer, sequence->destination_offset);
-        ops::causal_conv1d_silu_split(qkv, p.convolution, source, destination, qc, kc, vc, cuda);
+        if (packed) {
+            const auto before =
+                view_.states.layer_view(compact_layer, inputs_.state_source_offsets);
+            const auto after =
+                view_.states.layer_view(compact_layer, inputs_.state_destination_offsets);
+            ops::causal_conv1d_silu_split(qkv, p.convolution, packed->ragged, before.conv,
+                                          after.conv, qc, kc, vc, cuda);
+        } else {
+            Tensor source = view_.states.conv_tensor(compact_layer, sequence->source_offset);
+            Tensor destination =
+                view_.states.conv_tensor(compact_layer, sequence->destination_offset);
+            ops::causal_conv1d_silu_split(qkv, p.convolution, source, destination, qc, kc, vc,
+                                          cuda);
+        }
     } else {
         Tensor projection_input = h.view({dimension(cfg.hidden_size), width, batch});
         Tensor query_output     = qc.view({dimension(gdn.key_width()), width, batch});
@@ -242,7 +294,13 @@ void TextRun::gdn(const BlockParameters& block, std::uint32_t compact_layer) {
     Tensor k = kc.view({dk, qh, tokens});
     Tensor v = vc.view({dv, vh, tokens});
     Tensor o = workspace::gdn_recurrent_output(work, cfg, tokens).view({dv, vh, tokens});
-    if (sequence) {
+    if (packed) {
+        const auto before = view_.states.layer_view(compact_layer, inputs_.state_source_offsets);
+        const auto after =
+            view_.states.layer_view(compact_layer, inputs_.state_destination_offsets);
+        ops::gated_delta_net(q, k, v, g, beta, scale, true, packed->ragged, work, before.recurrent,
+                             after.recurrent, o, cuda);
+    } else if (sequence) {
         Tensor source = view_.states.recurrent_tensor(compact_layer, sequence->source_offset);
         Tensor destination =
             view_.states.recurrent_tensor(compact_layer, sequence->destination_offset);
@@ -258,9 +316,8 @@ void TextRun::gdn(const BlockParameters& block, std::uint32_t compact_layer) {
         Tensor ob = o.view({dv, vh, width, batch});
         if (replay) {
             const auto records = replay->records.layer(compact_layer, batch);
-            ops::gated_delta_net_replay_record(
-                qb, kb, vb, gb, bb, scale, source, inputs_.valid_columns,
-                {records.key, records.value, records.gate}, ob, cuda);
+            ops::gated_delta_net_replay_record(qb, kb, vb, gb, bb, scale, source,
+                                               inputs_.valid_columns, records.recurrence, ob, cuda);
         } else {
             ops::gated_delta_net_batch_update(
                 qb, kb, vb, gb, bb, scale, true, source,
@@ -282,7 +339,7 @@ ops::MoeExecutionHints TextRun::next_projection_hints(std::uint32_t layer) const
                : ops::MoeExecutionHints{};
 }
 
-void TextRun::mixer(std::uint32_t layer) {
+void TextRun::mixer(std::uint32_t layer, const CausalAttentionSubmit& submit) {
     const auto& config  = view_.parameters.profile->config.text;
     const auto& block   = view_.parameters.text.layers.at(layer);
     const bool full     = config.layer_types[layer] == MixerKind::FullAttention;
@@ -294,7 +351,7 @@ void TextRun::mixer(std::uint32_t layer) {
     auto scope         = view_.workspace.scope();
     const auto compact = config.compact_layer_indices[layer];
     if (full)
-        attention(block, compact);
+        attention(block, compact, submit);
     else
         gdn(block, compact);
 }

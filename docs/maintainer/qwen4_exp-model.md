@@ -99,7 +99,11 @@ MTP 使用私有 HC/QSA/MoE 层，与 Main 共享 embedding，默认共享 Main 
 Vision 复用 Qwen tower 与 MRoPE 输入机制。编码 features 与 prefill 窗口按真实媒体 spans 交接，
 状态与前缀身份同时包含媒体和位置。资源机制见[Frontend](frontend.md)。
 
-Resident decode 捕获连续设备主体，QSA 在图内更新本地 attention 节点；普通/MTP 的决定与最终
-状态采用保留各自依赖边界。Offload 保留 CPU expert 所需交接，Prefill、Replay 与 Vision encoder
-使用 eager。图目录和节点选择属于 [Program](../../src/models/qwen4_exp/program/)，
+Resident decode 捕获连续设备主体，QSA 按 `ContextBucket` 在扁平图内更新局部 kernel 参数切片。
+普通/MTP 的决定与最终状态采用保留各自依赖边界。Offload 保留 CPU expert 所需交接，
+Prefill、Replay 与 Vision encoder 使用 eager。纯文本多请求 Prefill 在 eager 路径上沿
+GDN、因果卷积、Host/Device PLE（`ngram_embedding_lookup` / `ple_conv` / `ple_state_extract`）、
+QSA（`prepare_update` / `indexer` / `sparse_gqa`）与 MTP 历史补齐（`qsa_prepare_kv_update`）全链路执行原生 ragged 打包，
+末尾以 `scatter_ragged_last_columns` 与 `ops::gather` 完成 `sample_hidden` 写回及批量采样汇聚。
+图目录和节点选择属于 [Program](../../src/models/qwen4_exp/program/)，
 不在文档维护 executable 数量或逐 shape 的分派表。

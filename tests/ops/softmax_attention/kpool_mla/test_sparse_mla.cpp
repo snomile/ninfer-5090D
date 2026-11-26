@@ -1,5 +1,7 @@
 #include "reference.h"
 #include "ops/suite.h"
+#include "ops/ragged_fixture.h"
+#include "ops/graph_patch_check.h"
 #include "ops/op_tester.h"
 #include "cuda_fixture.h"
 #include "core/decode_graph.h"
@@ -13,9 +15,13 @@
 
 using namespace ninfer;
 using namespace ninfer::test;
+using ops::ContextBucket;
+using ops::ContextBucketRange;
 namespace kp = ninfer::tool::kpool;
 
 namespace {
+constexpr ContextBucketRange kAllBuckets{ContextBucket::K2, ContextBucket::M1};
+
 int verify(kp::SparseMlaFixture& f) {
     const bool fp8   = f.cache.storage == ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
     const auto words = f.output.download();
@@ -102,13 +108,156 @@ int run(int T, int B, int E, int cap = 512, bool ragged = false, bool frozen = f
     return verify(f);
 }
 
+int ragged_sparse(bool boundary, bool fp8, bool mx) {
+    RaggedFixture ragged(boundary ? std::vector<int>{1025, 1024} : std::vector<int>{1, 3, 17});
+    const int width        = *std::max_element(ragged.lengths.begin(), ragged.lengths.end());
+    constexpr int features = 256 * 64;
+    const int n = ragged.tokens(), s = ragged.segments();
+    const auto execution = cuda_environment().context.execution_view();
+    // Sequence zero is empty with an invalid page row, sequence one begins
+    // with a singleton or a small selection, and the last sequence uses
+    // frozen selections shared across groups of four queries.
+    const auto contexts = boundary ? std::vector<int>{1025, 1029} : std::vector<int>{1, 4, 32786};
+    const std::array shape{kp::SparseMlaBatch{width, contexts, ragged.lengths}};
+    kp::SparseMlaFixture f(execution, width, s, contexts.back(), 2, 1, false, true, 1, 4,
+                           fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
+                               : ops::KpoolMlaStorage::BFloat16,
+                           KvCacheVectorFormat::BFloat16, 0, std::nullopt, shape);
+    if (mx) f.encode_factors(execution);
+    const auto poison = [&] {
+        for (int b = 0; b < s; ++b)
+            for (int t = 0; t < ragged.lengths[b]; ++t)
+                if (f.selected_tokens(t, b).size() <= 1)
+                    std::fill_n(f.query.host.begin() + f.query.index(0, 0, t, b), features, 0x7fc0);
+        f.query.upload();
+    };
+    if (boundary) {
+        const int singleton    = f.selection_rows.at(1023, 1);
+        f.ends.at(singleton)   = 1;
+        f.counts.at(singleton) = 0;
+    }
+    for (int b = 0; b < s; ++b)
+        if (ragged.lengths[b] > 8)
+            std::swap(f.selection_rows.at(0, b), f.selection_rows.at(ragged.lengths[b] - 1, b));
+    const int last_segment    = s - 1;
+    const auto copy_selection = [&](int dst, int src) {
+        f.ends.at(dst)   = f.ends.at(src);
+        f.counts.at(dst) = f.counts.at(src);
+        std::copy_n(&f.ids.at(0, src), f.counts.at(src), &f.ids.at(0, dst));
+    };
+    if (!boundary) {
+        // These slots belong to the empty segment's slice of the bank, but
+        // this record describes the last segment's own history.
+        copy_selection(0, f.selection_rows.at(0, last_segment));
+        f.selection_rows.at(0, last_segment) = 0;
+    }
+    f.upload_metadata();
+    poison();
+    const auto factors = f.factors();
+    const auto bytes   = ops::kpool_sparse_mla_ragged_workspace_capacity_bytes(
+        ops::kpool_sparse_mla_profile(factors, 64), f.cache.storage, f.buckets, n, n, s, s,
+        execution.multiprocessor_count());
+    GuardedDeviceBuffer storage(bytes + n * (4ULL * features + 8) + 4 * 256);
+    MemoryArena arena(storage.span());
+    const auto q              = arena.alloc(DType::BF16, {256, 64, n});
+    const auto pos            = arena.alloc(DType::I32, {n});
+    const auto rows           = arena.alloc(DType::I32, {n});
+    auto out                  = arena.alloc(DType::BF16, {256, 64, n});
+    const auto prefix         = arena.used();
+    const auto aligned_prefix = (prefix + 255) / 256 * 256;
+    const ops::KpoolMlaRaggedBatchView batch{ragged.view, pos, f.selectors.view};
+    const auto upload = [&] {
+        const auto query      = ragged.pack(f.query.host, width, features);
+        const auto positions  = ragged.pack(f.positions.host, width, 1);
+        const auto selections = ragged.pack(f.selection_rows.host, width, 1);
+        CUDA_CHECK(cudaMemcpy(q.data, query.data(), q.bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(pos.data, positions.data(), pos.bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(rows.data, selections.data(), rows.bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    };
+    const auto launch = [&] {
+        ops::kpool_sparse_mla(q, factors, f.cache, batch, {f.ids.view, f.counts.view, f.ends.view},
+                              rows, f.scale, f.bucket, arena, out, execution);
+    };
+    const auto check = [&] {
+        cuda_environment().context.synchronize();
+        const auto padded =
+            ragged.unpack(from_device<std::uint16_t>(out.data, n * features), width, features);
+        f.output.storage.copy_from_host(padded.data(), padded.size() * 2, 256);
+        return verify(f) + storage.verify_guards("ragged sparse MLA arena") +
+               (arena.used() != prefix || arena.peak_used() != aligned_prefix + bytes) +
+               verify_exact("sparse packed query preserved",
+                            from_device<std::uint16_t>(q.data, n * features),
+                            ragged.pack(f.query.host, width, features)) +
+               verify_exact("sparse packed selection mapping preserved",
+                            from_device<int>(rows.data, n),
+                            ragged.pack(f.selection_rows.host, width, 1));
+    };
+    upload();
+    DecodeGraphKernelSlice slice;
+    DecodeGraphCapture capture(execution.stream());
+    slice.capture(execution.stream(), launch);
+    auto definition = capture.finish();
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int failures = slice.size() != std::size_t(4 * ((n + 1023) / 1024));
+    graph.launch(execution.stream());
+    failures += check();
+    if (!boundary) {
+        // Replay using a different selection row and a remapped page-table row.
+        const int segment = last_segment;
+        copy_selection(1, f.selection_rows.at(4, segment));
+        f.selection_rows.at(0, segment)                           = 1;
+        const int empty_row                                       = segment * width + 1;
+        f.ends.at(empty_row)                                      = 0;
+        f.counts.at(empty_row)                                    = 0;
+        f.selection_rows.at(ragged.lengths[segment] - 1, segment) = empty_row;
+        for (int p = 0; p < f.P; ++p)
+            std::swap(f.tables.at(p, f.selectors.at(0)), f.tables.at(p, f.selectors.at(segment)));
+        std::swap(f.selectors.at(0), f.selectors.at(segment));
+        f.upload_metadata();
+        poison();
+        upload();
+        graph.launch(execution.stream());
+        failures += check();
+    }
+    return failures;
+}
+
+int ragged_sparse_capacity() {
+    int failures = 0;
+    for (const auto [storage, factors] :
+         {std::pair{ops::KpoolMlaStorage::BFloat16, QType::BF16},
+          {ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0, QType::MXFP8}}) {
+        const auto profile =
+            ops::KpoolSparseMlaProfile{64, 256, 256, 512, 4, 512, factors, factors};
+        const auto capacity = [&](int lo, int hi, int first, int last, ContextBucketRange buckets) {
+            return ops::kpool_sparse_mla_ragged_workspace_capacity_bytes(profile, storage, buckets,
+                                                                         lo, hi, first, last, 48);
+        };
+        const ContextBucketRange buckets{ContextBucket::K8, ContextBucket::K64};
+        for (const auto [lo, hi, first, last] :
+             {std::array{1, 67, 1, 5}, {1018, 1058, 2, 7}, {2030, 2067, 1, 4}}) {
+            std::size_t peak = 0;
+            buckets.for_each([&](ContextBucket bucket) {
+                for (int n = lo; n <= hi; ++n)
+                    for (int s = first; s <= std::min(last, n); ++s)
+                        peak = std::max(peak, capacity(n, n, s, s, bucket));
+            });
+            failures += peak != capacity(lo, hi, first, last, buckets);
+        }
+    }
+    return failures;
+}
+
 int token_sweep(bool fp8, bool mx) {
     auto& d = cuda_environment().context;
-    const std::vector<int> tokens{1, 3, 8, 17};
+    const std::array<kp::SparseMlaBatch, 4> sweep{
+        {{1, {}, {}}, {3, {}, {}}, {8, {}, {}}, {17, {}, {}}}};
     kp::SparseMlaFixture f(d.execution_view(), 17, 2, 8192, 512, 1, true, false, 1, 1,
                            fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
                                : ops::KpoolMlaStorage::BFloat16,
-                           KvCacheVectorFormat::BFloat16, 0, 0, tokens);
+                           KvCacheVectorFormat::BFloat16, 0, std::nullopt, sweep);
     if (mx) f.encode_factors(d.execution_view());
     int failures = 0;
     for (int t : {17, 1, 8, 3, 17}) {
@@ -207,16 +356,17 @@ int empty(bool fp8 = false) {
     return verify(f);
 }
 
-int shared_envelope() {
+int shared_bucket() {
     auto& d = cuda_environment().context;
     kp::SparseMlaFixture f(d.execution_view(), 4, 4, 2051, 512, 11, false, false, 1, 1,
                            ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0,
-                           KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0, 2048, 1048576);
+                           KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0, 2048,
+                           ContextBucketRange{ContextBucket::M1});
     DecodeGraphDefinition definition;
     definition.capture(d.stream(), [&] { f.launch(d.execution_view()); });
     DecodeGraphExecutable graph;
     graph.instantiate(definition);
-    // One fixed wide envelope also executes an empty row, a singleton and scored
+    // One fixed M1 bucket also executes an empty row, a singleton and scored
     // rows over shared physical pages. Metadata changes remain device inputs.
     for (int t = 0; t < f.T; ++t) {
         const int empty_row = f.selection_rows.at(t, 0), singleton = f.selection_rows.at(t, 1);
@@ -234,15 +384,16 @@ int graph(bool fp8 = false, bool mx = false, int tokens = 65) {
     auto& d = cuda_environment().context;
     kp::SparseMlaFixture f(d.execution_view(), tokens, 3, 1048576, 3, 1, true, false, 1, 1,
                            fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
-                               : ops::KpoolMlaStorage::BFloat16);
+                               : ops::KpoolMlaStorage::BFloat16,
+                           KvCacheVectorFormat::BFloat16, 0, kAllBuckets);
     if (mx) f.encode_factors(d.execution_view());
     DecodeGraphDefinition outer;
     DecodeGraphExecutable executable;
     DecodeGraphChild child;
-    std::optional<ops::KpoolGraphProfile> installed;
+    std::optional<ops::OpGraphProfile> installed;
     int failures = 0;
     for (int bound : {259, 8192, 1048576, 0, 259}) {
-        f.envelope.max_visible_tokens = bound;
+        f.bucket = ops::select_context_bucket(bound);
         for (int b = 0; b < f.B; ++b) {
             f.valid.at(b)     = bound && b != f.B - 1 ? f.T : 0;
             f.selectors.at(b) = f.valid.at(b) ? f.B - 1 - b : -1;
@@ -258,7 +409,7 @@ int graph(bool fp8 = false, bool mx = false, int tokens = 65) {
         }
         f.upload_metadata();
         const auto profile = ops::kpool_sparse_mla_graph_profile(
-            ops::kpool_sparse_mla_profile(f.factors(), 64), f.cache.storage, f.envelope, f.B, f.T,
+            ops::kpool_sparse_mla_profile(f.factors(), 64), f.cache.storage, f.bucket, f.B, f.T,
             d.execution_view().multiprocessor_count());
         if (!installed || *installed != profile) {
             DecodeGraphDefinition definition;
@@ -285,13 +436,14 @@ int singleton_graph(bool fp8 = false) {
     auto& d = cuda_environment().context;
     kp::SparseMlaFixture f(d.execution_view(), 1, 2, 1048576, 3, 1, false, false, 1, 1,
                            fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
-                               : ops::KpoolMlaStorage::BFloat16);
+                               : ops::KpoolMlaStorage::BFloat16,
+                           KvCacheVectorFormat::BFloat16, 0, kAllBuckets);
     // Give token zero a valid native page in both requests for the singleton route.
     f.tables.at(0, 0) = f.tables.at(1, 0);
     DecodeGraphExecutable executable;
     int failures = 0;
     for (int bound : {1, 8192, 0, 1}) {
-        f.envelope.max_visible_tokens = bound;
+        f.bucket = ops::select_context_bucket(bound);
         for (int b = 0; b < f.B; ++b) {
             f.valid.at(b)             = bound ? 1 : 0;
             f.selectors.at(b)         = bound ? 1 - b : -1;
@@ -329,14 +481,15 @@ int merge_graph(bool fp8 = false) {
     auto& d = cuda_environment().context;
     kp::SparseMlaFixture f(d.execution_view(), 18, 1, 1048576, 17, 1, false, false, 1, 1,
                            fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
-                               : ops::KpoolMlaStorage::BFloat16);
+                               : ops::KpoolMlaStorage::BFloat16,
+                           KvCacheVectorFormat::BFloat16, 0, kAllBuckets);
     DecodeGraphExecutable executable;
     int failures = 0;
     for (int bound : {1, 129, 8192, 0, 129}) {
-        f.envelope.max_visible_tokens = bound;
-        f.valid.at(0)                 = std::min(f.T, bound);
-        f.selectors.at(0)             = bound ? 0 : -1;
-        const int end                 = bound ? bound - f.valid.at(0) + 1 : 0;
+        f.bucket          = ops::select_context_bucket(bound);
+        f.valid.at(0)     = std::min(f.T, bound);
+        f.selectors.at(0) = bound ? 0 : -1;
+        const int end     = bound ? bound - f.valid.at(0) + 1 : 0;
         if (end % 4) f.tables.at(end / 64, 0) = f.tables.at(0, 0);
         for (int t = 0; t < f.T; ++t) {
             f.positions.at(t, 0)      = t < f.valid.at(0) ? end - 1 + t : -1;
@@ -355,6 +508,86 @@ int merge_graph(bool fp8 = false) {
         executable.launch(d.stream());
         d.synchronize();
         failures += verify(f);
+    }
+    return failures;
+}
+
+int cross_bucket_graph(bool fp8) {
+    auto& d              = cuda_environment().context;
+    const auto execution = d.execution_view();
+    // BF16 crosses the long-history tile threshold. FP8 changes its split count
+    // with BF16 value factors at this width. Both use four physical page columns.
+    const int tokens = fp8 ? 6 : 33, batch = fp8 ? 1 : 4;
+    const auto storage =
+        fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0 : ops::KpoolMlaStorage::BFloat16;
+    kp::SparseMlaFixture f(execution, tokens, batch, 256, 512, 1, !fp8, false, 1, 1, storage,
+                           KvCacheVectorFormat::BFloat16, 0, kAllBuckets);
+    std::vector<CapturedKernelSequence> captures;
+    for (const auto bucket : ops::kAllContextBuckets) {
+        f.bucket = bucket;
+        captures.emplace_back(execution, [&](auto view) { f.launch(view); });
+        if (captures.back().nodes().size() != 4) {
+            std::cerr << "expected four MLA kernel nodes at " << ops::context_bucket_name(bucket)
+                      << '\n';
+            return 1;
+        }
+    }
+    FlatGraphPatchHarness patch(captures.front()), update(captures.front());
+    const auto counts = f.counts.host, ends = f.ends.host;
+    int phase = 0, failures = 0;
+    for (const auto bucket : {ContextBucket::K2, ContextBucket::K8, ContextBucket::K64,
+                              ContextBucket::K256, ContextBucket::M1, ContextBucket::K2}) {
+        f.valid.at(0) = tokens - phase % 3;
+        f.counts.host = counts;
+        f.ends.host   = ends;
+        for (int b = 0; b < batch; ++b)
+            for (int t = 0; t < f.valid.at(b); ++t) {
+                const int row    = f.selection_rows.at(t, b);
+                f.counts.at(row) = std::min(f.counts.at(row), 5 + (t + phase + b) % 20);
+            }
+        const int first    = f.selection_rows.at(0, 0);
+        f.counts.at(first) = 0;
+        f.ends.at(first)   = phase++ % 2; // Alternate empty and singleton selections.
+        f.upload_metadata();
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+
+        const auto& target = captures.at(static_cast<std::size_t>(bucket));
+        const auto poison  = [&] {
+            CUDA_CHECK(cudaMemsetAsync(f.output.view.data, 0xff, f.output.view.bytes(),
+                                        execution.stream()));
+        };
+        poison();
+        patch.patch_and_launch(target, execution);
+        d.synchronize();
+        failures += verify(f);
+        poison();
+        update.update_whole_graph_and_launch(target, execution);
+        d.synchronize();
+        failures += verify(f);
+        if (failures) {
+            std::cerr << "MLA graph output at " << ops::context_bucket_name(bucket) << '\n';
+            return failures;
+        }
+    }
+    return failures;
+}
+
+int profile_deduplication() {
+    const int sms      = cuda_environment().context.multiprocessor_count();
+    auto profile       = ops::KpoolSparseMlaProfile{64, 256, 256, 512};
+    profile.key_format = profile.value_format = QType::MXFP8;
+    constexpr auto storage                    = ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
+    int failures                              = 0;
+    for (const auto [batch, tokens] : {std::pair{1, 5}, {4, 4}, {1, 1025}}) {
+        const auto baseline = ops::kpool_sparse_mla_graph_profile(
+            profile, storage, ContextBucket::K2, batch, tokens, sms);
+        for (const auto bucket : ops::kAllContextBuckets)
+            if (ops::kpool_sparse_mla_graph_profile(profile, storage, bucket, batch, tokens, sms) !=
+                baseline) {
+                std::cerr << "FP8/MXFP8 MLA profile differs at " << ops::context_bucket_name(bucket)
+                          << '\n';
+                ++failures;
+            }
     }
     return failures;
 }
@@ -381,26 +614,30 @@ int read_footprint(bool fp8 = false) {
 }
 
 int workspace_interval(bool fp8 = false, bool mx = false) {
-    const auto capacity = [=](int B, int lo, int hi, unsigned E) {
+    const auto capacity = [=](int B, int lo, int hi, ContextBucketRange buckets) {
         auto profile       = ops::KpoolSparseMlaProfile{64, 256, 256, 512};
         profile.key_format = profile.value_format = mx ? QType::MXFP8 : QType::BF16;
         return ops::kpool_sparse_mla_workspace_capacity_bytes(
             profile,
             fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0 : ops::KpoolMlaStorage::BFloat16,
-            {E}, B, lo, hi, 48);
+            buckets, B, lo, hi, 48);
     };
     int failures = 0;
     for (int B : {1, 2, 3, 4, 8})
-        for (unsigned E : {0u, 1u, 65u, 8192u, 1048576u})
+        for (auto range : {ContextBucketRange{ContextBucket::K2}, kAllBuckets})
             for (auto [lo, hi] : {std::pair{1, 257}, {2, 33}, {47, 129}, {95, 97}, {1023, 1025}}) {
                 std::size_t maximum = 0;
-                for (int t = lo; t <= hi; ++t) maximum = std::max(maximum, capacity(B, t, t, E));
-                failures += capacity(B, lo, hi, E) != maximum;
+                range.for_each([&](ContextBucket bucket) {
+                    for (int t = lo; t <= hi; ++t)
+                        maximum = std::max(maximum, capacity(B, t, t, bucket));
+                });
+                failures += capacity(B, lo, hi, range) != maximum;
             }
     for (auto [B, lo, hi] : {std::tuple{17, 1, 65}, {65, 9, 31}, {1025, 1, 17}}) {
         std::size_t maximum = 0;
-        for (int t = lo; t <= hi; ++t) maximum = std::max(maximum, capacity(B, t, t, 8192));
-        failures += capacity(B, lo, hi, 8192) != maximum;
+        for (int t = lo; t <= hi; ++t)
+            maximum = std::max(maximum, capacity(B, t, t, ContextBucket::K8));
+        failures += capacity(B, lo, hi, ContextBucket::K8) != maximum;
     }
     return failures;
 }
@@ -420,11 +657,25 @@ int admission() {
                          {64, 256, 256, 512, 8, 512}})
         failures += rejects([&] {
             (void)ops::kpool_sparse_mla_workspace_capacity_bytes(
-                profile, ops::KpoolMlaStorage::BFloat16, {8192}, 1, 1, 8, 48);
+                profile, ops::KpoolMlaStorage::BFloat16, ContextBucket::K8, 1, 1, 8, 48);
         });
     auto& d = cuda_environment().context;
     kp::SparseMlaFixture f(d.execution_view(), 2, 1, 8192, 1, 1);
-    f.scale = 0;
+    constexpr auto invalid = static_cast<ContextBucket>(255);
+    f.bucket               = invalid;
+    failures += rejects([&] { f.launch(d.execution_view()); });
+    const auto profile = ops::kpool_sparse_mla_profile(f.factors(), 64);
+    failures += rejects([&] {
+        (void)ops::kpool_sparse_mla_graph_profile(profile, f.cache.storage, invalid, 1, 2, 48);
+    });
+    for (const auto range :
+         {ContextBucketRange{invalid}, ContextBucketRange{ContextBucket::K8, ContextBucket::K2}})
+        failures += rejects([&] {
+            (void)ops::kpool_sparse_mla_workspace_capacity_bytes(profile, f.cache.storage, range, 1,
+                                                                 1, 2, 48);
+        });
+    f.bucket = ContextBucket::K8;
+    f.scale  = 0;
     failures += rejects([&] { f.launch(d.execution_view()); });
     f.scale       = 1.F / 16;
     f.output.view = f.query.view;
@@ -436,6 +687,9 @@ int admission() {
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    suite.add("kpool_sparse_mla/packed_replay", [] { return ragged_sparse(false, false, false); });
+    suite.add("kpool_sparse_mla/packed_window", [] { return ragged_sparse(true, true, true); });
+    suite.add("kpool_sparse_mla/packed_capacity", ragged_sparse_capacity);
     for (bool fp8 : {false, true})
         for (bool mx : {false, true})
             suite.add("kpool_sparse_mla/token_sweep/" + std::to_string(fp8) + "/" +
@@ -477,7 +731,7 @@ int main(int argc, char** argv) {
                         {128, 262143},
                         {128, 262144},
                         {128, 262145}})
-        add("kpool_sparse_mla/envelope_route/" + std::to_string(T) + "/" + std::to_string(E),
+        add("kpool_sparse_mla/context_route/" + std::to_string(T) + "/" + std::to_string(E),
             [=] { return run(T, 1, E, 1); });
     add("kpool_sparse_mla/singleton_graph", [] { return singleton_graph(); }, true);
     add("kpool_sparse_mla/selection_reuse", [] { return selection_reuse(); });
@@ -497,6 +751,14 @@ int main(int argc, char** argv) {
     add("kpool_sparse_mla/read_footprint", [] { return read_footprint(); });
     suite.add("kpool_sparse_mla/workspace_interval", [] { return workspace_interval(); });
     suite.add("kpool_sparse_mla/admission", admission);
+    suite.add("kpool_sparse_mla/mxfp8/fp8/profile_deduplication", profile_deduplication,
+              {{"format", "mxfp8"}});
+    for (bool fp8 : {false, true}) {
+        const std::string format = fp8 ? "fp8" : "bf16";
+        suite.add("kpool_sparse_mla/" + format + "/bucket_graph_patch",
+                  [=] { return cross_bucket_graph(fp8); },
+                  {{"format", format}, {"execution", "graph"}});
+    }
     suite.add("kpool_sparse_mla/large_batch/bf16",
               [] { return large_batch_graph(17, 1, false, false); },
               {{"suite", "concurrency"}, {"execution", "graph"}});
@@ -530,7 +792,7 @@ int main(int argc, char** argv) {
     suite.add("kpool_sparse_mla/mxfp8/fp8/decode_padding_graph_t3",
               [] { return decode_padding_graph(true, 3); },
               {{"format", "mxfp8"}, {"execution", "graph"}});
-    suite.add("kpool_sparse_mla/fp8/shared_envelope", shared_envelope,
+    suite.add("kpool_sparse_mla/fp8/shared_bucket", shared_bucket,
               {{"format", "fp8"}, {"execution", "graph"}});
     suite.add("kpool_sparse_mla/fp8/graph", [] { return graph(true); },
               {{"format", "fp8"}, {"execution", "graph"}});

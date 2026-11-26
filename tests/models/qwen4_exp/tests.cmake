@@ -38,6 +38,17 @@ set_tests_properties(ninfer_qwen4_exp_state_test PROPERTIES SKIP_RETURN_CODE 77 
 add_test(NAME ninfer_qwen4_exp_state_layout_test COMMAND ninfer_qwen4_exp_state_test --host)
 set_tests_properties(ninfer_qwen4_exp_state_layout_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
 
+add_executable(ninfer_qwen4_exp_packed_prefill_test "${CMAKE_CURRENT_LIST_DIR}/test_packed_prefill.cpp")
+ninfer_test_includes(ninfer_qwen4_exp_packed_prefill_test)
+target_link_libraries(ninfer_qwen4_exp_packed_prefill_test PRIVATE ninfer_model_execution)
+if(NINFER_ENABLE_DISTRIBUTED)
+  target_compile_definitions(ninfer_qwen4_exp_packed_prefill_test PRIVATE NINFER_ENABLE_DISTRIBUTED=1)
+endif()
+add_test(NAME ninfer_qwen4_exp_packed_prefill_test
+  COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/test_packed_prefill.py"
+    $<TARGET_FILE:ninfer_qwen4_exp_packed_prefill_test>)
+set_tests_properties(ninfer_qwen4_exp_packed_prefill_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=" TIMEOUT 30)
+
 ninfer_add_test(ninfer_qwen4_exp_reclaim_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reclaim_real.cpp"
   LIBRARIES ninfer_model_execution ninfer_model_loading ninfer_core)
@@ -48,4 +59,15 @@ ninfer_add_test(ninfer_qwen4_exp_score_state_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_score_state_real.cpp"
   LIBRARIES ninfer_model_execution)
 set_tests_properties(ninfer_qwen4_exp_score_state_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
+
+ninfer_add_test(ninfer_qwen4_exp_dynamic_speculation_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dynamic_speculation_real.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/dynamic_speculation/rounds.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/dynamic_speculation/history.cpp"
+  LIBRARIES ninfer_engine ninfer_product_config ninfer_model_execution)
+if(NINFER_ENABLE_DISTRIBUTED)
+  target_compile_definitions(ninfer_qwen4_exp_dynamic_speculation_real_test PRIVATE NINFER_ENABLE_DISTRIBUTED=1)
+endif()
+set_tests_properties(ninfer_qwen4_exp_dynamic_speculation_real_test PROPERTIES
   SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")

@@ -32,7 +32,15 @@ struct MtpBufferLayout {
     TensorRegion base_conditioning, alignment_conditioning, hidden, sample;
     TensorRegion tail_keys, tail_coordinates, tail_key_offsets, tail_coordinate_offsets;
     TensorRegion drafts, extents, verify_ids, target_tokens;
-    TensorRegion last_columns, active_columns, skip_first;
+    TensorRegion last_columns, active_columns, skip_first, previous_rope, history_base_positions;
+};
+
+struct PackedInputLayout {
+    TensorRegion ids, positions, rope_positions;
+    TensorRegion cu_seqlens, seq_lengths, token_to_seq;
+    TensorRegion source_offsets, destination_offsets, table_rows;
+    std::optional<TensorRegion> raw_tail, raw_tail_offsets;
+    LayoutRegion ingress;
 };
 
 struct BufferLayout {
@@ -42,6 +50,8 @@ struct BufferLayout {
     TensorRegion commit_destination_offsets;
     TensorRegion prefill_sample;
     std::optional<TensorRegion> prefill_conditioning;
+    std::optional<PackedInputLayout> packed_main, packed_history;
+    std::optional<TensorRegion> prefill_sampled_offsets, prefill_sampled_hidden, prefill_aligned;
     TensorRegion pending_sample;
     std::optional<TensorRegion> pending_conditioning;
     QsaRecordLayout main_qsa;
@@ -52,11 +62,14 @@ struct BufferLayout {
     std::optional<TensorRegion> ple_embedding, vocabulary_local, vocabulary_gathered;
     std::optional<TensorRegion> proposal_sampling;
     std::optional<TensorRegion> sampled_ids, output_counts;
+    std::optional<TensorRegion> top1_probabilities, draft_confidences;
     std::optional<TensorRegion> token_counts, sampling, grammar_masks;
 };
 
 [[nodiscard]] MtpBatchLayout history_control_view(const MtpBatchLayout&, std::uint32_t tokens,
                                                   std::uint32_t rows);
+[[nodiscard]] PackedInputLayout packed_input_view(const PackedInputLayout&, std::int32_t tokens,
+                                                  std::int32_t segments);
 
 void select_buffer_rows(BufferLayout&, const BufferLayout& backing, std::uint32_t rows);
 

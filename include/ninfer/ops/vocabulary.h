@@ -24,7 +24,8 @@ namespace ninfer::ops {
  *
  * configs is Device SamplingConfig[B]; its counts and masks retain GLOBAL vocabulary indexing.
  * They are read-only. valid_columns is Device I32 [B], 0<=n[b]<=T. An optional I32 drafts
- * [T-1,B] supplies the penalty overlay drafts[0:t,b] for column t; an empty Tensor disables it.
+ * [D,B], D>=1, supplies the penalty overlay drafts[0:t,b] for column t. With drafts the caller
+ * provides n[b]<=min(T,D+1). An empty Tensor disables the overlay.
  * Masks use position t regardless of whether drafts are present. Only t<n[b] is consumed.
  * Missing candidates, locally empty masks, padding IDs and inactive columns produce zero keys.
  * Inactive columns do not read logits, configs, draft values or referenced mask/count storage.
@@ -39,6 +40,20 @@ void vocabulary_candidates(const Tensor& logits, std::int32_t token_begin,
                            std::int32_t token_domain, const SamplingConfig* configs,
                            const Tensor& valid_columns, const Tensor& drafts, Tensor& keys,
                            MemoryArena& workspace, CudaExecutionView execution);
+
+[[nodiscard]] std::size_t vocabulary_candidates_with_lse_workspace_capacity_bytes(
+    std::int32_t physical_rows, std::int64_t max_columns, std::int32_t candidates);
+
+// Same candidate keys in contiguous I64 records [K+1,T,B]. Word K holds the FP32 bits
+// of log(sum exp((adjusted_score - shard_max) / tau)) in its low 32 bits, with the high bits
+// zero. The sum includes all allowed local scores. shard_max is the score in word 0, and
+// tau is the positive configured temperature or one. Inactive and empty columns write zero
+// to all words. Scratch follows the with_lse capacity query (candidates = K).
+void vocabulary_candidates_with_lse(const Tensor& logits, std::int32_t token_begin,
+                                    std::int32_t token_domain, const SamplingConfig* configs,
+                                    const Tensor& valid_columns, const Tensor& drafts,
+                                    Tensor& records, MemoryArena& workspace,
+                                    CudaExecutionView execution);
 
 /**
  * Sample from gathered disjoint vocabulary candidates, keys I64 [K,1,B,R], K=1 or 20,
@@ -57,11 +72,20 @@ void sample_vocabulary_candidates(const Tensor& keys, const SamplingConfig* conf
                                   Tensor& output, const Tensor& live_rows,
                                   CudaExecutionView execution);
 
+// Same draw from gathered I64 records [K+1,1,B,R]. The disjoint contiguous Device FP32 [B]
+// output is the full-domain top-1 probability, or zero for inactive rows or empty global
+// support. Each nonempty rank contributes exp((shard_max - global_max) / tau + local_rel_lse)
+// to the denominator; ranks with word 0 equal to zero contribute nothing.
+void sample_vocabulary_candidates(const Tensor& records, const SamplingConfig* configs,
+                                  const Tensor& logical_positions, std::int32_t purpose,
+                                  Tensor& output, Tensor& top1_probabilities,
+                                  const Tensor& live_rows, CudaExecutionView execution);
+
 /**
- * Greedy-draft speculative acceptance from gathered keys I64 [K,D+1,B,R]. D=1..15; K/B/R,
- * key representation and storage follow sample_vocabulary_candidates. drafts is I32 [D,B],
- * current_extents is I32 [B] in [0,D]. Only columns 0..current_extents[b] are consumed.
- * Candidates already include each column's preceding draft penalty overlay.
+ * Greedy-draft speculative acceptance from gathered keys I64 [K,W,B,R]. W=2..16; K/B/R,
+ * key representation and storage follow sample_vocabulary_candidates. drafts is I32 [D,B], D>=1.
+ * Live current_extents are I32 [B] in [0,min(W-1,D)]. Only columns 0..current_extents[b] are
+ * consumed. Candidates already include each column's preceding draft penalty overlay.
  *
  * Greedy rows accept matching target IDs. Stochastic rows use the one-hot proposal law:
  * accept draft j with probability p_j(draft_j), sample normalized p_j with draft_j removed
@@ -71,7 +95,7 @@ void sample_vocabulary_candidates(const Tensor& keys, const SamplingConfig* conf
  *
  * drafts permits positive, naturally aligned, non-overlapping strides. Base logical positions
  * are read-only I32 [B], with the same RNG meaning as speculative_accept_greedy_drafts.
- * Writes I32 licensed_tokens [D+1,B] (accepted prefix, correction/bonus, then zeros) and
+ * Writes I32 licensed_tokens [W,B] (accepted prefix, correction/bonus, then zeros) and
  * licensed_counts [B]. Outputs are disjoint and overlap no inputs/configs. No workspace or
  * persistent state effects. The caller later commits its chosen prefix and updates counts.
  * live_rows follows sample_vocabulary_candidates. Inactive rows write zero tokens/counts and
@@ -84,12 +108,13 @@ void accept_vocabulary_candidates(const Tensor& keys, const SamplingConfig* conf
                                   CudaExecutionView execution);
 
 /**
- * Sparse-proposal acceptance from gathered target keys I64 [K,D+1,B,R], following the
+ * Sparse-proposal acceptance from gathered target keys I64 [K,W,B,R], following the
  * key/filter/storage contract above. candidate_ids I32 [16,D,B] and proposal_q FP32 [16,D,B]
  * describe the conditional proposal distribution actually used for each draft prefix.
- * They are contiguous; q is finite, nonnegative and sums to one (up to FP32 rounding).
- * Positive-q IDs are distinct valid global IDs. Zero-q IDs are ignored (INT_MAX is allowed).
- * For every consumed positive-temperature draft, q(draft)>0. Greedy rows ignore IDs/q.
+ * D=1..15. The 16 candidates are contiguous; each tensor has independent positive, aligned,
+ * non-overlapping column and row strides. q is finite, nonnegative and sums to one (up to FP32
+ * rounding). Positive-q IDs are distinct valid global IDs. Zero-q IDs are ignored (INT_MAX is
+ * allowed). For every consumed positive-temperature draft, q(draft)>0. Greedy rows ignore IDs/q.
  *
  * Target keys already include penalties and masks. Apply the existing target Top-K/min-p/top-p
  * normalization once, accept with min(1,p(draft)/q(draft)), and on first rejection draw from

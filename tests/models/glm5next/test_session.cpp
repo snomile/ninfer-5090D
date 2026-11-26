@@ -13,6 +13,7 @@
 #include <iostream>
 #include <fstream>
 #include <map>
+#include <numeric>
 #include <sstream>
 #include <thread>
 
@@ -24,6 +25,111 @@ namespace rt  = runtime;
 
 void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
+}
+
+void packed_work_contract() {
+    const glm::WorkContract contract{{.max_context = 128, .max_concurrency = 3, .prefill_chunk = 8},
+                                     std::make_shared<const models::BatchExecutionPlan>(
+                                         models::make_batch_execution_spec(3, 2, false)),
+                                     64,
+                                     64,
+                                     2};
+    glm::ForwardWork forward;
+    forward.sample = glm::SampleKind::FirstToken;
+    forward.rows.resize(3);
+    for (unsigned i = 0; i < forward.rows.size(); ++i) {
+        auto& row          = forward.rows[i];
+        row.member         = {{i + 1, 1}, {{i}, 1}};
+        row.attention_rank = i == 0 ? 1 : 0;
+        row.states         = {{0, {32 * i, 32 * i + 16}}, {1, {32 * i, 32 * i + 16}}};
+        row.main_table     = {0, i, 1};
+    }
+    forward.rows[0].ids    = {2, 3, 4};
+    forward.rows[0].sample = forward.rows[0].constrained = true;
+    forward.rows[1].ids                                  = {6, 7, 8, 9, 10};
+    forward.rows[2].sample                               = true;
+    forward.rows[2].main_frontier                        = 7;
+    glm::Work work{{}, forward};
+    glm::prepare_batch(work, *contract.batches);
+    contract.validate(work, rt::FrameKind::Compute);
+    require(glm::work_batch(work).members == std::vector<std::uint32_t>{1, 2, 0},
+            "prefill membership lost its attention owners");
+
+    const rt::DecisionRequest request{.vocabulary = 64, .rows = {{0, {}}}};
+    const rt::DecisionInput input{.rows = {{0, 1, 0, {0xFFFFFFFFU, 0xFFFFFFFFU}}}};
+    contract.validate(work, request, input);
+    const glm::ComputeResult result{{
+        {.processed = 3, .tokens = {42}},
+        {.processed = 5},
+        {.processed = 0, .tokens = {43}},
+    }};
+    glm::Commit commit;
+    for (const auto& row : forward.rows) commit.rows.push_back({row.member, row.states});
+    commit.rows[0].accepted = 1;
+    commit.rows[1].accepted = 5;
+    commit.rows[2].terminal = commit.rows[2].cancelled = true;
+    contract.validate(work, result, commit);
+
+#if NINFER_ENABLE_DISTRIBUTED
+    for (std::uint32_t rank = 0; rank < contract.ranks; ++rank) {
+        distributed::wire::Encoder work_wire, commit_wire;
+        glm::encode_work(work_wire, work, rank);
+        glm::encode_commit(commit_wire, commit, rank);
+        const auto work_bytes   = std::move(work_wire).take();
+        const auto commit_bytes = std::move(commit_wire).take();
+        const auto capacity     = contract.payload_capacity(contract.ranks);
+        require(work_bytes.size() <= capacity.compute_work &&
+                    commit_bytes.size() <= capacity.commit,
+                "ragged prefill exceeded its wire capacity");
+        distributed::wire::Decoder work_in(work_bytes), commit_in(commit_bytes);
+        const auto decoded  = glm::decode_work(work_in);
+        const auto adoption = glm::decode_commit(commit_in);
+        work_in.finish();
+        commit_in.finish();
+        contract.validate(decoded, rt::FrameKind::Compute);
+        contract.validate(decoded, request, input);
+        contract.validate(decoded, result, adoption);
+        const auto& rows = std::get<glm::ForwardWork>(decoded.operation).rows;
+        require(rows[0].ids == forward.rows[0].ids && rows[0].sample && rows[0].constrained &&
+                    rows[1].ids == forward.rows[1].ids && !rows[1].sample && rows[2].ids.empty() &&
+                    rows[2].sample && rows[2].main_frontier == 7,
+                "wire changed ragged prefill input or sampling");
+        require(adoption.rows[0].accepted == 1 && adoption.rows[1].accepted == 5 &&
+                    adoption.rows[2].cancelled && adoption.rows[2].accepted == 0,
+                "wire changed ragged prefill commit");
+    }
+#endif
+
+    const auto rejects = [](auto check, const char* message) {
+        try {
+            check();
+        } catch (const std::invalid_argument&) { return; }
+        throw std::runtime_error(message);
+    };
+    const auto invalid_work = [&](auto mutate, const char* message) {
+        auto bad = work;
+        mutate(std::get<glm::ForwardWork>(bad.operation));
+        rejects([&] { contract.validate(bad, rt::FrameKind::Compute); }, message);
+    };
+    invalid_work([](auto& w) { w.rows[1].ids.push_back(0); }, "accepted excess packed tokens");
+    invalid_work([](auto& w) { w.rows[1].constrained = true; }, "constrained an unsampled row");
+    invalid_work([](auto& w) { w.rows[2].main_frontier = 0; }, "sampled an empty root row");
+    invalid_work([](auto& w) { w.rows[2].sample = false; }, "accepted an unsampled cache hit");
+    invalid_work([](auto& w) { w.sample = glm::SampleKind::None; }, "lost sampled row kind");
+    rejects([&] { contract.validate(work, request, {}); }, "accepted a missing sampled mask");
+    auto wrong_mask           = input;
+    wrong_mask.rows[0].member = 1;
+    rejects([&] { contract.validate(work, request, wrong_mask); }, "accepted an unsampled mask");
+    auto invalid_commit             = commit;
+    invalid_commit.rows[0].accepted = 0;
+    rejects([&] { contract.validate(work, result, invalid_commit); }, "sampled row accepted zero");
+    invalid_commit                  = commit;
+    invalid_commit.rows[1].accepted = 1;
+    rejects([&] { contract.validate(work, result, invalid_commit); }, "accepted partial prompt");
+    auto invalid_result           = result;
+    invalid_result.rows[1].tokens = {17};
+    rejects([&] { contract.validate(work, invalid_result, commit); },
+            "unsampled row emitted a token");
 }
 
 // Transaction test: physical completion is explicitly separated from result publication.
@@ -39,11 +145,15 @@ public:
     bool failure            = false;
     std::atomic<bool> hold_poll{false};
     std::atomic<bool> fail_poll{false};
+    std::atomic<bool> mixed_prefill_held{false};
+    bool hold_mixed_prefill             = false;
     std::uint32_t hold_prefill_frontier = UINT32_MAX;
     std::uint64_t unit_time_ns          = 0;
     unsigned defer_binding = 0, bindings = 0;
     std::optional<rt::DeviceRetired> deferred_context;
-    bool compute_retired = false;
+    bool compute_retired           = false;
+    unsigned deferred_bind_flushes = 0;
+    std::vector<glm::CommitRow> packed_commit;
     std::function<void()> replay_submitted;
     std::vector<std::uint32_t> accept;
     glm::ComputeResult computed;
@@ -81,6 +191,8 @@ public:
             for (std::size_t row = 0; row < original_rows.size(); ++row)
                 require(original_rows[row].member.sequence == decoded_rows[row].member.sequence &&
                             original_rows[row].ids == decoded_rows[row].ids &&
+                            original_rows[row].sample == decoded_rows[row].sample &&
+                            original_rows[row].constrained == decoded_rows[row].constrained &&
                             original_rows[row].attention_rank == decoded_rows[row].attention_rank,
                         "wire changed inputs or attention ownership");
         }
@@ -111,8 +223,13 @@ public:
                     r.drafts          = mtp->draft_extents[b];
                     r.accepted_drafts = accept.empty() ? r.drafts : std::min(accept[b], r.drafts);
                     r.tokens.resize(r.accepted_drafts + 1, 0);
-                } else if (forward->sample != glm::SampleKind::None)
+                    r.draft_confidences.resize(r.drafts, 0.75f);
+                } else if (row.sample || forward->sample == glm::SampleKind::NextToken) {
                     r.tokens = {static_cast<TokenId>(row.member.sequence.value % 2)};
+                    if (forward->sample == glm::SampleKind::NextToken &&
+                        contract.shape.draft_tokens)
+                        r.target_top1_probability = 0.75f;
+                }
                 result.rows.push_back(std::move(r));
             }
             if (forward && forward->kind == glm::ForwardKind::Replay && replay_submitted)
@@ -122,6 +239,12 @@ public:
             if (forward && forward->kind == glm::ForwardKind::Prefill &&
                 rows.front().main_frontier >= hold_prefill_frontier)
                 hold_poll = true;
+            if (hold_mixed_prefill && forward && forward->kind == glm::ForwardKind::Prefill &&
+                rows.size() > 1) {
+                hold_mixed_prefill = false;
+                hold_poll          = true;
+                mixed_prefill_held = true;
+            }
         }
         return ticket;
     }
@@ -132,6 +255,9 @@ public:
 
     rt::CommitReceipt commit(rt::ExecutionTicket ticket, glm::Commit commit) override {
         contract.validate_commit(last, computed.rows, commit);
+        const auto* forward = std::get_if<glm::ForwardWork>(&last.operation);
+        if (forward && forward->kind == glm::ForwardKind::Prefill && forward->rows.size() > 1)
+            packed_commit = commit.rows;
         events.emplace_back(rt::DeviceRetired{ticket, {++next}, {}});
         return {ticket, {next}};
     }
@@ -157,9 +283,10 @@ public:
     }
 
     void flush() override {
-        // Model an asynchronous binding retiring after resident compute has progressed.
-        // Publishing at flush keeps the new lane unavailable until the next scheduling boundary.
-        if (deferred_context && compute_retired) {
+        if (!deferred_context) return;
+        // A bind retires at a flush either after a delay or after resident work progresses.
+        const bool ready = deferred_bind_flushes ? --deferred_bind_flushes == 0 : compute_retired;
+        if (ready) {
             events.emplace_back(std::move(*deferred_context));
             deferred_context.reset();
             compute_retired = false;
@@ -182,13 +309,13 @@ public:
 };
 
 glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = false,
-                      std::uint32_t concurrency = 3) {
+                      std::uint32_t concurrency = 3, std::uint32_t drafts = 3) {
     glm::SessionPlan p;
     p.shape   = {.max_context     = 256,
                  .max_concurrency = concurrency,
                  .prefill_chunk   = 64,
                  .draft_tokens =
-                   definition.options().speculative != SpeculativeBackend::None ? 3U : 0U,
+                   definition.options().speculative != SpeculativeBackend::None ? drafts : 0U,
                  .kv_storage    = KvCacheStorage::BFloat16,
                  .index_format  = KvCacheVectorFormat::BFloat16,
                  .purpose       = EnginePurpose::Generation,
@@ -339,7 +466,8 @@ struct Fixture {
     Fixture(std::shared_ptr<const glm::ModelDefinition> d, glm::SessionPlan p)
         : definition(d), frontend(make_frontend()), layout(std::move(p)),
           executor({layout.shape, layout.batches, d->config().text.vocabulary,
-                    d->resources().text.public_token_count, 2}),
+                    d->resources().text.public_token_count, 2, 0, 0,
+                    glm::make_decode_routes(layout.shape, *layout.batches)}),
           session(glm::prepare_session(d, layout, make_directory()), executor) {}
 
     std::unique_ptr<ctx::ContextDirectory> make_directory() {
@@ -408,34 +536,52 @@ struct Fixture {
 };
 
 void expanded_membership(std::shared_ptr<const glm::ModelDefinition> definition) {
-    Fixture f(definition, plan(*definition, false, 17));
+    constexpr unsigned k = 5;
+    Fixture f(definition, plan(*definition, false, 17, k));
     const auto input = f.request(4);
     std::vector<glm::SequenceHandle> members;
     for (std::uint32_t lane = 0; lane < 17; ++lane) {
         members.push_back(f.bind(input, lane, 0));
         f.commit(f.prefill(members.back()));
     }
-    for (const auto count : {10U, 9U, 17U}) {
+    std::size_t round = 0;
+    for (const auto count : {12U, 11U, 17U, 12U, 12U}) {
+        const auto depth = std::array{3U, 1U, 2U, 0U, k}[round++];
         f.executor.accept.resize(count);
         std::vector<glm::ExecutionUnit> units;
-        std::vector<rt::RoundBudget> budgets;
         std::vector<glm::SequenceHandle> ordered;
+        std::vector<unsigned> drafts;
         for (std::uint32_t i = 0; i < count; ++i) {
             f.executor.accept[i] = i % 2;
             const auto h         = members[(i + 5) % members.size()];
-            const auto budget    = 1U + i % 4;
+            const auto width     = i == 0 ? depth : std::min(i % 4, depth);
+            drafts.push_back(width);
             ordered.push_back(h);
-            units.push_back({h, glm::ExecutionUnitKind::Decode, budget});
-            budgets.push_back({budget});
+            units.push_back({h, glm::ExecutionUnitKind::Decode, 1});
         }
         require(bool(f.session.reserve_units(units)), "expanded decode reservation failed");
-        require(f.session.start_decode(ordered, budgets).has_value(),
+        require(f.session.start_decode_extents(ordered, drafts).has_value(),
                 "expanded decode not started");
         const auto& physical = glm::work_batch(f.executor.last);
-        require(physical.shape.rows == (count == 17 ? 17 : 10) &&
+        require(physical.shape == f.layout.batches->decode(count, count) &&
                     physical.owners[0].size == count && physical.owners[1].size == 0 &&
                     physical.members.size() == count,
                 "expanded work lost real membership or invented empty-rank rows");
+        const auto described = glm::ExecutionTypes::describe_work(f.executor.last);
+        const auto& geometry = described.speculative;
+        const auto target    = std::accumulate(drafts.begin(), drafts.end(), std::uint64_t(count));
+        require(geometry && geometry->mtp_steps == depth &&
+                    geometry->verify_width == (depth ? k + 1 : 1) &&
+                    geometry->owner_target_tokens == std::vector<std::uint64_t>{target, 0} &&
+                    geometry->valid_target_tokens == target,
+                "heterogeneous budgets changed the physical route or owner token count");
+        if (depth)
+            require(std::get<glm::SpeculativeWork>(f.executor.last.operation).draft_extents ==
+                        drafts,
+                    "GLM Session lost a heterogeneous verification extent");
+        else
+            require(std::holds_alternative<glm::ForwardWork>(f.executor.last.operation),
+                    "an anchor-only round used the verification graph");
         auto pending = f.event<glm::PendingBatch>();
         std::vector<rt::CommitDecision> decisions(count);
         for (std::uint32_t i = 0; i < count; ++i) {
@@ -460,6 +606,39 @@ void expanded_membership(std::shared_ptr<const glm::ModelDefinition> definition)
     for (auto h : members) (void)f.session.abort(h);
     f.idle();
     require(f.session.physical_usage().state_objects == 0, "expanded membership retained State");
+}
+
+void calibrate_attention_owners(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(std::move(definition));
+    auto frontend           = glm::make_frontend(f.definition->resources(),
+                                                 {.vision_enabled = false, .max_context = 256});
+    f.executor.unit_time_ns = 1'000'000;
+
+    struct Instance {
+        using ModelContract = glm::RuntimeTypes;
+        glm::Frontend& frontend;
+        Executor* executor;
+        glm::Session* session;
+    } instance{frontend, &f.executor, &f.session};
+
+    std::vector<StartupStatus> phases;
+    const StartupObserver observer{[&](const StartupEvent& event) {
+        if (event.phase == StartupPhase::SpeculativeCalibration) phases.push_back(event.status);
+    }};
+    const auto calibration = rt::calibrate_speculative(instance, observer, "aabbab");
+    const auto cost        = f.session.speculative_cost_summary();
+    require(cost.fitted && cost.anchor_count && !cost.online_cell_count,
+            "two-owner calibration did not fit from isolated probes");
+    require(calibration && calibration->anchors == cost.anchor_count &&
+                calibration->contexts == 1 && calibration->seconds > 0 &&
+                phases == std::vector{StartupStatus::Begin, StartupStatus::Complete},
+            "calibration reported the wrong measured scope or startup events");
+    const auto usage = f.session.physical_usage();
+    require(f.executor.bindings == 2 + f.layout.shape.max_concurrency &&
+                !f.executor.has_pending_work() && !f.session.has_context_operation() &&
+                !usage.state_objects && !usage.history_objects &&
+                std::ranges::all_of(usage.kv_page_groups, [](auto pages) { return !pages; }),
+            "two-owner calibration did not create and release one root per owner");
 }
 
 struct CopyWork {
@@ -626,7 +805,7 @@ void long_input_replacement(std::shared_ptr<const glm::ModelDefinition> definiti
         auto progress = f.event<glm::PrefillProgress>();
         f.idle();
         if (capture) {
-            require(capture->reserved && progress.capture_ready && !progress.pending,
+            require(capture->reserved && progress.rows.at(0).capture_ready && !progress.pending,
                     "long input capture was not prepared before execution");
             require(f.session.start_capture(sequence) == rt::ContextStart::Started,
                     "long input capture did not start");
@@ -666,6 +845,95 @@ void retired_quotes_do_not_block_new_inputs(
     const auto usage = f.session.physical_usage();
     require(!usage.state_objects && !usage.history_objects,
             "retired quotes retained physical context");
+}
+
+void mixed_prefill_transaction(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+    const auto short_prompt = f.bind(f.request(8), 0, 0);
+    const auto continuing   = f.bind(f.request(60), 1, 1);
+    const auto cancelled    = f.bind(f.request(50), 2, 0);
+    const std::array members{short_prompt, continuing, cancelled};
+    const std::array units{
+        glm::ExecutionUnit{short_prompt, glm::ExecutionUnitKind::Prefill, 8},
+        glm::ExecutionUnit{continuing, glm::ExecutionUnitKind::Prefill, 16},
+        glm::ExecutionUnit{cancelled, glm::ExecutionUnitKind::Prefill, 24},
+    };
+    const std::array grants{rt::PrefillGrant{8}, rt::PrefillGrant{16}, rt::PrefillGrant{24}};
+    require(f.session.prefill_budget_policy().max_sequences_per_step ==
+                    f.layout.shape.max_concurrency &&
+                f.session.reserve_units(units) && f.session.start_prefill(members, grants),
+            "mixed prefill could not reserve and start its rows");
+    auto progress = f.event<glm::PrefillProgress>();
+    require(progress.rows.size() == 3 && progress.pending && progress.rows[0].complete &&
+                !progress.rows[1].complete && !progress.rows[2].complete &&
+                progress.rows[0].processed_prompt_tokens == 8 &&
+                progress.rows[1].processed_prompt_tokens == 16 &&
+                progress.rows[2].processed_prompt_tokens == 24 &&
+                progress.pending->row_sampled(0) && !progress.pending->row_sampled(1) &&
+                !progress.pending->row_sampled(2) &&
+                std::ranges::equal(progress.pending->row_counts(), std::array{1, 0, 0}),
+            "mixed prefill lost its row extents or sampled membership");
+    const std::array decisions{
+        rt::CommitDecision{.accepted_tokens = 1, .terminal = true},
+        rt::CommitDecision{},
+        rt::CommitDecision{.terminal = true, .cancelled = true},
+    };
+    const auto result = f.session.commit(std::move(*progress.pending), decisions);
+    require(result.rows[0].disposition == rt::CommitDisposition::Finishable &&
+                result.rows[1].disposition == rt::CommitDisposition::Active &&
+                result.rows[2].disposition == rt::CommitDisposition::CancelledReleased &&
+                f.executor.packed_commit.size() == 3 && f.executor.packed_commit[0].accepted == 1 &&
+                f.executor.packed_commit[1].accepted == 16 &&
+                f.executor.packed_commit[2].accepted == 0 && f.executor.packed_commit[2].cancelled,
+            "mixed prefill confused generated, processed and discarded tokens");
+    f.idle();
+    require(f.session.prefill_candidate(continuing).remaining_tokens == 44 &&
+                f.session.abort(cancelled).status != rt::ConsumeStatus::Consumed,
+            "mixed commit lost the prompt frontier or retained a cancelled row");
+    f.commit(f.prefill(continuing), true);
+    for (const auto sequence : {short_prompt, continuing}) {
+        const auto finished = f.session.finish(sequence);
+        require(finished.status == rt::ConsumeStatus::Consumed && finished.checkpoint &&
+                    f.session.release_checkpoint(*finished.checkpoint),
+                "mixed prefill left an invalid finishable row");
+    }
+    f.idle();
+}
+
+void packed_cache_hits(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+    const auto request = f.request(7);
+    const auto donor   = f.bind(request, 0, 0);
+    f.commit(f.prefill(donor), true);
+    const auto completed = f.session.finish(donor);
+    require(completed.checkpoint.has_value(), "cache-hit fixture did not capture prompt state");
+    f.idle();
+
+    const std::array members{f.bind(request, 0, 0, completed.checkpoint),
+                             f.bind(request, 1, 0, completed.checkpoint)};
+    const std::array units{glm::ExecutionUnit{members[0], glm::ExecutionUnitKind::Prefill, 0},
+                           glm::ExecutionUnit{members[1], glm::ExecutionUnitKind::Prefill, 0}};
+    const std::array grants{rt::PrefillGrant{0}, rt::PrefillGrant{0}};
+    require(f.session.reserve_units(units) && f.session.start_prefill(members, grants),
+            "cache-hit batch did not start");
+    auto progress = f.event<glm::PrefillProgress>();
+    require(progress.pending && progress.rows.size() == 2 &&
+                std::ranges::all_of(progress.rows,
+                                    [](const auto& row) {
+                                        return row.complete && row.processed_prompt_tokens == 0;
+                                    }) &&
+                std::ranges::equal(progress.pending->row_counts(), std::array{1, 1}),
+            "cache-hit batch lost a first token or processed prompt input");
+    f.commit(std::move(*progress.pending), true);
+    for (const auto member : members) {
+        const auto finished = f.session.finish(member);
+        require(finished.status == rt::ConsumeStatus::Consumed && finished.checkpoint &&
+                    f.session.release_checkpoint(*finished.checkpoint),
+                "cache-hit row did not finish after commit");
+        f.idle();
+    }
+    require(f.session.release_checkpoint(*completed.checkpoint), "donor checkpoint did not retire");
+    f.idle();
 }
 
 void fragmented_capture(std::shared_ptr<const glm::ModelDefinition> definition) {
@@ -731,7 +999,7 @@ void fragmented_capture(std::shared_ptr<const glm::ModelDefinition> definition) 
     const auto ready = f.session.prepare_capture(sequence);
     require(ready && ready->reserved, "capture did not become ready after compaction");
     require(f.session.start_prefill(sequence).has_value(), "compacted prefill did not execute");
-    require(f.event<glm::PrefillProgress>().capture_ready,
+    require(f.event<glm::PrefillProgress>().rows.at(0).capture_ready,
             "compacted prefill lost its checkpoint boundary");
     f.idle();
     require(f.session.start_capture(sequence) == runtime::ContextStart::Started,
@@ -857,7 +1125,7 @@ void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         require(capture && capture->reserved, "input checkpoint was not reserved");
         (void)f.session.start_prefill(sequence);
         const auto progress = f.event<glm::PrefillProgress>();
-        require(progress.capture_ready && !progress.pending,
+        require(progress.rows.at(0).capture_ready && !progress.pending,
                 "input checkpoint boundary not honored");
         f.idle();
         require(f.session.start_capture(sequence) == runtime::ContextStart::Started,
@@ -926,7 +1194,7 @@ void capture_replacement_and_retry(std::shared_ptr<const glm::ModelDefinition> d
     f.session.skip_capture(first);
     require(f.session.start_prefill(first).has_value(), "retry prefill start");
     auto result = f.event<glm::PrefillProgress>();
-    require(result.complete && result.pending && !result.capture_ready,
+    require(result.rows.at(0).complete && result.pending && !result.rows.at(0).capture_ready,
             "skipped capture changed the normal prefill boundary");
     f.commit(std::move(*result.pending));
     require(f.session.retry_capture(first), "completed prefill lost its retryable input frontier");
@@ -989,6 +1257,67 @@ void capture_replacement_and_retry(std::shared_ptr<const glm::ModelDefinition> d
             "shared capture leaked its complete snapshot");
 }
 
+void owner_window_grants(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+    const auto request = f.request(63);
+    const std::array members{f.bind(request, 0, 1), f.bind(request, 1, 0)};
+    for (auto h : members) f.commit(f.prefill(h));
+    const std::array anchors{glm::ExecutionUnit{members[0], glm::ExecutionUnitKind::Decode, 1},
+                             glm::ExecutionUnit{members[1], glm::ExecutionUnitKind::Decode, 1}};
+    require(bool(f.session.reserve_units(anchors)), "private tails did not admit both anchors");
+    // Fill only owner 1 after mandatory admission. Each additional Target window crosses page 64.
+    auto& records     = f.directory->records();
+    const auto layout = f.directory->pool(0).pages().layout().id;
+    std::vector<ctx::RecordLease> held;
+    for (;;) {
+        auto reserve =
+            records.reserve(ctx::RecordDemand{layout, ctx::ContextMemory::Device, 1, {1}});
+        if (!reserve || !reserve->ready()) break;
+        held.push_back(reserve->materialize(1));
+    }
+    require(!f.session.start_decode_extents(members, std::array{3u, 3u}),
+            "an exact extent exceeded its owner's KV grant");
+    require(f.session.start_decode_extents(members, std::array{0u, 3u}).has_value(),
+            "optional growth blocked the batch");
+    const auto& work = std::get<glm::SpeculativeWork>(f.executor.last.operation);
+    require(work.draft_extents == std::vector<unsigned>{0, 3} &&
+                work.speculative->owner_target_tokens == std::vector<std::uint64_t>{4, 1},
+            "capacity pressure on one attention owner clipped the other");
+    auto pending = f.event<glm::PendingBatch>();
+    const std::array adopt{rt::CommitDecision{.accepted_tokens = 1},
+                           rt::CommitDecision{.accepted_tokens = 4}};
+    const auto result = f.session.commit(std::move(pending), adopt);
+    require(result.rows[0].speculative.fallback_steps == 1 &&
+                result.rows[0].speculative.bypass_steps == 0 &&
+                result.rows[0].speculative.proposed_tokens == 0 &&
+                result.rows[0].speculative.drafted_tokens == 0 &&
+                result.rows[1].speculative.proposed_tokens == 3 &&
+                result.rows[1].speculative.drafted_tokens == 3,
+            "owner-specific grant accounting");
+    f.idle();
+    held.clear();
+    for (auto h : members)
+        require(f.session.abort(h).status == rt::ConsumeStatus::Consumed, "grant cleanup");
+    f.idle();
+}
+
+void masked_block_at_context_boundary(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+    auto h = f.bind(f.request(f.layout.shape.max_context - 2), 0, 1);
+    f.commit(f.prefill(h));
+    const glm::ExecutionUnit anchor{h, glm::ExecutionUnitKind::Decode, 1};
+    require(bool(f.session.reserve_units({&anchor, 1})), "last private anchor not admitted");
+    const rt::RoundBudget budget{2};
+    require(bool(f.session.start_decode({&h, 1}, {&budget, 1})),
+            "short context round did not start");
+    const auto& ordinary = std::get<glm::ForwardWork>(f.executor.last.operation);
+    require(ordinary.speculative && ordinary.speculative->verify_width == 1 &&
+                !ordinary.speculative->head_columns,
+            "partial noncausal block executed past context");
+    f.commit(f.event<glm::PendingBatch>());
+    require(f.session.abort(h).status == rt::ConsumeStatus::Consumed, "context edge cleanup");
+}
+
 void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
     for (const auto accepted : {0U, 1U, 3U}) {
         Fixture f(definition);
@@ -997,18 +1326,21 @@ void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         f.commit(f.prefill(a));
         f.commit(f.prefill(b));
         const std::array members{a, b};
-        const std::array units{glm::ExecutionUnit{a, glm::ExecutionUnitKind::Decode, 4},
+        const std::array units{glm::ExecutionUnit{a, glm::ExecutionUnitKind::Decode, 1},
                                glm::ExecutionUnit{b, glm::ExecutionUnitKind::Decode, 1}};
         require(bool(f.session.reserve_units(units)), "MTP capacity not reserved");
-        std::array<rt::RoundBudget, 2> budgets;
-        budgets[0].generated_tokens_remaining = 4;
-        budgets[1].generated_tokens_remaining = 1;
-        f.executor.accept                     = {accepted, 0};
-        require(f.session.start_decode(members, budgets).has_value(), "MTP did not start");
+        f.executor.accept = {accepted, 0};
+        require(f.session.start_decode_extents(members, std::array{3u, 0u}).has_value(),
+                "MTP did not start");
         const auto& work = std::get<glm::SpeculativeWork>(f.executor.last.operation);
         require(work.draft_extents == std::vector<std::uint32_t>{3, 0} &&
                     glm::work_batch(f.executor.last).members == std::vector<std::uint32_t>{1, 0},
                 "mixed MTP rows lost extents or ownership");
+        const auto& geometry = work.speculative;
+        require(geometry && geometry->mtp_steps == 3 && geometry->verify_width == 4 &&
+                    geometry->owner_target_tokens == std::vector<std::uint64_t>{1, 4} &&
+                    geometry->valid_target_tokens == 5 && geometry->path == ExecutionPath::Graph,
+                "MTP geometry disagrees with the ADP owner ordering");
         require(work.rows[0].mtp_frontier == 62 && work.rows[1].mtp_frontier == 3,
                 "MTP canonical frontier is not Main minus one");
         auto result = f.event<glm::PendingBatch>();
@@ -1070,7 +1402,10 @@ void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, boo
     std::array<std::exception_ptr, 3> errors;
     std::array<std::vector<GenerationSchedulingObservation>, 3> observations;
     for (unsigned row = 0; row < submitted.size(); ++row) {
-        auto prompt        = f.frontend.prepare_tokens(std::vector<TokenId>(128, row), true);
+        // The first two rows reach Decode after one chunk. Their next pages force
+        // pressure before the newest binding can process any prompt tokens.
+        auto prompt =
+            f.frontend.prepare_tokens(std::vector<TokenId>(row == 2 ? 128 : 64, row), true);
         const auto summary = prompt.summary();
         rt::ResolvedRequestOptions request;
         request.execution.requested_output_tokens = 120;
@@ -1348,6 +1683,150 @@ struct WaitingCaptureRuntime : glm::RuntimeTypes {
     using Session = WaitingCaptureSession;
 };
 
+class PackedPrefillSession : public glm::Session {
+public:
+    using glm::Session::Session;
+    using glm::Session::start_prefill;
+
+    std::optional<rt::ExecutionTicket> start_prefill(std::span<const glm::SequenceHandle> members,
+                                                     std::span<const rt::PrefillGrant> grants) {
+        auto ticket = glm::Session::start_prefill(members, grants);
+        if (ticket) prefill_members.assign(members.begin(), members.end());
+        return ticket;
+    }
+
+    glm::CommitResult commit(glm::PendingBatch&& batch,
+                             std::span<const rt::CommitDecision> decisions) {
+        std::vector<std::pair<glm::SequenceHandle, std::uint32_t>> cancelled;
+        for (std::size_t row = 0; row < decisions.size(); ++row) {
+            if (!decisions[row].cancelled) continue;
+            const auto member = prefill_members.at(row);
+            cancelled.emplace_back(member, decode_frontier(member));
+        }
+        auto result = glm::Session::commit(std::move(batch), decisions);
+        for (const auto& [member, before] : cancelled)
+            require(decode_frontier(member) == before, "cancelled row adopted its prompt suffix");
+        return result;
+    }
+
+    glm::FinishResult finish(glm::SequenceHandle sequence) {
+        auto result = glm::Session::finish(sequence);
+        if (result.status == rt::ConsumeStatus::Consumed) ++finished;
+        return result;
+    }
+
+    rt::ContextStart start_capture(glm::SequenceHandle sequence) {
+        const auto result = glm::Session::start_capture(sequence);
+        if (result == rt::ContextStart::Started) {
+            ++captures;
+            finished_before_capture = finished;
+        }
+        return result;
+    }
+
+    unsigned finished = 0, captures = 0, finished_before_capture = 0;
+    std::vector<glm::SequenceHandle> prefill_members;
+};
+
+struct PackedPrefillRuntime : glm::RuntimeTypes {
+    using Session = PackedPrefillSession;
+};
+
+void engine_packed_prefill(std::shared_ptr<const glm::ModelDefinition> definition,
+                           bool cancel_in_flight = false) {
+    auto layout                = plan(*definition);
+    layout.shape.prefill_chunk = 128;
+    auto frontend              = make_frontend();
+    Executor executor({layout.shape, layout.batches, definition->config().text.vocabulary,
+                       definition->resources().text.public_token_count, 2});
+    PackedPrefillSession session(
+        glm::prepare_session(definition, layout,
+                             std::make_unique<ctx::ContextDirectory>(layout.context)),
+        executor);
+
+    struct Instance {
+        using ModelContract = PackedPrefillRuntime;
+        glm::Frontend& frontend;
+        Executor* executor;
+        PackedPrefillSession* session;
+    } instance{frontend, &executor, &session};
+
+    EngineOptions options;
+    options.max_context            = 256;
+    options.max_concurrency        = 3;
+    options.context_cache.enabled  = true;
+    executor.hold_poll             = true;
+    executor.defer_binding         = 2;
+    executor.deferred_bind_flushes = 8;
+    executor.hold_mixed_prefill    = cancel_in_flight;
+    rt::EngineCore<Instance> engine(instance, options, {});
+    const auto submit = [&](std::uint32_t length, TokenId token, bool cache, bool stream = false) {
+        auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(length, token), cache);
+        const auto summary = prompt.summary();
+        rt::ResolvedRequestOptions request;
+        request.execution.requested_output_tokens = 1;
+        request.execution.allow_prefix_reuse      = cache;
+        request.output.raw                        = true;
+        request.stop.include_model_defaults       = false;
+        return engine.submit(std::move(prompt), summary, 0, request,
+                             stream ? OutputConsumerMode::Streaming : OutputConsumerMode::Aggregate,
+                             {.prompt_progress = stream});
+    };
+    auto short_prompt   = submit(8, 0, false, cancel_in_flight);
+    auto capture_prompt = submit(96, 1, true);
+    executor.hold_poll  = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const CancellationView timeout([&] { return std::chrono::steady_clock::now() >= deadline; });
+    if (cancel_in_flight) {
+        while (!executor.mixed_prefill_held && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        require(executor.mixed_prefill_held, "cancellation fixture did not pack both requests");
+
+        struct Sink : OutputSink {
+            void start(GenerationStart) override {}
+
+            void progress(PromptProgress) override { ++progress_events; }
+
+            void timing(GenerationTimingObservation) override {}
+
+            void publish(OutputEvent) override { ++output_events; }
+
+            unsigned progress_events = 0, output_events = 0;
+        } sink;
+
+        unsigned checks = 0;
+        const auto a    = short_prompt.wait(&sink, CancellationView([&] {
+            // The first check sets the request flag before the next check releases the result.
+            if (++checks == 2) executor.hold_poll = false;
+            return true;
+        }));
+        const auto b    = capture_prompt.wait(nullptr, timeout);
+        require(a.finish_reason == FinishReason::Cancelled && a.generated_token_ids.empty() &&
+                    !a.stats.timings.first_token_seconds && !sink.progress_events &&
+                    !sink.output_events,
+                "cancelled in-flight row published prompt progress or its first token");
+        require(b.finish_reason == FinishReason::OutputLimit && b.generated_token_ids.size() == 1,
+                "cancellation interrupted the other packed row");
+        require(executor.packed_commit.size() == 2 && executor.packed_commit[0].terminal &&
+                    executor.packed_commit[0].cancelled &&
+                    executor.packed_commit[0].accepted == 0 &&
+                    executor.packed_commit[1].accepted == 96,
+                "mixed prefill did not reject only the cancelled row");
+        return;
+    }
+    const auto a = short_prompt.wait(nullptr, timeout);
+    const auto b = capture_prompt.wait(nullptr, timeout);
+    require(a.finish_reason == FinishReason::OutputLimit &&
+                b.finish_reason == FinishReason::OutputLimit && a.generated_token_ids.size() == 1 &&
+                b.generated_token_ids.size() == 1,
+            "mixed Engine prefill did not produce exactly one token for each request");
+    require(executor.packed_commit.size() == 2 && executor.packed_commit[0].terminal &&
+                executor.packed_commit[0].accepted == 1 &&
+                executor.packed_commit[1].accepted == 96 && session.captures == 1 &&
+                session.finished_before_capture == 1,
+            "lightweight bind or terminal row prevented the co-batched input capture");
+}
+
 void independent_prefill(std::shared_ptr<const glm::ModelDefinition> definition) {
     auto layout   = plan(*definition);
     auto frontend = make_frontend();
@@ -1459,6 +1938,7 @@ void cancelled_prefix_statistics(std::shared_ptr<const glm::ModelDefinition> def
 int main(int argc, char** argv) {
     try {
         batch_geometry();
+        packed_work_contract();
         require(argc >= 2, "missing artifact directory");
         artifact::Reader reader(std::filesystem::path(argv[1]) / "model.ninfer");
         long_input_replacement(glm::read_definition(reader, {}));
@@ -1472,15 +1952,23 @@ int main(int argc, char** argv) {
         relocation_preflight_includes_destination_victims(glm::read_definition(reader, {}));
         transactions(glm::read_definition(reader, {}));
         capture_replacement_and_retry(glm::read_definition(reader, {}));
+        mixed_prefill_transaction(glm::read_definition(reader, {}));
+        packed_cache_hits(glm::read_definition(reader, {}));
         fragmented_capture(glm::read_definition(reader, {}));
         engine_pressure(glm::read_definition(reader, {}), false);
         engine_pressure(glm::read_definition(reader, {}), true);
         engine_stop(glm::read_definition(reader, {}));
+        engine_packed_prefill(glm::read_definition(reader, {}));
+        engine_packed_prefill(glm::read_definition(reader, {}), true);
         independent_prefill(glm::read_definition(reader, {}));
         cancelled_prefix_statistics(glm::read_definition(reader, {}));
         engine_pressure(glm::read_definition(reader, {}), false, true);
         auto mtp = glm::read_definition(reader, {.speculative = SpeculativeBackend::Mtp});
+        calibrate_attention_owners(mtp);
         expanded_membership(mtp);
+        owner_window_grants(mtp);
+        masked_block_at_context_boundary(
+            glm::read_definition(reader, {.speculative = SpeculativeBackend::DFlash2}));
         mtp_transactions(std::move(mtp));
         std::cout << "PASS GLM ADP binding, continuation, conversion, relocation and retirement\n";
     } catch (const std::exception& e) {

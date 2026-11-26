@@ -18,12 +18,31 @@ void SessionImpl::finish_result(ComputeResult result) {
     if (result.rows.size() != tx.members.size())
         throw std::logic_error("GLM5Next result changed its membership");
     tx.result.emplace(std::move(result));
+    const bool prefill = tx.kind == Kind::Prefill;
+    PrefillProgress progress;
+    if (prefill) progress.rows.reserve(tx.members.size());
     bool generated = false;
     for (std::size_t b = 0; b < tx.members.size(); ++b) {
-        const auto& row = tx.result->rows[b];
-        generated |= !row.tokens.empty();
+        const auto& row    = tx.result->rows[b];
+        const bool sampled = !row.tokens.empty();
+        generated |= sampled;
+        if (prefill) {
+            const auto& work = tx.rows[b];
+            const auto& s    = sequence(tx.members[b]);
+            const auto end   = work.main_frontier + row.processed;
+            if (sampled != work.sample || (sampled && row.tokens.size() != 1))
+                throw std::logic_error("prefill result changed its sampling rows");
+            progress.rows.push_back({
+                .summary                 = {s.request->summary.prompt_tokens, s.reused,
+                            s.reused ? PrefixReusePath::Checkpoint : PrefixReusePath::Root},
+                .processed_prompt_tokens = row.processed,
+                .complete                = sampled,
+                .capture_ready           = s.capture && s.captures[s.next_capture].frontier == end,
+            });
+        }
         if (tx.kind == Kind::Speculative
-                ? (row.drafts != tx.draft_extents[b] || row.processed != tx.draft_extents[b] + 1 ||
+                ? (row.drafts != tx.round->verify_drafts()[b] ||
+                   row.processed != tx.round->verify_drafts()[b] + 1 ||
                    row.accepted_drafts > row.drafts || row.tokens.size() != row.accepted_drafts + 1)
                 : (row.processed != tx.rows[b].ids.size()))
             throw std::logic_error("GLM5Next result changed its input extent");
@@ -40,23 +59,19 @@ void SessionImpl::finish_result(ComputeResult result) {
         batch.tokens_.resize(batch.stride_ * tx.members.size());
         batch.counts_.resize(tx.members.size());
         batch.failed_.resize(tx.members.size());
+        if (prefill) batch.sampled_.resize(tx.members.size());
         for (std::size_t b = 0; b < tx.members.size(); ++b) {
-            const auto& row = tx.result->rows[b];
-            if (row.tokens.empty()) throw std::logic_error("sampled batch has an empty row");
+            const auto& row    = tx.result->rows[b];
+            const bool sampled = !row.tokens.empty();
+            if (!prefill && !sampled) throw std::logic_error("decode has an empty sampled row");
+            if (prefill) batch.sampled_[b] = sampled;
             batch.counts_[b] = row.tokens.size();
             std::copy(row.tokens.begin(), row.tokens.end(),
                       batch.tokens_.begin() + b * batch.stride_);
             batch.failed_[b]              = reached_dead_end(row);
             sequence(tx.members[b]).phase = Phase::Pending;
         }
-        if (tx.kind == Kind::Prefill) {
-            const auto& s = sequence(tx.members[0]);
-            PrefillProgress progress;
-            progress.summary                 = {s.request->summary.prompt_tokens, s.reused,
-                                s.reused ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
-            progress.processed_prompt_tokens = tx.result->rows[0].processed;
-            progress.complete                = true;
-
+        if (prefill) {
             progress.pending.emplace(std::move(batch));
             events.push_back({tx.ticket, tx.members, std::move(progress)});
         } else {
@@ -87,16 +102,7 @@ void SessionImpl::finish_result(ComputeResult result) {
         prefixes[b]       = s.prefix.prepare(s.request->identity_view(s.ledger.view(staged)),
                                              completed[b].main_frontier);
     }
-    if (tx.kind == Kind::Prefill) {
-        const auto& s = sequence(tx.members[0]);
-        PrefillProgress progress;
-        progress.summary                 = {s.request->summary.prompt_tokens, s.reused,
-                            s.reused ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
-        progress.processed_prompt_tokens = tx.result->rows[0].processed;
-        progress.complete                = false;
-        progress.capture_ready =
-            s.capture && s.captures[s.next_capture].frontier == completed[0].main_frontier;
-
+    if (prefill) {
         tx.event.emplace(SessionEvent{tx.ticket, tx.members, std::move(progress)});
     } else if (tx.kind == Kind::Replay) {
         const auto& s = sequence(tx.members[0]);
@@ -156,6 +162,10 @@ void SessionImpl::retire_compute(const runtime::DeviceRetired& event) {
     if (tx.kind != Kind::Score)
         events.push_back({tx.ticket, tx.members,
                           runtime::ExecutionComplete{event.execution, tx.members.size()}});
+    if (tx.cost_query && tx.record_online_cost && !tx.discarded &&
+        std::ranges::none_of(tx.decisions, [](const auto& d) { return d.cancelled || d.failed; }))
+        cost_model.observe_retired_step(*tx.cost_query,
+                                        double(event.execution.latency.total_ns) * 1.0e-6);
     for (std::size_t b = 0; b < tx.members.size(); ++b) {
         if (!tx.discarded &&
             (tx.decisions.empty() || (!tx.decisions[b].cancelled && !tx.decisions[b].failed)))
@@ -185,6 +195,12 @@ CommitResult Session::commit(PendingBatch&& batch,
     for (std::size_t b = 0; b < decisions.size(); ++b) {
         const auto& decision = decisions[b];
         const auto produced  = tx.result->rows[b].tokens.size();
+        if (!batch.row_sampled(b)) {
+            if (decision.accepted_tokens || decision.failed ||
+                decision.terminal != decision.cancelled)
+                throw std::logic_error("invalid unsampled prefill decision");
+            continue;
+        }
         if ((decision.cancelled && decision.failed) || (decision.failed && !batch.failed_[b]) ||
             ((decision.cancelled || decision.failed)
                  ? (!decision.terminal || decision.accepted_tokens != 0)
@@ -209,9 +225,12 @@ CommitResult Session::commit(PendingBatch&& batch,
                 s.speculative.attempted_per_position.size());
             result.rows[b].speculative.accepted_per_position.reserve(
                 s.speculative.accepted_per_position.size());
-            physical.rows.push_back({p.member(s), tx.rows[b].states, decision.accepted_tokens,
+            const auto physical_count = batch.row_sampled(b) || decision.cancelled
+                                            ? decision.accepted_tokens
+                                            : static_cast<std::uint32_t>(tx.rows[b].ids.size());
+            physical.rows.push_back({p.member(s), tx.rows[b].states, physical_count,
                                      decision.terminal, decision.cancelled, decision.failed});
-            if (!decision.accepted_tokens) continue;
+            if (decision.cancelled || decision.failed) continue;
             const auto count = decision.accepted_tokens;
             s.ledger.prepare_append(count);
             const auto inputs = tx.kind == detail::ComputeTransaction::Kind::Speculative
@@ -220,7 +239,7 @@ CommitResult Session::commit(PendingBatch&& batch,
             completed[b]      = p.prepare_commit(s, tx.rows[b], inputs, false, *tx.completion);
         }
         for (std::size_t b = 0; b < decisions.size(); ++b) {
-            if (!decisions[b].accepted_tokens) continue;
+            if (decisions[b].cancelled || decisions[b].failed) continue;
             auto& s             = p.sequence(tx.members[b]);
             const auto accepted = std::span<const TokenId>(tx.result->rows[b].tokens)
                                       .first(decisions[b].accepted_tokens);
@@ -242,18 +261,14 @@ CommitResult Session::commit(PendingBatch&& batch,
         const auto& decision = decisions[b];
         auto& row            = result.rows[b];
         if (batch.decode_ && p.shape.draft_tokens) {
-            auto& stats         = s.speculative;
-            const auto drafted  = tx.result->rows[b].drafts;
-            const auto accepted = tx.result->rows[b].accepted_drafts;
-            stats.committed_draft_tokens += std::min(decision.accepted_tokens, accepted);
-            if (drafted)
-                ++stats.rounds;
-            else
-                ++stats.fallback_steps;
-            stats.drafted_tokens += drafted;
-            for (std::uint32_t i = 0; i < drafted; ++i) ++stats.attempted_per_position[i];
-            stats.accepted_tokens += accepted;
-            for (std::uint32_t i = 0; i < accepted; ++i) ++stats.accepted_per_position[i];
+            const auto& output = tx.result->rows[b];
+            auto* feedback     = p.shape.length_policy == SpeculativeLengthPolicy::Adaptive
+                                     ? &s.speculative_state
+                                     : nullptr;
+            speculative::record_speculative_commit(
+                s.speculative, feedback, decision, tx.could_speculate[b], output.drafts,
+                output.drafts, output.accepted_drafts, output.draft_confidences,
+                output.target_top1_probability);
         }
         row.speculative = s.speculative;
 
@@ -269,7 +284,9 @@ CommitResult Session::commit(PendingBatch&& batch,
                 std::span<const TokenId>(tx.result->rows[b].tokens).first(decision.accepted_tokens);
             s.ledger.append(tokens);
             s.prefix.commit(std::move(prefixes[b]));
-            s.phase         = decision.terminal ? detail::Phase::Finished : detail::Phase::Active;
+            s.phase         = !batch.row_sampled(b) ? detail::Phase::Prefill
+                              : decision.terminal   ? detail::Phase::Finished
+                                                    : detail::Phase::Active;
             row.disposition = decision.terminal ? runtime::CommitDisposition::Finishable
                                                 : runtime::CommitDisposition::Active;
             result.rows[b].capture_ready = s.capture_pending;

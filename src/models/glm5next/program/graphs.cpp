@@ -1,219 +1,138 @@
-#include "models/glm5next/program/graphs.h"
-
-#include "core/startup.h"
-#include "models/glm5next/program/graph_inputs.h"
 #include "models/glm5next/program/internal.h"
 
-#include <algorithm>
+#include "models/glm5next/program/graph_inputs.h"
 
 namespace ninfer::models::glm5next::detail {
-void Graphs::bind_sites(Round& round, int g, int c, int depth) {
-    auto& p        = owner_;
-    const auto& io = p.frame;
-    const auto add = [&](execution::MlaReadout call, int step) {
-        Site site{.call = call, .draft_step = step};
-        const auto visible = call.visible;
-        const auto sms     = p.cuda.multiprocessor_count();
-        if (call.index) {
-            site.index_profile = call.index_profile(visible, sms);
-            site.index.capture(p.cuda.stream(), [&] { call.indexer(visible, p.cuda); });
-        }
-        site.attention_profile = call.attention_profile(visible, sms);
-        site.attention.capture(p.cuda.stream(), [&] { call.attention(visible, p.cuda); });
-        round.sites.push_back(std::move(site));
+namespace {
+
+// Standalone patches use the bound operands. Inline recording uses the operands from the
+// same forward path that executes eagerly, with the execution view supplied by the suite.
+template <class Readout>
+auto capture_readout(Readout call, auto execute) {
+    return [call = std::move(call), execute](ops::ContextBucket bucket, CudaExecutionView cuda) {
+        (call.*execute)(bucket, cuda);
     };
-    if (p.parameters.mtp)
-        for (int step = 0; step < depth; ++step) {
-            auto call  = p.batch(io.mtp->draft_steps[step], 1, g, c, p.shape.max_context);
-            auto run   = p.mtp_run(step, call);
-            auto local = run.local_mla(p.mtp_selection(step, c));
-            add(local.readout(), step);
-        }
-    if (p.parameters.draft && depth) {
-        auto run = p.dflash_run(g, p.shape.max_context);
-        for (std::uint32_t i = 0; i < p.parameters.draft->layers.size(); ++i) {
-            auto layer = run.attention(i);
-            DraftSite site{.call = layer.readout()};
-            site.profile = site.call.profile(p.shape.max_context);
-            site.attention.capture(p.cuda.stream(),
-                                   [&] { site.call.execute(p.shape.max_context, p.cuda); });
-            round.draft_sites.push_back(std::move(site));
-        }
+}
+
+void bind_mla(std::vector<ContextBucketBinding>& bindings, DeviceContext& device,
+              ops::ContextBucketRange buckets, const execution::MlaReadout& call) {
+    const auto sms = device.execution_view().multiprocessor_count();
+    if (call.index)
+        bindings.push_back({buckets, [call, sms](auto b) { return call.index_profile(b, sms); },
+                            capture_readout(call, &execution::MlaReadout::indexer)});
+    bindings.push_back({buckets, [call, sms](auto b) { return call.attention_profile(b, sms); },
+                        capture_readout(call, &execution::MlaReadout::attention)});
+}
+
+void record_mla(const ReadoutRecorder& record, const execution::MlaReadout& expected,
+                const execution::MlaReadout& actual) {
+    if (expected.query.data != actual.query.data || expected.scratch.data != actual.scratch.data ||
+        expected.index != actual.index)
+        throw std::logic_error("GLM Graph readout binding differs from execution layout");
+    if (actual.index) record(capture_readout(actual, &execution::MlaReadout::indexer));
+    record(capture_readout(actual, &execution::MlaReadout::attention));
+}
+
+ReadoutCapture bind_mtp_step(RankProgramImpl& p, ops::ContextBucketRange buckets,
+                             std::uint32_t step, const execution::BatchView& batch) {
+    auto run   = p.mtp_run(step, batch);
+    auto local = run.local_mla(p.mtp_selection(step, batch.attention.rows));
+    auto call  = local.readout(buckets);
+    ReadoutCapture capture;
+    bind_mla(capture.readouts, p.device, buckets, call);
+    capture.body = [&p, step, batch, call](const ReadoutRecorder& record) {
+        p.mtp_forward(step, batch, [&](const execution::MlaReadout& actual) {
+            record_mla(record, call, actual);
+        });
+    };
+    return capture;
+}
+
+ReadoutCapture bind_dflash(RankProgramImpl& p, ops::ContextBucketRange buckets, int rows,
+                           int head_columns) {
+    ReadoutCapture capture;
+    std::vector<execution::DraftReadout> expected;
+    auto run = p.dflash_run(rows, buckets.first, head_columns);
+    for (std::uint32_t layer = 0; layer < p.parameters.draft->layers.size(); ++layer) {
+        const auto call = run.attention(layer).readout();
+        expected.push_back(call);
+        capture.readouts.push_back({buckets, [call](auto b) { return call.profile(b); },
+                                    capture_readout(call, &execution::DraftReadout::execute)});
     }
-    const int t                   = depth ? p.shape.draft_tokens + 1 : 1;
-    execution::StateUpdate update = execution::StepUpdate{};
-    if (depth) update.emplace<execution::RecordWindow>(*p.resources.kda_records);
-    auto run = p.text_run(p.decode_batch(t, g, c, p.shape.max_context), update);
+    capture.body = [&p, rows, head_columns, bucket = buckets.first,
+                    expected = std::move(expected)](const ReadoutRecorder& record) {
+        std::size_t next = 0;
+        p.dflash_forward(rows, bucket, head_columns, [&](const execution::DraftReadout& actual) {
+            const auto& call = expected.at(next++);
+            if (call.query.data != actual.query.data || call.scratch.data != actual.scratch.data)
+                throw std::logic_error(
+                    "DFlash Graph readout binding differs from execution layout");
+            record(capture_readout(actual, &execution::DraftReadout::execute));
+        });
+    };
+    return capture;
+}
+
+ProposalCapture bind_proposal(RankProgramImpl& p, ops::ContextBucketRange buckets,
+                              const speculative::RoundRoute& route,
+                              const execution::BatchView& main) {
+    const int head_columns = static_cast<int>(route.head_columns);
+    const auto drafts      = p.draft_proposals(
+        main.rows, p.parameters.mtp ? dimension(p.shape.draft_tokens) : head_columns);
+    ProposalCapture capture;
+    capture.prefix          = [&p, main] { p.begin_proposal(main, true); };
+    capture.before_readback = [&p] { p.timer.end_draft(true); };
+    capture.readback        = [&p, drafts] { p.readback_drafts(drafts); };
+    capture.drafts_ready    = [&p] { p.drafts_done.record_external(p.cuda.stream()); };
+    if (p.parameters.mtp) {
+        for (std::uint32_t step = 0; step < route.mtp_steps; ++step) {
+            const auto batch = p.batch(p.frame.mtp->draft_steps[step], 1, main.rows,
+                                       main.attention.rows, p.shape.max_context);
+            capture.steps.push_back({.forward = bind_mtp_step(p, buckets, step, batch)});
+        }
+    } else {
+        capture.steps.push_back({.forward = bind_dflash(p, buckets, main.rows, head_columns)});
+    }
+    return capture;
+}
+
+ResidentTargetCapture bind_target(RankProgramImpl& p, ops::ContextBucketRange buckets,
+                                  const execution::BatchView& main, int head_columns) {
+    const auto hidden = p.target_hidden(main);
+    ResidentTargetCapture capture;
+    std::vector<execution::MlaReadout> expected;
+    auto run = p.text_run(main, p.target_update(main.tokens));
     for (std::uint32_t i = 0; i < p.parameters.text.layers.size(); ++i) {
         if (!std::holds_alternative<execution::MlaParameters>(p.parameters.text.layers[i].mixer))
             continue;
-        auto local = run.local_mla(i);
-        add(local.readout(), -1);
+        auto local      = run.local_mla(i);
+        const auto call = local.readout(buckets);
+        expected.push_back(call);
+        bind_mla(capture.readouts, p.device, buckets, call);
     }
-}
-
-void Graphs::prepare_round(int g, int c, bool verify) {
-    const int depth = verify ? owner_.shape.draft_tokens : 0;
-    auto& p         = owner_;
-    auto& round     = rounds_[{g, c, verify}];
-    p.resources.workspace.reset_peak();
-    bind_sites(round, g, c, depth);
-    std::size_t cursor = 0;
-    const auto emit    = [&](const execution::MlaReadout& call) {
-        auto& site = round.sites.at(cursor++);
-        if (site.call.query.data != call.query.data || site.call.scratch.data != call.scratch.data)
-            throw std::logic_error("GLM Graph readout binding differs from execution layout");
-        if (call.index) site.index_node = site.index.append_to(p.cuda.stream());
-        site.attention_node = site.attention.append_to(p.cuda.stream());
+    capture.body = [&p, main, hidden, head_columns, expected = std::move(expected)](
+                       const ReadoutRecorder& record, const GraphBody&, const GraphBody& head,
+                       const StreamSectionRecorder&) {
+        p.begin_target(main, true);
+        if (main.tokens > 1) {
+            const auto steps  = p.parameters.mtp ? dimension(p.shape.draft_tokens) : head_columns;
+            const auto drafts = p.draft_proposals(main.rows, steps);
+            p.prepare_verify_inputs(main, drafts);
+        }
+        std::size_t next = 0;
+        p.target_forward(main, hidden, false, [&](const execution::MlaReadout& actual) {
+            record_mla(record, expected.at(next++), actual);
+        });
+        head();
+        p.timer.end_target(true);
     };
-    std::size_t draft_cursor = 0;
-    const auto draft_emit    = [&](const execution::DraftReadout& call) {
-        auto& site = round.draft_sites.at(draft_cursor++);
-        if (site.call.query.data != call.query.data || site.call.scratch.data != call.scratch.data)
-            throw std::logic_error("DFlash Graph readout binding differs from execution layout");
-        site.node = site.attention.append_to(p.cuda.stream());
+    capture.head = [&p, hidden, main] {
+        p.project_head(hidden.view({hidden.ne[0], main.tokens * main.rows}));
     };
-    const int t     = depth ? p.shape.draft_tokens + 1 : 1;
-    const auto main = p.decode_batch(t, g, c, p.shape.max_context);
-    const std::vector<std::uint32_t> draft(depth && p.parameters.draft ? 1 : depth,
-                                           p.shape.max_context);
-    round.graph.prepare(
-        p.cuda,
-        [&] { p.execute_round(main, draft, true, true, emit, &round.sections, draft_emit); },
-        p.parallel ? &*p.parallel : nullptr);
-    if (cursor != round.sites.size() || draft_cursor != round.draft_sites.size())
-        throw std::logic_error("GLM Graph readouts were not consumed");
-    round.workspace_bytes = p.resources.workspace.peak_used();
+    return capture;
 }
 
-void Graphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
-    auto& p           = owner_;
-    const int maximum = p.shape.draft_tokens;
-    for (const auto shape : p.resources.plan.batches->graph_shapes()) {
-        const int g = dimension(shape.rows), c = dimension(shape.attention_rows);
-        for (bool verify : {false, true}) {
-            if (verify && !maximum) continue;
-            const int depth = verify ? maximum : 0;
-            inputs.set(g, c, depth);
-            const auto main = p.decode_batch(verify ? maximum + 1 : 1, g, c, p.shape.max_context);
-            const std::vector<std::uint32_t> draft(depth && p.parameters.draft ? 1 : depth,
-                                                   p.shape.max_context);
-            const auto decide = [&] {
-                if (verify)
-                    p.accept_speculative(g);
-                else
-                    p.sample(g, SampleKind::NextToken);
-            };
-            if (preparation.capturing()) {
-                prepare_round(g, c, verify);
-                replay(main, draft, true, false);
-            } else {
-                p.execute_round(main, draft, true, false);
-            }
-            decide();
-            preparation.checkpoint();
-        }
-        if (maximum) {
-            inputs.set(g, c, maximum);
-            const auto main = p.decode_batch(maximum + 1, g, c, p.shape.max_context);
-            if (!preparation.capturing()) {
-                p.execute_speculative_commit(main, true, true);
-                preparation.checkpoint();
-                continue;
-            }
-            auto& commit = commits_[{g, c}];
-            p.resources.workspace.reset_peak();
-            commit.graph.prepare(
-                p.cuda,
-                [&] {
-                    p.execute_speculative_commit(main, true, true, &commit.repair, &commit.counts);
-                },
-                p.parallel ? &*p.parallel : nullptr);
-            commit.workspace_bytes = p.resources.workspace.peak_used();
-            workspace_peak_        = std::max(workspace_peak_, commit.workspace_bytes);
-            commit.graph.launch(p.cuda, p.parallel ? &*p.parallel : nullptr);
-            preparation.checkpoint();
-        }
-    }
-    for (const auto g : p.resources.plan.batches->graph_rows()) {
-        const auto representative = std::find_if(p.resources.plan.batches->graph_shapes().begin(),
-                                                 p.resources.plan.batches->graph_shapes().end(),
-                                                 [&](auto shape) { return shape.rows == g; });
-        for (bool verify : {false, true}) {
-            if (verify && !maximum) continue;
-            if (!preparation.capturing()) continue;
-            inputs.set(g, representative->attention_rows, verify ? maximum : 0);
-            auto& decision = decisions_[{g, verify}];
-            p.resources.workspace.reset_peak();
-            decision.graph.prepare(
-                p.cuda,
-                [&] {
-                    if (verify)
-                        p.accept_speculative(g);
-                    else
-                        p.sample(g, SampleKind::NextToken);
-                    p.copy_result(g, verify);
-                },
-                p.parallel ? &*p.parallel : nullptr);
-            decision.workspace_bytes = p.resources.workspace.peak_used();
-            workspace_peak_          = std::max(workspace_peak_, decision.workspace_bytes);
-            decision.graph.launch(p.cuda, p.parallel ? &*p.parallel : nullptr);
-            preparation.checkpoint();
-        }
-    }
-}
-
-void Graphs::replay(const execution::BatchView& main, std::span<const std::uint32_t> draft,
-                    bool head, bool read_drafts) {
-    auto& p       = owner_;
-    auto& round   = rounds_.at({main.rows, main.attention.rows, !draft.empty()});
-    const int sms = p.cuda.multiprocessor_count();
-    for (auto& site : round.sites) {
-        const auto bound =
-            site.draft_step < 0 ? main.attention.max_visible_tokens : draft[site.draft_step];
-        if (site.call.index) {
-            const auto profile = site.call.index_profile(bound, sms);
-            if (profile != site.index_profile) {
-                site.index.capture(p.cuda.stream(), [&] { site.call.indexer(bound, p.cuda); });
-                round.graph.executable.update_child(site.index_node, site.index);
-                site.index_profile = profile;
-            }
-        }
-        const auto profile = site.call.attention_profile(bound, sms);
-        if (profile != site.attention_profile) {
-            site.attention.capture(p.cuda.stream(), [&] { site.call.attention(bound, p.cuda); });
-            round.graph.executable.update_child(site.attention_node, site.attention);
-            site.attention_profile = profile;
-        }
-    }
-    for (auto& site : round.draft_sites) {
-        const auto bound   = draft.front();
-        const auto profile = site.call.profile(bound);
-        if (profile != site.profile) {
-            site.attention.capture(p.cuda.stream(), [&] { site.call.execute(bound, p.cuda); });
-            round.graph.executable.update_child(site.node, site.attention);
-            site.profile = profile;
-        }
-    }
-    round.sections.head.set_enabled(round.graph.executable, head);
-    round.sections.drafts.set_enabled(round.graph.executable, read_drafts);
-    round.graph.launch(p.cuda, p.parallel ? &*p.parallel : nullptr);
-    workspace_peak_ = std::max(workspace_peak_, round.workspace_bytes);
-}
-
-void Graphs::decide(int g, bool verify) {
-    auto& decision = decisions_.at({g, verify});
-    decision.graph.launch(owner_.cuda, owner_.parallel ? &*owner_.parallel : nullptr);
-    workspace_peak_ = std::max(workspace_peak_, decision.workspace_bytes);
-}
-
-void Graphs::commit(int g, int c, bool repair, bool count_tokens) {
-    auto& commit = commits_.at({g, c});
-    if (owner_.parameters.mtp) commit.repair.set_enabled(commit.graph.executable, repair);
-    commit.counts.set_enabled(commit.graph.executable, count_tokens);
-    commit.graph.launch(owner_.cuda, owner_.parallel ? &*owner_.parallel : nullptr);
-    workspace_peak_ = std::max(workspace_peak_, commit.workspace_bytes);
-}
+} // namespace
 
 GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode) {
     if (!resources.plan.use_cuda_graph || graphs) return {};
@@ -225,8 +144,51 @@ GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode
     // Retain inputs on failure until the executor aborts communication and drains the Program.
     graph_inputs = std::make_unique<GraphInputs>(*this);
     graph_inputs->prepare();
-    graphs = std::make_unique<Graphs>(*this);
-    graphs->prepare(*graph_inputs, observation);
+    graphs =
+        std::make_unique<models::DecodeGraphSuite>(device, resources.workspace, shape.speculative,
+                                                   false, parallel ? &*parallel : nullptr, nullptr);
+
+    const auto buckets = ops::ContextBucketRange::through(shape.max_context);
+    execution::BatchView main;
+    std::vector<ops::ContextBucket> draft_buckets;
+    DecodeGraphBindings bindings;
+    bindings.stage = [&](const speculative::RoundRoute& route) {
+        const int rows = dimension(route.shape.rows), local = dimension(route.shape.attention_rows),
+                  width = dimension(route.width);
+        const int depth = static_cast<int>(route.verification_limit(shape.speculative));
+        graph_inputs->set(rows, local, width, depth);
+        main = decode_batch(width, rows, local, shape.max_context);
+        const auto steps =
+            route.mtp_steps ? route.mtp_steps : std::uint32_t(route.head_columns != 0);
+        draft_buckets.assign(steps, buckets.last);
+        return TargetReplay{.bucket = buckets.last, .proposal = {.buckets = draft_buckets}};
+    };
+    bindings.warmup_proposal = [&](const speculative::RoundRoute& route) {
+        const std::vector<std::uint32_t> bounds(draft_buckets.size(), shape.max_context);
+        execute_proposal(main, bounds, static_cast<int>(route.head_columns), false);
+    };
+    bindings.warmup_target = [&](const speculative::RoundRoute&) { execute_target(main, true); };
+    bindings.proposal      = [&](const speculative::RoundRoute& route) {
+        return bind_proposal(*this, buckets, route, main);
+    };
+    bindings.target = [&](const speculative::RoundRoute& route) -> TargetCapture {
+        return bind_target(*this, buckets, main, static_cast<int>(route.head_columns));
+    };
+    bindings.decision = [&](const speculative::RoundRoute& route) {
+        const bool verify = route.width > 1;
+        if (verify)
+            accept_speculative(main.rows, main.tokens, static_cast<int>(route.head_columns));
+        else
+            sample(main.rows, SampleKind::NextToken);
+        copy_result(main.rows, verify);
+    };
+    if (shape.draft_tokens) {
+        bindings.commit = [&](const speculative::RoundRoute&, const SectionRecorder& repair,
+                              const SectionRecorder& counts) {
+            execute_speculative_commit(main, true, true, repair, counts);
+        };
+    }
+    graphs->prepare(*resources.plan.batches, *resources.plan.decode_routes, observation, bindings);
     observation.checkpoint();
     graph_inputs.reset();
     const auto result = observation.sample();
@@ -245,4 +207,5 @@ void RankProgramImpl::release_graphs() {
     graphs.reset();
     graph_inputs.reset();
 }
+
 } // namespace ninfer::models::glm5next::detail

@@ -1,5 +1,5 @@
 #include "ninfer/ops/vocabulary.h"
-#include "ops/common/host/operands.h"
+#include "ops/sampling/acceptance/operands.h"
 #include "ops/sampling/acceptance/kernel.cuh"
 
 namespace ninfer::ops {
@@ -12,10 +12,12 @@ struct Support {
     int ids[20], size;
 };
 
+template <bool RelativeLse = false>
 __device__ void distribution(const unsigned long long* input, int cap, int tokens, int batch,
                              int ranks, int row, int col, const SamplingConfig& cfg, Support& s) {
     const int rank    = threadIdx.x & 31;
-    const auto* first = input + (std::int64_t(row) * tokens + col) * cap;
+    const int width   = cap + RelativeLse;
+    const auto* first = input + (std::int64_t(row) * tokens + col) * width;
     const int limit   = cfg.temperature > 0 ? sampling_candidate_cap(cfg, 20) : 1;
     if (ranks <= 2) {
         auto key = rank < cap ? first[rank] : 0ULL;
@@ -24,7 +26,7 @@ __device__ void distribution(const unsigned long long* input, int cap, int token
             // upper half of a 64-element bitonic merge. Only five shuffles remain.
             const int reverse = 31 - rank;
             const auto other =
-                reverse < cap ? first[std::int64_t(batch) * tokens * cap + reverse] : 0ULL;
+                reverse < cap ? first[std::int64_t(batch) * tokens * width + reverse] : 0ULL;
             key = key > other ? key : other;
 #pragma unroll
             for (int distance = 16; distance; distance /= 2) {
@@ -44,7 +46,7 @@ __device__ void distribution(const unsigned long long* input, int cap, int token
         }
     } else {
         const auto* list = rank < ranks
-                               ? input + ((std::int64_t(rank) * batch + row) * tokens + col) * cap
+                               ? input + ((std::int64_t(rank) * batch + row) * tokens + col) * width
                                : nullptr;
         int cursor = 0, count = 0;
         for (; count < limit; ++count) {
@@ -73,17 +75,36 @@ __device__ void distribution(const unsigned long long* input, int cap, int token
     __syncwarp();
 }
 
+template <bool RelativeLse>
 __global__ void sample_kernel(const unsigned long long* keys, int cap, int batch, int ranks,
                               const SamplingConfig* configs, const int* positions, int purpose,
-                              int* output, const int* live) {
+                              int* output, const int* live, float* probabilities) {
     __shared__ Support s;
     const int row = blockIdx.x;
     if (live && !live[row]) {
-        if (!threadIdx.x) output[row] = 0;
+        if (!threadIdx.x) {
+            output[row] = 0;
+            if constexpr (RelativeLse) probabilities[row] = 0.0f;
+        }
         return;
     }
     const auto cfg = configs[row];
-    distribution(keys, cap, 1, batch, ranks, row, 0, cfg, s);
+    distribution<RelativeLse>(keys, cap, 1, batch, ranks, row, 0, cfg, s);
+    if constexpr (RelativeLse) {
+        const int rank = threadIdx.x;
+        float mass     = 0.0f;
+        if (s.size && rank < ranks) {
+            const auto* record = keys + (std::int64_t(rank) * batch + row) * (cap + 1);
+            if (record[0]) {
+                const float temperature = cfg.temperature > 0.0f ? cfg.temperature : 1.0f;
+                const float offset      = scaled_score_difference(score_from_order_key(record[0]),
+                                                                  s.scores[0], temperature);
+                mass = __expf(offset + __uint_as_float(static_cast<unsigned int>(record[cap])));
+            }
+        }
+        mass = warp_reduce_sum(mass);
+        if (rank == 0) probabilities[row] = s.size ? 1.0f / mass : 0.0f;
+    }
     if (threadIdx.x == 0) {
         int token = -1;
         if (s.size)
@@ -107,7 +128,7 @@ __global__ void accept_kernel(const unsigned long long* keys, int cap, int draft
         if (!threadIdx.x) counts[row] = 0;
         return;
     }
-    const int extent = extents[row], old_length = positions[row];
+    const int extent = drafts.extent(extents[row], drafts_count), old_length = positions[row];
     const auto cfg = configs[row];
     __shared__ Support support[16];
     __shared__ int terminals[16];
@@ -165,7 +186,7 @@ __device__ float cumulative_weight(float weight) {
 // the critical path by a single Top-K merge instead of D serial distribution builds.
 __global__ void accept_sparse_kernel(const unsigned long long* keys, int cap, int d, int batch,
                                      int ranks, const SamplingConfig* configs, TokenRows drafts,
-                                     const int* ids, const float* q, const int* extents,
+                                     SparseProposalView proposal, const int* extents,
                                      const int* positions, int* licensed, int* counts,
                                      const int* live) {
     const int row = blockIdx.x, col = threadIdx.x / 32, lane = threadIdx.x & 31;
@@ -175,7 +196,7 @@ __global__ void accept_sparse_kernel(const unsigned long long* keys, int cap, in
         if (!threadIdx.x) counts[row] = 0;
         return;
     }
-    const int extent = extents[row], position = positions[row];
+    const int extent = drafts.extent(extents[row], d), position = positions[row];
     const auto cfg = configs[row];
     __shared__ Support supports[16];
     __shared__ int rejected[16], terminal[16];
@@ -192,9 +213,8 @@ __global__ void accept_sparse_kernel(const unsigned long long* keys, int cap, in
             const int token = lane < s.size ? s.ids[lane] : INT_MAX;
             float weight    = lane < s.size ? s.probabilities[lane] : 0.0F;
             if (col < extent) {
-                const auto at     = (std::int64_t(row) * d + col) * 16 + lane;
-                const float own_q = lane < 16 ? q[at] : 0.0F;
-                const int own_id  = own_q > 0 ? ids[at] : INT_MAX;
+                const float own_q = lane < 16 ? proposal.q.at(row, col)[lane] : 0.0F;
+                const int own_id  = own_q > 0 ? proposal.ids.at(row, col)[lane] : INT_MAX;
                 const float pd    = warp_sum(token == draft ? weight : 0.0F);
                 const float qd    = warp_sum(own_id == draft ? own_q : 0.0F);
                 const float u     = sampling_uniform(cfg.seed, position + col + 1,
@@ -245,9 +265,10 @@ __global__ void accept_sparse_kernel(const unsigned long long* keys, int cap, in
     }
 }
 
-void check_keys(const Tensor& keys, const SamplingConfig* configs, const char* op, Device device) {
-    if ((keys.ne[0] != 1 && keys.ne[0] != 20) || keys.ne[1] < 1 || keys.ne[1] > 16 ||
-        keys.ne[2] < 1 || keys.ne[3] < 1 || keys.ne[3] > 16 || !configs ||
+void check_keys(const Tensor& keys, const SamplingConfig* configs, const char* op, Device device,
+                bool relative_lse = false) {
+    if ((keys.ne[0] != 1 + relative_lse && keys.ne[0] != 20 + relative_lse) || keys.ne[1] < 1 ||
+        keys.ne[1] > 16 || keys.ne[2] < 1 || keys.ne[3] < 1 || keys.ne[3] > 16 || !configs ||
         !operand::aligned(configs, alignof(SamplingConfig)))
         throw std::invalid_argument(std::string(op) + ": invalid candidates/configs");
     operand::tensor(keys, DType::I64, {keys.ne[0], keys.ne[1], keys.ne[2], keys.ne[3]}, 8, op,
@@ -258,36 +279,48 @@ void check_live(const Tensor& live, int batch, const char* op, Device device) {
     if (live.data) operand::tensor(live, DType::I32, {batch}, 4, op, "live rows", device);
 }
 
-void check_outputs(std::initializer_list<Tensor*> outputs,
-                   std::initializer_list<const Tensor*> inputs, const SamplingConfig* configs,
-                   int batch, const char* op) {
-    for (auto current = outputs.begin(); current != outputs.end(); ++current) {
-        const auto range = operand::range(**current, op);
-        for (const auto* input : inputs)
-            if (input->data) operand::disjoint(range, operand::strided_range(*input, op), op);
-        operand::disjoint(range, operand::range(configs, sizeof(SamplingConfig) * batch, op), op);
-        for (auto earlier = outputs.begin(); earlier != current; ++earlier)
-            operand::disjoint(range, operand::range(**earlier, op), op);
+template <bool RelativeLse>
+void sample_candidates(const Tensor& keys, const SamplingConfig* configs,
+                       const Tensor& logical_positions, int purpose, Tensor& output,
+                       Tensor* probabilities, const Tensor& live_rows,
+                       CudaExecutionView execution) {
+    constexpr const char* op = "sample_vocabulary_candidates";
+    check_keys(keys, configs, op, execution.device(), RelativeLse);
+    if (keys.ne[1] != 1) throw std::invalid_argument("sample_vocabulary_candidates: expected T=1");
+    const int batch = keys.ne[2];
+    check_live(live_rows, batch, op, execution.device());
+    operand::tensor(logical_positions, DType::I32, {batch}, 4, op, "positions", execution.device());
+    operand::tensor(output, DType::I32, {batch}, 4, op, "output", execution.device());
+    if constexpr (RelativeLse) {
+        operand::tensor(*probabilities, DType::FP32, {batch}, 4, op, "top1 probabilities",
+                        execution.device());
+        check_outputs({&output, probabilities}, {&keys, &logical_positions, &live_rows}, configs,
+                      batch, op);
+    } else {
+        check_outputs({&output}, {&keys, &logical_positions, &live_rows}, configs, batch, op);
     }
+    sample_kernel<RelativeLse><<<batch, 32, 0, execution.stream()>>>(
+        static_cast<const unsigned long long*>(keys.data), keys.ne[0] - RelativeLse, batch,
+        keys.ne[3], configs, static_cast<const int*>(logical_positions.data), purpose,
+        static_cast<int*>(output.data), static_cast<const int*>(live_rows.data),
+        RelativeLse ? static_cast<float*>(probabilities->data) : nullptr);
+    CUDA_CHECK(cudaGetLastError());
 }
 } // namespace
 
 void sample_vocabulary_candidates(const Tensor& keys, const SamplingConfig* configs,
                                   const Tensor& logical_positions, int purpose, Tensor& output,
                                   const Tensor& live_rows, CudaExecutionView execution) {
-    constexpr const char* op = "sample_vocabulary_candidates";
-    check_keys(keys, configs, op, execution.device());
-    if (keys.ne[1] != 1) throw std::invalid_argument("sample_vocabulary_candidates: expected T=1");
-    const int batch = keys.ne[2];
-    check_live(live_rows, batch, op, execution.device());
-    operand::tensor(logical_positions, DType::I32, {batch}, 4, op, "positions", execution.device());
-    operand::tensor(output, DType::I32, {batch}, 4, op, "output", execution.device());
-    check_outputs({&output}, {&keys, &logical_positions, &live_rows}, configs, batch, op);
-    sample_kernel<<<batch, 32, 0, execution.stream()>>>(
-        static_cast<const unsigned long long*>(keys.data), keys.ne[0], batch, keys.ne[3], configs,
-        static_cast<const int*>(logical_positions.data), purpose, static_cast<int*>(output.data),
-        static_cast<const int*>(live_rows.data));
-    CUDA_CHECK(cudaGetLastError());
+    sample_candidates<false>(keys, configs, logical_positions, purpose, output, nullptr, live_rows,
+                             execution);
+}
+
+void sample_vocabulary_candidates(const Tensor& records, const SamplingConfig* configs,
+                                  const Tensor& logical_positions, int purpose, Tensor& output,
+                                  Tensor& top1_probabilities, const Tensor& live_rows,
+                                  CudaExecutionView execution) {
+    sample_candidates<true>(records, configs, logical_positions, purpose, output,
+                            &top1_probabilities, live_rows, execution);
 }
 
 void accept_vocabulary_candidates(const Tensor& keys, const SamplingConfig* configs,
@@ -300,7 +333,8 @@ void accept_vocabulary_candidates(const Tensor& keys, const SamplingConfig* conf
     const int d = keys.ne[1] - 1, batch = keys.ne[2];
     check_live(live_rows, batch, op, execution.device());
     if (d < 1) throw std::invalid_argument("accept_vocabulary_candidates: expected D>=1");
-    operand::strided_tensor(drafts, DType::I32, {d, batch}, 4, op, "drafts", execution.device());
+    operand::strided_tensor(drafts, DType::I32, {drafts.ne[0], batch}, 4, op, "drafts",
+                            execution.device());
     operand::tensor(current_extents, DType::I32, {batch}, 4, op, "extents", execution.device());
     operand::tensor(base_positions, DType::I32, {batch}, 4, op, "base positions",
                     execution.device());
@@ -329,11 +363,14 @@ void accept_vocabulary_candidates_sparse(const Tensor& keys, const SamplingConfi
     const int d = keys.ne[1] - 1, batch = keys.ne[2];
     check_live(live_rows, batch, op, execution.device());
     if (d < 1) throw std::invalid_argument(std::string(op) + ": expected D>=1");
-    operand::strided_tensor(drafts, DType::I32, {d, batch}, 4, op, "drafts", execution.device());
-    operand::tensor(candidate_ids, DType::I32, {16, d, batch}, 4, op, "candidate IDs",
-                    execution.device());
-    operand::tensor(proposal_q, DType::FP32, {16, d, batch}, 4, op, "proposal q",
-                    execution.device());
+    operand::strided_tensor(drafts, DType::I32, {drafts.ne[0], batch}, 4, op, "drafts",
+                            execution.device());
+    if (drafts.ne[0] > 15)
+        throw std::invalid_argument(std::string(op) + ": proposal width exceeds 15");
+    sparse_candidate_plane(candidate_ids, DType::I32, drafts.ne[0], batch, op, "candidate IDs",
+                           execution.device());
+    sparse_candidate_plane(proposal_q, DType::FP32, drafts.ne[0], batch, op, "proposal q",
+                           execution.device());
     operand::tensor(current_extents, DType::I32, {batch}, 4, op, "extents", execution.device());
     operand::tensor(base_positions, DType::I32, {batch}, 4, op, "positions", execution.device());
     operand::tensor(licensed_tokens, DType::I32, {d + 1, batch}, 4, op, "tokens",
@@ -345,10 +382,10 @@ void accept_vocabulary_candidates_sparse(const Tensor& keys, const SamplingConfi
                   configs, batch, op);
     accept_sparse_kernel<<<batch, (d + 1) * 32, 0, execution.stream()>>>(
         static_cast<const unsigned long long*>(keys.data), keys.ne[0], d, batch, keys.ne[3],
-        configs, token_rows(drafts), static_cast<const int*>(candidate_ids.data),
-        static_cast<const float*>(proposal_q.data), static_cast<const int*>(current_extents.data),
-        static_cast<const int*>(base_positions.data), static_cast<int*>(licensed_tokens.data),
-        static_cast<int*>(licensed_counts.data), static_cast<const int*>(live_rows.data));
+        configs, token_rows(drafts), sparse_proposal(candidate_ids, proposal_q),
+        static_cast<const int*>(current_extents.data), static_cast<const int*>(base_positions.data),
+        static_cast<int*>(licensed_tokens.data), static_cast<int*>(licensed_counts.data),
+        static_cast<const int*>(live_rows.data));
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops

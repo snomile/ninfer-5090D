@@ -40,12 +40,14 @@ void control_layout(LayoutBuilder& b, FrameLayout& out, PhysicalBatchShape shape
                                       global.live_rows.region.offset,
                                   256};
     if (out.speculative) out.speculative->extents = rows();
-    if (out.dflash) out.dflash->valid_columns = rows();
+    if (out.dflash) {
+        out.dflash->valid_columns = rows();
+        out.dflash->proposal_rows = rows();
+    }
     if (out.mtp) {
         auto& m = *out.mtp;
         m.draft_steps.resize(width - 1);
         for (auto& step : m.draft_steps) step = metadata(global_rows);
-        m.skip_first = rows();
     }
     if (out.sampling)
         out.sampling =
@@ -76,8 +78,9 @@ void control_layout(LayoutBuilder& b, FrameLayout& out, PhysicalBatchShape shape
     out.ingress = {global.anchors.region.offset, ingress_end - global.anchors.region.offset, 256};
     global.accepted_columns = rows();
     global.count_columns    = rows();
-    local.accepted_columns  = locals();
-    local.active_columns    = locals();
+    if (out.mtp) out.mtp->skip_first = rows();
+    local.accepted_columns = locals();
+    local.active_columns   = locals();
     if (out.speculative) out.speculative->last_columns = rows();
     const auto commit_end = b.finish(256);
     out.commit_ingress    = {global.accepted_columns.region.offset,
@@ -97,10 +100,11 @@ void draft_ids(FrameLayout& out, int rows) {
 }
 } // namespace
 
-void reshape_frame_controls(FrameLayout& out, PhysicalBatchShape shape, std::uint32_t width) {
+void reshape_frame_controls(FrameLayout& out, PhysicalBatchShape shape) {
+    const auto width    = std::uint32_t(out.pending_hidden.shape[1]);
     const auto capacity = std::uint32_t(out.pending_hidden.shape[2]);
     if (!shape.rows || !shape.attention_rows || shape.rows > capacity ||
-        shape.attention_rows > capacity || width != std::uint32_t(out.pending_hidden.shape[1]))
+        shape.attention_rows > shape.rows)
         throw std::invalid_argument("GLM frame controls exceed their physical capacity");
     LayoutBuilder b;
     if (out.ingress.offset) (void)b.add(out.ingress.offset, 1, "frame prefix");
@@ -116,6 +120,13 @@ void reshape_frame_controls(FrameLayout& out, PhysicalBatchShape shape, std::uin
                                             256, "generated tokens");
         out.output_counts =
             output.add_tensor(DType::I32, {dimension(shape.rows)}, 256, "generated token counts");
+        if (out.speculative) {
+            const auto rows = dimension(shape.rows), steps = dimension(width - 1);
+            out.top1_probabilities =
+                output.add_tensor(DType::FP32, {rows}, 256, "target top-1 probabilities");
+            out.draft_confidences =
+                output.add_tensor(DType::FP32, {rows * steps}, 256, "draft confidences");
+        }
         out.result_egress = {begin, output.finish() - begin, 256};
         if (out.speculative)
             out.speculative->drafts = output.add_tensor(
@@ -164,6 +175,28 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
     };
     out.main = metadata(columns, true);
     local_batch(out.main, columns, local.main_tables);
+    if (s.purpose == EnginePurpose::Generation) {
+        auto& packed      = out.packed_prefill.emplace();
+        const int chunk   = dimension(s.prefill_chunk);
+        const auto ragged = [&] {
+            return RaggedLayout{tensor(DType::I32, {batch + 1}, "ragged prefix lengths"), rows(),
+                                tensor(DType::I32, {chunk}, "ragged token segments")};
+        };
+        const auto offsets    = [&] { return tensor(DType::I64, {batch}, "packed State offsets"); };
+        packed.global         = ragged();
+        packed.local          = ragged();
+        packed.source_offsets = offsets();
+        packed.destination_offsets = offsets();
+        packed.local_tables        = rows();
+        packed.sampled_offsets     = offsets();
+        if (p.mtp)
+            packed.mtp =
+                PackedMtpLayout{ragged(), rows(), rows(), rows(), rows(), offsets(), offsets()};
+        if (p.draft)
+            packed.dflash = PackedDFlashLayout{
+                ragged(), tensor(DType::I32, {chunk}, "DFlash source indices"),
+                tensor(DType::I32, {chunk}, "DFlash local rank indices")};
+    }
     if (p.vision) out.visual_indices = tensor(DType::I32, {columns}, "visual embedding indices");
     const auto host_end = b.finish(256);
     out.host_ingress    = {out.ingress.offset, host_end - out.ingress.offset, 256};
@@ -229,8 +262,9 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         const auto& end      = out.grammar_masks->region;
         out.sampling_ingress = {begin, end.offset + end.bytes - begin, 256};
         if (p.local.size > 1) {
-            constexpr int n = DistributedVocabulary::candidates;
-            out.candidates  = tensor(DType::I64, {n, width, batch}, "local vocabulary candidates");
+            const int n    = out.speculative ? DistributedVocabulary::candidates_with_lse
+                                             : DistributedVocabulary::candidates;
+            out.candidates = tensor(DType::I64, {n, width, batch}, "local vocabulary candidates");
             out.gathered_candidates = tensor(DType::I64, {n, width, batch, dimension(p.local.size)},
                                              "gathered vocabulary candidates");
         }
@@ -238,6 +272,11 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         out.output_counts = rows();
         const auto first  = out.sampled_ids->region.offset;
         auto last         = out.output_counts->region;
+        if (out.speculative) {
+            out.top1_probabilities = tensor(DType::FP32, {batch}, "target top-1 probabilities");
+            out.draft_confidences = tensor(DType::FP32, {batch * (width - 1)}, "draft confidences");
+            last                  = out.draft_confidences->region;
+        }
         out.result_egress = {first, last.offset + last.bytes - first, 256};
         if (out.speculative) {
             out.speculative->drafts = out.mtp

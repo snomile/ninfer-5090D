@@ -13,10 +13,11 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& values, const Sequ
                                  DeviceContext& context, const StartupObserver& observer)
     : parameters(values), device(context), capacity(plan.capacity),
       max_concurrency(plan.max_concurrency), batch_execution(plan.batch_execution),
-      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      backend(plan.speculative_backend), proposal_head(plan.proposal_head),
-      use_cuda_graph(plan.use_cuda_graph), kv_storage(plan.kv_storage),
-      workspace_plan(plan.workspace), resources(context, plan.persistent, plan.workspace, observer),
+      decode_routes(plan.decode_routes), prefill_chunk(plan.prefill_chunk),
+      draft_window(plan.draft_window), backend(plan.speculative_backend),
+      proposal_head(plan.proposal_head), use_cuda_graph(plan.use_cuda_graph),
+      kv_storage(plan.kv_storage), workspace_plan(plan.workspace),
+      resources(context, plan.persistent, plan.workspace, observer),
       context_counts(plan.persistent.pinned_context_counts_bytes()),
       residencies(plan.max_concurrency), validation_marks(plan.max_concurrency),
       result_ready(context), drafts_ready(context), compute_retired(context),
@@ -156,7 +157,7 @@ void RankProgramImpl::drain() {
     };
     attempt([&] { device.bind_to_current_thread(); });
     if (compute && compute->text) attempt([&] { compute->text->cancel(); });
-    if (graphs) attempt([&] { graphs->cancel(); });
+    if (compute && compute->graph_target) attempt([&] { compute->graph_target->cancel(); });
     if (resources.moe) {
         attempt([&] { resources.moe->cancel(); });
         attempt([&] { resources.moe->synchronize(); });

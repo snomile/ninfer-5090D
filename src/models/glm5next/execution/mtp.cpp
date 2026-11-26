@@ -6,19 +6,21 @@
 #include "ninfer/ops/residual_add_rmsnorm.h"
 #include "ninfer/ops/rmsnorm.h"
 
+#include <algorithm>
+
 namespace ninfer::models::glm5next::execution {
 namespace {
-void prepare_stem(const Parameters& p, const BatchView& batch, const Tensor& hidden,
-                  Tensor& residual, Tensor& normalized, MemoryArena& arena,
+void prepare_stem(const Parameters& p, const Tensor& ids, const Tensor& positions,
+                  const Tensor& hidden, Tensor& residual, Tensor& normalized, MemoryArena& arena,
                   CudaExecutionView cuda) {
-    const auto& c = p.profile->config.text;
-    const auto& m = *p.mtp;
-    auto scope    = arena.scope();
-    auto b        = workspace::mtp_stem(arena, c, batch.tokens * batch.rows);
-    ops::embedding(batch.ids.view({batch.tokens * batch.rows}), m.embedding, b.embedding, cuda);
+    const auto& c     = p.profile->config.text;
+    const auto& m     = *p.mtp;
+    auto scope        = arena.scope();
+    const int columns = hidden.ne[1];
+    auto b            = workspace::mtp_stem(arena, c, columns);
+    ops::embedding(ids.view({columns}), m.embedding, b.embedding, cuda);
     ops::paired_rmsnorm_concat(b.embedding, hidden, m.embedding_norm, m.hidden_norm,
-                               batch.positions.view({batch.tokens * batch.rows}), c.norm_epsilon,
-                               b.normalized, cuda);
+                               positions.view({columns}), c.norm_epsilon, b.normalized, cuda);
     ops::linear(b.normalized, m.stem.weight, residual, m.stem.policy, arena, cuda);
     ops::rmsnorm(residual, m.input_norm, c.norm_epsilon, false, normalized, cuda);
 }
@@ -37,19 +39,20 @@ MtpRun::MtpRun(const Parameters& p, MtpExecution execution, BatchView batch, Cud
 }
 
 void MtpRun::stem(const Tensor& conditioning) {
-    prepare_stem(parameters_, batch_, conditioning, roots_.residual, roots_.input,
-                 execution_.workspace, cuda_);
+    prepare_stem(parameters_, batch_.ids, batch_.positions, conditioning, roots_.residual,
+                 roots_.input, execution_.workspace, cuda_);
 }
 
 MlaRun MtpRun::local_mla(MlaSelection selection) {
     const auto& p     = *parameters_.profile;
     const auto& local = batch_.attention;
-    return MlaRun(
-        attention_.input.data ? attention_.input : roots_.input, p.config.text,
-        parameters_.mtp->attention, {local.positions, local.valid_columns, local.table_rows},
-        execution_.before, execution_.after, execution_.cache.layer(0), {}, local.selection_rows,
-        local.max_visible_tokens, attention_.output.data ? attention_.output : roots_.output,
-        execution_.workspace, cuda_, selection);
+    const auto bucket = ops::select_context_bucket(std::max(1U, local.max_visible_tokens));
+    return MlaRun(attention_.input.data ? attention_.input : roots_.input, p.config.text,
+                  parameters_.mtp->attention,
+                  {local.positions, local.valid_columns, local.table_rows}, execution_.before,
+                  execution_.after, execution_.cache.layer(0), {}, local.selection_rows, bucket,
+                  attention_.output.data ? attention_.output : roots_.output, execution_.workspace,
+                  cuda_, selection);
 }
 
 void MtpRun::local_attention(MlaSelection selection, const MlaSubmit& submit) {
@@ -99,9 +102,20 @@ void mtp_history(const Parameters& p, MtpExecution e, const BatchView& batch,
     auto scope      = e.workspace.scope();
     auto residual   = e.workspace.alloc(DType::BF16, {h, t * rows});
     auto normalized = e.workspace.alloc(DType::BF16, {h, t * rows});
-    prepare_stem(p, batch, conditioning, residual, normalized, e.workspace, cuda);
+    prepare_stem(p, batch.ids, batch.positions, conditioning, residual, normalized, e.workspace,
+                 cuda);
     mla_history(normalized.view({h, t, rows}), p.mtp->attention,
                 {local.positions, local.valid_columns, local.table_rows}, e.before, e.after,
                 e.cache.layer(0), e.workspace, cuda);
+}
+
+void mtp_history(const Parameters& p, MtpExecution e, const ops::KpoolMlaRaggedBatchView& batch,
+                 const Tensor& ids, const Tensor& conditioning, CudaExecutionView cuda) {
+    auto scope      = e.workspace.scope();
+    auto residual   = e.workspace.alloc(DType::BF16, {conditioning.ne[0], conditioning.ne[1]});
+    auto normalized = e.workspace.alloc(DType::BF16, {conditioning.ne[0], conditioning.ne[1]});
+    prepare_stem(p, ids, batch.positions, conditioning, residual, normalized, e.workspace, cuda);
+    mla_history(normalized, p.mtp->attention, batch, e.before, e.after, e.cache.layer(0),
+                e.workspace, cuda);
 }
 } // namespace ninfer::models::glm5next::execution

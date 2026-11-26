@@ -25,6 +25,7 @@ inline constexpr std::uint32_t kCausalScoreTile = 1024;
 
 struct SequencePlanningInputs {
     std::shared_ptr<const BatchExecutionPlan> batch_execution;
+    std::vector<std::uint32_t> target_widths;
     std::shared_ptr<const execution::ModelProfile> profile;
     std::shared_ptr<const moe::Plan> moe;
     std::uint32_t capacity                 = 0;
@@ -32,7 +33,9 @@ struct SequencePlanningInputs {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    SpeculativeLengthPolicy length_policy  = SpeculativeLengthPolicy::Adaptive;
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
+    LinearStateDType linear_state_dtype    = LinearStateDType::Float32;
     ProposalHead proposal_head             = ProposalHead::Full;
     models::LoadOptions features;
     bool gpu_timing                   = false;
@@ -45,6 +48,7 @@ struct SequencePlanningInputs {
 };
 
 struct SequencePlanImpl {
+    std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
     std::shared_ptr<const BatchExecutionPlan> batch_execution;
     std::shared_ptr<const execution::ModelProfile> profile;
     std::shared_ptr<const moe::Plan> moe;
@@ -55,7 +59,9 @@ struct SequencePlanImpl {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    SpeculativeLengthPolicy length_policy  = SpeculativeLengthPolicy::Adaptive;
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
+    LinearStateDType linear_state_dtype    = LinearStateDType::Float32;
     ProposalHead proposal_head             = ProposalHead::Full;
     models::LoadOptions features;
     bool gpu_timing                   = false;
@@ -80,7 +86,8 @@ struct SequencePlannerImpl {
 [[nodiscard]] std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profile,
                            DeviceContext& device, const EngineOptions& options,
-                           std::shared_ptr<const moe::Plan> moe = {});
+                           std::shared_ptr<const moe::Plan> moe         = {},
+                           std::span<const std::uint32_t> target_widths = {});
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             runtime::ContextCapacity capacity);
@@ -88,6 +95,7 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 make_graph_probe_plan(std::shared_ptr<const execution::ModelProfile>, DeviceContext&,
                       const EngineOptions&, std::shared_ptr<const moe::Plan>,
-                      GraphProbeBacking = GraphProbeBacking::Inputs);
+                      std::span<const std::uint32_t> target_widths = {},
+                      GraphProbeBacking                            = GraphProbeBacking::Inputs);
 
 } // namespace ninfer::models::qwen3_5::detail

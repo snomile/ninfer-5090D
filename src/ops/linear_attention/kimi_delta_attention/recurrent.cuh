@@ -1,13 +1,21 @@
 #pragma once
 
 #include "ops/linear_attention/kimi_delta_attention/kernels/transition.cuh"
+#include "ops/linear_attention/kimi_delta_attention/chunked/workspace.h"
 
 namespace ninfer::ops::detail::kimi_delta_attention {
-template <bool Batched, bool Record, int Rows = kDvPerWarp, bool GroupStateTiles = false>
+struct RaggedRecurrent {
+    RaggedSegments segments;
+    int recurrent_before;
+};
+
+template <bool Batched, bool Record, class StateT, int Rows = kDvPerWarp,
+          bool GroupStateTiles = false, class... Metadata>
 __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     recurrent_kernel(Arguments args, const std::int64_t* source_offsets,
                      const std::int64_t* destination_offsets, const std::int32_t* valid_columns,
-                     RecurrenceRecords records, int row_begin) {
+                     RecurrenceRecords records, int row_begin, Metadata... metadata) {
+    constexpr bool Packed  = sizeof...(Metadata) != 0;
     constexpr int kBlockDv = kNumWarps * Rows;
     const int lane = threadIdx.x, warp = threadIdx.y, thread = warp * common::kWarpSize + lane;
     constexpr int tiles = kStateDim / kBlockDv;
@@ -15,52 +23,65 @@ __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     const int tile      = GroupStateTiles ? blockIdx.x % tiles : blockIdx.z;
     const int batch     = Batched ? row_begin + blockIdx.y : 0;
     const int dv_base = tile * kBlockDv + warp * Rows, dqk_base = lane * kQkPerLane;
-    const int qhead = head / (args.value_heads / args.qk_heads);
-    const int valid = valid_columns ? valid_columns[batch] : args.tokens;
-    if (!valid) {
-        if (lane < Rows)
-            for (int t = 0; t < args.tokens; ++t)
-                args.out[((std::int64_t(batch) * args.tokens + t) * args.value_heads + head) *
-                             kStateDim +
-                         dv_base + lane] = __float2bfloat16(0.0F);
-        return;
+    const int group = args.value_heads / args.qk_heads;
+    const int qhead = head / group;
+    int valid;
+    std::int64_t first_column;
+    if constexpr (Packed) {
+        const auto& [segments, recurrent_before] = (..., metadata);
+        valid = segments.lengths[batch];
+        if (valid >= recurrent_before) return;
+        first_column        = segments.cu_seqlens[batch];
+    } else {
+        valid        = valid_columns ? valid_columns[batch] : args.tokens;
+        first_column = static_cast<std::int64_t>(batch) * args.tokens;
+    }
+    if constexpr (!Packed) {
+        if (!valid) {
+            if (lane < Rows)
+                for (int t = 0; t < args.tokens; ++t)
+                    args.out[((std::int64_t(batch) * args.tokens + t) * args.value_heads + head) *
+                                 kStateDim +
+                             dv_base + lane] = __float2bfloat16(0.0F);
+            return;
+        }
     }
     const auto state_head = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
-    const auto source     = state_head + (Batched ? source_offsets[batch] / sizeof(float) : 0);
+    const auto src_bytes =
+        Batched ? source_offsets[batch] : (args.source_offset ? *args.source_offset : 0);
+    const auto source = state_head + src_bytes / static_cast<std::int64_t>(sizeof(StateT));
     __align__(16) float state[Rows][kQkPerLane];
-    load_state(state, args.state_in + source, dv_base, dqk_base);
+    load_state(state, static_cast<const StateT*>(args.state_in) + source, dv_base, dqk_base);
     float a_scale = lane == 0 ? expf(args.a_log[head]) : 0.0F;
     a_scale       = __shfl_sync(common::kFullWarpMask, a_scale, 0);
     for (int t = 0; t < valid; ++t) {
-        const auto column = static_cast<std::int64_t>(batch) * args.tokens + t;
+        const auto column = first_column + t;
         const auto vo     = (column * args.value_heads + head) * kStateDim;
         const auto qo     = (column * args.qk_heads + qhead) * kStateDim;
         const auto bo     = column * args.value_heads + head;
         if constexpr (Record) {
-            if (tile == 0 && head % (args.value_heads / args.qk_heads) == 0 &&
-                records.key != args.k)
-                records.key[qo + thread] = args.k[qo + thread];
-            if (lane < Rows && records.value != args.v)
-                records.value[vo + dv_base + lane] = args.v[vo + dv_base + lane];
+            if (tile == 0 && head % group == 0) records.key[qo + thread] = args.k[qo + thread];
         }
-        run_recurrent_token(state, args.q + qo, args.k + qo, args.v + vo, args.g + vo,
+        run_recurrent_token<Record>(state, args.q + qo, args.k + qo, args.v + vo, args.g + vo,
                             args.beta + bo, args.dt_bias + head * kStateDim, args.out + vo, lane,
                             thread, dv_base, dqk_base, a_scale, args.lower_bound, args.scale,
-                            Record && tile == 0 ? records.log_decay + vo : nullptr,
-                            Record && tile == 0 ? records.beta + bo : nullptr);
+                            Record ? records.delta + vo : nullptr,
+                            Record && tile == 0 ? records.alpha + vo : nullptr);
     }
-    if (lane < Rows)
-        for (int t = valid; t < args.tokens; ++t) {
-            const auto offset =
-                ((static_cast<std::int64_t>(batch) * args.tokens + t) * args.value_heads + head) *
-                    kStateDim +
-                dv_base + lane;
-            args.out[offset] = __float2bfloat16(0.0F);
-        }
+    if constexpr (!Packed) {
+        if (lane < Rows)
+            for (int t = valid; t < args.tokens; ++t) {
+                const auto offset =
+                    ((first_column + t) * args.value_heads + head) * kStateDim + dv_base + lane;
+                args.out[offset] = __float2bfloat16(0.0F);
+            }
+    }
     if constexpr (!Record) {
+        const auto dst_bytes = Batched ? destination_offsets[batch]
+                                       : (args.destination_offset ? *args.destination_offset : 0);
         const auto destination =
-            state_head + (Batched ? destination_offsets[batch] / sizeof(float) : 0);
-        store_state(state, args.state_out + destination, dv_base, dqk_base);
+            state_head + dst_bytes / static_cast<std::int64_t>(sizeof(StateT));
+        store_state(state, static_cast<StateT*>(args.state_out) + destination, dv_base, dqk_base);
     }
 }
 

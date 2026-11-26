@@ -98,6 +98,10 @@ ninfer::EngineOptions engine_options(const std::filesystem::path& artifact,
     options.speculative.backend  = selected;
     if (selected != ninfer::SpeculativeBackend::None) {
         options.speculative.draft_tokens = selected == ninfer::SpeculativeBackend::DFlash2 ? 7 : 3;
+        if (selected == ninfer::SpeculativeBackend::DFlash2) {
+            // Preserve this gate's K7 recovery workload when the product default adapts its depth.
+            options.speculative.length_policy = ninfer::SpeculativeLengthPolicy::Fixed;
+        }
         const auto head                  = setting("NINFER_TEST_PROPOSAL_HEAD", "optimized");
         require(head == "full" || head == "optimized", "unknown test proposal head");
         options.speculative.proposal_head =
@@ -231,7 +235,11 @@ public:
                 (selected == ninfer::SpeculativeBackend::None ||
                  (result.stats.speculative.enabled &&
                   result.stats.speculative.draft_window == expected_draft_window &&
-                  result.stats.speculative.rounds + result.stats.speculative.fallback_steps != 0)),
+                  (selected != ninfer::SpeculativeBackend::DFlash2 ||
+                   result.stats.speculative.rounds > 0) &&
+                  result.stats.speculative.rounds + result.stats.speculative.bypass_steps +
+                          result.stats.speculative.fallback_steps !=
+                      0)),
             "request did not execute the selected backend");
         require(result.stats.timings.first_token_seconds > 0.0 &&
                     result.stats.timings.prefill_seconds > 0.0 &&
@@ -441,6 +449,12 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     require(after.speculative_rounds - before.speculative_rounds ==
                     first_result->stats.speculative.rounds +
                         second_result.stats.speculative.rounds &&
+                after.speculative_proposed_tokens - before.speculative_proposed_tokens ==
+                    first_result->stats.speculative.proposed_tokens +
+                        second_result.stats.speculative.proposed_tokens &&
+                after.speculative_bypass_steps - before.speculative_bypass_steps ==
+                    first_result->stats.speculative.bypass_steps +
+                        second_result.stats.speculative.bypass_steps &&
                 after.speculative_draft_tokens - before.speculative_draft_tokens ==
                     first_result->stats.speculative.drafted_tokens +
                         second_result.stats.speculative.drafted_tokens &&

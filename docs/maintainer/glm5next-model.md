@@ -27,12 +27,11 @@ Router 的 correction bias 只改变选择，最终系数来自未加 bias 的 s
 ## KDA 与 ReplaySSM
 
 KDA 的 Q/K/V 经因果卷积和 SiLU；forget/output gate 通过各自低秩投影产生。
-它使用逐 key 维的 decay，recurrent State 为 FP32，卷积 history 为 BF16。
-长 Prefill 采用完整更新，短 speculative verify 保存 transition inputs，接受后 fold。
+它使用逐 key 维的 decay，recurrent State 支持 FP32（默认）或 BF16（`engine.linear_state_dtype`），内部递推维持 FP32，卷积 history 为 BF16。
+长 Prefill 采用完整更新，短 speculative verify 从只读初始 State 产生不透明私有 transition records，接受后从同一初始 State 折叠采用前缀。
 
-Record 固定同次执行实际消费的 represented inputs；fold 重放相同有限精度 transition。
-Chunked Prefill 的数学精度与 recurrent record/fold 的精确关系分别验证，不能要求不同算法逐位相同。
-公共设计见[Speculative 执行](speculative-decoding.md#replayssm)，接口见
+Verify readout、fold state 与 Chunked Prefill 均按表示后的输入对照独立数值参考验收，不要求不同实现逐位相同；
+卷积 history 按 BF16 words 精确搬运。公共设计见[Speculative 执行](speculative-decoding.md#replayssm)，接口见
 [KDA](../../include/ninfer/ops/kimi_delta_attention.h)和
 [fold](../../include/ninfer/ops/kda_replay.h)。
 
@@ -71,7 +70,7 @@ DFlash2 自身的参数保留 companion 的原始浮点表示。Embedding 和 fu
 Main 绑定，因而 full 不表示强制 BF16。`--proposal` 另生成完整词表 Q4 A16 head，MTP 与
 DFlash2 均可选择它；这不改变 target head 或 DFlash2 decoder 权重。
 
-Latent 使用已有 `kv_dtype=bf16|fp8`。Indexer 默认 FP8，
+Latent 使用已有 `kv_dtype=bf16|fp8`，KDA recurrent State 使用 `linear_state_dtype=fp32|bf16`。Indexer 默认 FP8，
 `NINFER_KPOOL_INDEXER_BF16=1` 在启动选择 BF16 并传给各 rank，不另设 Engine KV 选项。
 FP8 cache 共用 E4M3FN/G128/UE8M0 codec；latent 保留原始基底，index keys 使用归一化 H128 基底。
 Raw tail/records 保留 BF16。Prepare 的 FP8 编码消费 FP32 norm/pooling 结果，不先舍入到 BF16。
@@ -97,7 +96,10 @@ DFlash2 使用自己的 GQA 与滑动窗口 context；context KV 按 heads TP �
 Checkpoint 同时覆盖 Main 和当前启用 backend 的续算状态。
 
 MLA 边界按 owner-local 行 pack，输出汇集回全局顺序，再进入复制的 mHC 或 MTP residual。
-零有效行也遵守通信次序。放置与压力转换使用[共享 Context 策略](context-management.md#attention-dp)，
+纯文本多请求 Prefill 同样按 owner 分组构造全局与本地 `RaggedSequenceView`：KDA（`kda_input_proj_conv_update` /
+`kimi_delta_attention`）与 FFN 消费全局打包 token 流，各 rank 的 Kpool MLA（`prepare_update` / `indexer` /
+`sparse_mla`）和 MTP 历史补齐并行执行本地 owner 段，末尾经 `scatter_ragged_last_columns` 与 `ops::gather`
+写回状态并汇集待采样行。零有效行也遵守通信次序。放置与压力转换使用[共享 Context 策略](context-management.md#attention-dp)，
 字段转换和切片由 [ParallelPlan](../../src/models/glm5next/parallel/plan.cpp)及 Session 解释。
 
 ## MTP
@@ -117,8 +119,9 @@ DFlash2 从配置指定 Main 层的特征建立 conditioning，经 feature proje
 context K/V。草拟输入为 anchor 与 masked block，经过 GQA、动态卷积和 FFN，再用词表候选及
 条件 selector 生成 draft 路径和实际 proposal 分布。Target 的 KDA/MLA 与接受过程保持原语义。
 
-每层的 K/V/Q 使用合并 parent，context-only 路径借用 K/V 前缀。特征、候选分布及 provisional
-计算属于执行帧；正式 context 只采用已提交输入。草拟窗口与验证有效长度分别管理，
+每层的 K/V/Q 使用合并 parent，context-only 路径借用 K/V 前缀。打包 Prefill 下，各 rank 按滑动窗口截断索引
+单次收集并广播特征分片，通过原生 ragged `context_kv_materialize` 一次性物化所有段的局部上下文 KV。
+特征、候选分布及 provisional 计算属于执行帧；正式 context 只采用已提交输入。草拟窗口与验证有效长度分别管理，
 记录和状态采用遵循[Speculative 执行](speculative-decoding.md)。
 
 MTP 与 DFlash2 是互斥的启动选择，只加载所选 backend、head 和执行资源。
@@ -128,8 +131,9 @@ MTP 与 DFlash2 是互斥的启动选择，只加载所选 backend、head 和执
 ## Graph
 
 Decode 主体按全局物理桶 P 和各 rank 共同的本地 Attention 桶 L 组织，owner 分布通过设备行映射
-进入，不枚举 owner 向量。采样参数、实际 draft/accepted 长度是输入数据；Indexer/MLA 局部 child
-随上下文更新，外层通信保持固定。Decision 与最终 commit 依赖独立，Prefill/Replay 使用 eager。
+进入，不枚举 owner 向量。采样参数、实际 draft/accepted 长度是输入数据。Indexer/MLA 按
+`ContextBucket` 在扁平图内更新局部 kernel 参数切片，外层通信保持固定。
+Decision 与最终 commit 依赖独立，Prefill/Replay 使用 eager。
 批次与 padding 合同见[并发执行](concurrent-execution.md)，其他共享原则见
 [Speculative 执行](speculative-decoding.md)与[分布式执行](distributed-execution.md)。
 

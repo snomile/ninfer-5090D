@@ -1,3 +1,4 @@
+#include "models/qwen3_5/execution/draft.h"
 #include "models/qwen3_5/program/frames.h"
 
 #include "models/load_options.h"
@@ -49,6 +50,87 @@ Tensor prefix(const Tensor& tensor, std::initializer_list<std::int32_t> shape) {
     return Tensor(MemorySpan{tensor.data, tensor.bytes(), tensor.device}, tensor.dtype, shape);
 }
 
+PackedPrefillLayout plan_packed_prefill(LayoutBuilder& device, LayoutBuilder& host, int batch,
+                                        int chunk, const FrameSpec& spec) {
+    LayoutBuilder metadata;
+    const auto rows = [&](DType dtype, const char* label) {
+        return metadata.add_tensor(dtype, {batch}, dtype_size(dtype), label);
+    };
+    const auto ragged = [&] {
+        return RaggedPrefillMetadata<TensorRegion>{
+            metadata.add_tensor(DType::I32, {dimension(std::uint64_t(batch) + 1)}, 4,
+                                "ragged offsets"),
+            rows(DType::I32, "ragged lengths"),
+            metadata.add_tensor(DType::I32, {chunk}, 4, "ragged token segments")};
+    };
+    PackedPrefillLayout out;
+    auto& m               = out.metadata;
+    m.ragged              = ragged();
+    m.main_tables         = rows(DType::I32, "packed Main tables");
+    m.backend_tables      = rows(DType::I32, "packed backend tables");
+    m.source_offsets      = rows(DType::I64, "packed source State offsets");
+    m.destination_offsets = rows(DType::I64, "packed destination State offsets");
+    m.sampled_offsets     = rows(DType::I64, "packed sampled State offsets");
+    m.sampling_positions  = rows(DType::I32, "packed sampling positions");
+    m.live_rows           = rows(DType::I32, "packed sampling live rows");
+    m.residency_slots     = rows(DType::I32, "packed sampling residency slots");
+    out.sampling          = metadata.add(std::size_t(batch) * sizeof(ops::SamplingConfig),
+                                         alignof(ops::SamplingConfig), "packed sampling configs");
+    if (spec.backend == SpeculativeBackend::Mtp) {
+        m.mtp = PackedMtpMetadata<TensorRegion>{
+            ragged(),
+            rows(DType::I32, "MTP Main segments"),
+            rows(DType::I32, "MTP previous rows"),
+            rows(DType::I32, "MTP history skip"),
+            metadata.add_tensor(DType::I32, {3, batch}, 4, "MTP previous RoPE"),
+            rows(DType::I64, "MTP source State offsets"),
+            rows(DType::I32, "MTP backend tables")};
+    }
+    if (is_masked_draft_backend(spec.backend)) {
+        m.dflash = PackedDFlashMetadata<TensorRegion>{
+            ragged(), metadata.add_tensor(DType::I32, {chunk}, 4, "DFlash local source indices")};
+    }
+    const auto bytes   = metadata.finish(kAlignment);
+    out.device         = device.add(bytes, kAlignment, "packed prefill metadata");
+    out.host           = host.add(bytes, kAlignment, "Host packed prefill metadata");
+    out.sampled_hidden = add(device, DType::BF16, {spec.hidden, batch}, "packed sampled hidden");
+    out.sampled_rows   = add(host, DType::I32, {batch}, "packed sampled members");
+    out.sample_slots   = add(host, DType::I32, {batch}, "packed member sampling slots");
+    return out;
+}
+
+PackedPrefillMetadata<Tensor> bind_packed_metadata(const PackedPrefillMetadata<TensorRegion>& m,
+                                                   MemorySpan storage) {
+    const auto bind   = [&](const TensorRegion& region) { return region.bind(storage); };
+    const auto ragged = [&](const RaggedPrefillMetadata<TensorRegion>& r) {
+        return RaggedPrefillMetadata<Tensor>{bind(r.cu_seqlens), bind(r.seq_lengths),
+                                             bind(r.token_to_seq)};
+    };
+    PackedPrefillMetadata<Tensor> out{
+        ragged(m.ragged),       bind(m.main_tables),         bind(m.backend_tables),
+        bind(m.source_offsets), bind(m.destination_offsets), bind(m.sampled_offsets),
+        bind(m.sampling_positions),
+        bind(m.live_rows),      bind(m.residency_slots),     {},
+        {}};
+    if (m.mtp) {
+        const auto& p = *m.mtp;
+        out.mtp       = PackedMtpMetadata<Tensor>{ragged(p.ragged),      bind(p.input_segments),
+                                                  bind(p.previous_rows), bind(p.skip_first),
+                                                  bind(p.previous_rope), bind(p.source_offsets),
+                                                  bind(p.backend_tables)};
+    }
+    if (m.dflash) {
+        out.dflash = PackedDFlashMetadata<Tensor>{ragged(m.dflash->ragged),
+                                                  bind(m.dflash->source_indices)};
+    }
+    return out;
+}
+
+std::span<std::int32_t> host_i32(const TensorRegion& region, MemorySpan backing) {
+    const auto tensor = region.bind(backing);
+    return {static_cast<std::int32_t*>(tensor.data), static_cast<std::size_t>(tensor.ne[0])};
+}
+
 } // namespace
 
 FrameControlLayout plan_frame_controls(const FrameSpec& spec, std::uint32_t row_count) {
@@ -70,7 +152,7 @@ FrameControlLayout plan_frame_controls(const FrameSpec& spec, std::uint32_t row_
     result.ingress.extents                   = row(DType::I32);
     result.ingress.valid_columns             = row(DType::I32);
     result.ingress.proposal_valid_columns    = row(DType::I32);
-    result.ingress.budgets                   = row(DType::I32);
+    result.ingress.proposal_live_rows        = row(DType::I32);
     result.ingress.main_table_rows           = row(DType::I32);
     result.ingress.backend_table_rows        = row(DType::I32);
     result.ingress.residency_slots           = row(DType::I32);
@@ -106,7 +188,14 @@ FrameControlLayout plan_frame_controls(const FrameSpec& spec, std::uint32_t row_
     LayoutBuilder output;
     result.egress.tokens = output.add_tensor(DType::I32, {width, rows}, 4, "output tokens");
     result.egress.counts = output.add_tensor(DType::I32, {rows}, 4, "output counts");
-    result.egress.bytes  = output.finish(kAlignment);
+    if (spec.draft_window) {
+        result.egress.top1_probabilities =
+            output.add_tensor(DType::FP32, {rows}, 4, "target top-1 probabilities");
+        const auto drafts = dimension(spec.draft_window);
+        result.egress.draft_confidences =
+            output.add_tensor(DType::FP32, {rows * drafts}, 4, "draft confidences");
+    }
+    result.egress.bytes = output.finish(kAlignment);
     return result;
 }
 
@@ -190,6 +279,7 @@ FrameLayout plan_frames(LayoutBuilder& builder, const FrameSpec& spec) {
         out.host.visual_indices = add(host, DType::I32, {chunk}, "Host visual indices");
     }
     if (!spec.causal_scoring) {
+        out.packed_prefill      = plan_packed_prefill(builder, host, batch, chunk, spec);
         const auto control      = dimension(std::max(spec.control_token_limit, 1U));
         out.host.control_tokens = add(host, DType::I32, {control, batch}, "Host control tokens");
         out.control_ids         = add(builder, DType::I32, {control}, "control token counts input");
@@ -207,6 +297,21 @@ FrameLayout plan_frames(LayoutBuilder& builder, const FrameSpec& spec) {
     }
     out.host.bytes = host.finish(kAlignment, "Host execution frame");
     return out;
+}
+
+PackedPrefillFrame::PackedPrefillFrame(MemorySpan device_backing, MemorySpan host_backing,
+                                       const PackedPrefillLayout& layout)
+    : device_storage(layout.device.bind(device_backing)),
+      host_storage(layout.host.bind(host_backing)),
+      device(bind_packed_metadata(layout.metadata, device_storage)),
+      host(bind_packed_metadata(layout.metadata, host_storage)),
+      sampling(static_cast<const ops::SamplingConfig*>(layout.sampling.bind(device_storage).data)),
+      host_sampling(static_cast<ops::SamplingConfig*>(layout.sampling.bind(host_storage).data),
+                    static_cast<std::size_t>(host.live_rows.ne[0])),
+      sampled_hidden(layout.sampled_hidden.bind(device_backing)),
+      sampled_rows(host_i32(layout.sampled_rows, host_backing)),
+      sample_slots(host_i32(layout.sample_slots, host_backing)) {
+    std::memset(host_storage.data, 0, host_storage.bytes);
 }
 
 MtpFrame::MtpFrame(MemorySpan backing, const MtpFrameLayout& layout)
@@ -245,6 +350,17 @@ DFlashFrame::DFlashFrame(MemorySpan backing, const DFlashFrameLayout& layout)
     if (layout.proposal_q) proposal_q = layout.proposal_q->bind(backing);
 }
 
+execution::DraftOutputs DFlashFrame::proposal(std::int32_t batch, std::int32_t columns) const {
+    const auto packed = [](const Tensor& backing, std::initializer_list<int> shape) {
+        return Tensor({backing.data, backing.bytes(), backing.device}, backing.dtype, shape);
+    };
+    return {proposal_ids.slice(1, 0, batch), proposal_positions.slice(1, 0, batch),
+            packed(drafts, {columns, batch}),
+            candidate_ids.data ? packed(candidate_ids, {candidate_ids.ne[0], columns, batch})
+                               : Tensor{},
+            proposal_q.data ? packed(proposal_q, {proposal_q.ne[0], columns, batch}) : Tensor{}};
+}
+
 ExecutionFrame::ExecutionFrame(MemorySpan backing, const FrameLayout& layout)
     : spec(layout.spec), input_capacity(layout.input_capacity), host_storage(layout.host.bytes),
       input_ids(layout.input_ids.bind(backing)),
@@ -262,7 +378,8 @@ ExecutionFrame::ExecutionFrame(MemorySpan backing, const FrameLayout& layout)
     if (layout.control_ids) control_ids = layout.control_ids->bind(backing);
     if (layout.mtp) mtp.emplace(backing, *layout.mtp);
     if (layout.dflash) dflash.emplace(backing, *layout.dflash);
-    const auto host       = host_storage.span();
+    const auto host = host_storage.span();
+    if (layout.packed_prefill) packed_prefill.emplace(backing, host, *layout.packed_prefill);
     host_ingress_storage_ = layout.host.ingress.bind(host);
     host_commit_storage_  = layout.host.commit.bind(host);
     host_egress_storage_  = layout.host.egress.bind(host);
@@ -301,7 +418,7 @@ void ExecutionFrame::bind_rows(std::uint32_t rows) {
     extents                   = layout.ingress.extents.bind(ingress);
     valid_columns             = layout.ingress.valid_columns.bind(ingress);
     proposal_valid_columns    = layout.ingress.proposal_valid_columns.bind(ingress);
-    budgets                   = layout.ingress.budgets.bind(ingress);
+    proposal_live_rows        = layout.ingress.proposal_live_rows.bind(ingress);
     main_table_rows           = layout.ingress.main_table_rows.bind(ingress);
     backend_table_rows        = layout.ingress.backend_table_rows.bind(ingress);
     residency_slots           = layout.ingress.residency_slots.bind(ingress);
@@ -328,8 +445,8 @@ void ExecutionFrame::bind_rows(std::uint32_t rows) {
         span.template operator()<std::int32_t>(layout.ingress.valid_columns, host_ingress_bytes);
     host_ingress.proposal_valid_columns = span.template operator()<std::int32_t>(
         layout.ingress.proposal_valid_columns, host_ingress_bytes);
-    host_ingress.budgets =
-        span.template operator()<std::int32_t>(layout.ingress.budgets, host_ingress_bytes);
+    host_ingress.proposal_live_rows = span.template operator()<std::int32_t>(
+        layout.ingress.proposal_live_rows, host_ingress_bytes);
     host_ingress.main_table_rows =
         span.template operator()<std::int32_t>(layout.ingress.main_table_rows, host_ingress_bytes);
     host_ingress.backend_table_rows = span.template operator()<std::int32_t>(
@@ -378,6 +495,14 @@ void ExecutionFrame::bind_rows(std::uint32_t rows) {
     host_egress.tokens = span.template operator()<TokenId>(layout.egress.tokens, host_egress_bytes);
     host_egress.counts =
         span.template operator()<std::int32_t>(layout.egress.counts, host_egress_bytes);
+    if (layout.egress.draft_confidences) {
+        top1_probabilities = layout.egress.top1_probabilities->bind(egress);
+        draft_confidences  = layout.egress.draft_confidences->bind(egress);
+        host_egress.top1_probabilities =
+            span.template operator()<float>(*layout.egress.top1_probabilities, host_egress_bytes);
+        host_egress.draft_confidences =
+            span.template operator()<float>(*layout.egress.draft_confidences, host_egress_bytes);
+    }
     if (mtp) {
         mtp->step_positions         = layout.ingress.step_positions.bind(ingress);
         mtp->step_valid_columns     = layout.ingress.step_valid.bind(ingress);

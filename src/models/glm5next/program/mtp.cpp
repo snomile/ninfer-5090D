@@ -41,16 +41,13 @@ Tensor RankProgramImpl::mtp_output_ids(int step, int batch) {
         .view({batch});
 }
 
-void RankProgramImpl::prepare_history_metadata(std::span<const WorkRow> rows,
-                                               std::span<const std::uint32_t> skip_first) {
-    const auto& m = *frame.mtp;
-    auto* values  = static_cast<std::int32_t*>(host(m.skip_first).data);
+void RankProgramImpl::prepare_history_metadata(std::span<const WorkRow> rows) {
+    const auto& region = frame.mtp->skip_first;
+    auto* values       = static_cast<std::int32_t*>(host(region).data);
     std::fill_n(values, compute->batch.rows, 0);
-    for (std::size_t b = 0; b < rows.size(); ++b) {
-        const auto logical = compute->physical.members[b];
-        values[b] = skip_first.empty() ? rows[logical].main_frontier == 0 : skip_first[logical];
-    }
-    if (compute->sequence) upload_region(m.skip_first.region, rows.size() * sizeof(std::int32_t));
+    for (std::size_t b = 0; b < rows.size(); ++b)
+        values[b] = rows[compute->physical.members[b]].main_frontier == 0;
+    upload_region(region.region, compute->batch.rows * sizeof(std::int32_t));
 }
 
 void RankProgramImpl::align_history(const execution::BatchView& main, Tensor hidden, int width) {
@@ -95,6 +92,44 @@ void RankProgramImpl::align_history(const execution::BatchView& main, Tensor hid
     }
 }
 
+void RankProgramImpl::align_packed_history(const execution::BatchView& main,
+                                           const PackedPrefill& packed, const Tensor& hidden) {
+    const auto& ragged = packed.mtp_ragged;
+    const int segments = ragged.num_seqs();
+    if (!segments) return;
+    const auto& layout = *frame.packed_prefill->mtp;
+    const auto& m      = *frame.mtp;
+    const int h = hidden.ne[0], n = ragged.total_tokens();
+    const auto source      = row(layout.source_offsets, segments);
+    const auto destination = row(layout.destination_offsets, segments);
+    auto previous          = resources.packed(m.previous_hidden, {h, segments});
+    ops::gather(resources.states.hidden(source), row(layout.base_positions, segments), previous,
+                cuda);
+    auto conditioning         = resources.packed(m.conditioning, {h, n});
+    const auto ids            = row(m.history.ids, n);
+    const auto positions      = row(m.history.positions, n);
+    const auto input_segments = row(layout.input_segments, segments);
+    // Previous hidden is compact, while input segments index the global pack.
+    const auto previous_rows = row(frame.attention.selection_rows, segments);
+    ops::prepare_causal_pairs({packed.update.ragged,
+                               hidden,
+                               previous,
+                               main.ids,
+                               main.positions,
+                               {},
+                               {},
+                               input_segments,
+                               previous_rows,
+                               row(layout.skip_first, segments)},
+                              {ragged, conditioning, ids, positions, {}}, cuda);
+    execution::mtp_history(
+        parameters,
+        {resources.workspace, *resources.mtp, resources.states.mtp_tail(source),
+         resources.states.mtp_tail(destination)},
+        ops::KpoolMlaRaggedBatchView{ragged, positions, row(layout.table_rows, segments)}, ids,
+        conditioning, cuda);
+}
+
 execution::MtpRun RankProgramImpl::mtp_run(std::uint32_t step, const execution::BatchView& call) {
     const int c       = call.attention.rows;
     const auto before = step ? resources.mtp_tail(step == 1 ? 0 : 1 + (step - 2) % 2, c)
@@ -135,31 +170,34 @@ void RankProgramImpl::mtp_forward(std::uint32_t step, const execution::BatchView
         resources.packed(*io.logits, {dimension(parameters.profile->local.vocabulary.size), b});
     const auto& head = parameters.mtp->head;
     ops::linear(next, head.weight, logits, head.policy, resources.workspace, cuda);
-    auto ids = mtp_output_ids(step, b);
+    auto ids         = mtp_output_ids(step, b);
+    auto confidences = resources.tensor(*io.draft_confidences).slice(0, step * b, b);
     if (parallel) {
-        auto keys = resources.packed(*io.candidates, {1, 1, b});
+        auto local = resources.packed(*io.candidates, {2, 1, b});
+        auto gathered =
+            resources.packed(*io.gathered_candidates, {2, 1, b, dimension(parallel->size())});
         const auto* configs =
             static_cast<const ops::SamplingConfig*>(resources.tensor(m.proposal_sampling).data);
-        ops::vocabulary_candidates(logits.view({logits.ne[0], 1, b}),
-                                   parameters.profile->local.vocabulary.begin,
-                                   parameters.profile->public_tokens, configs, call.valid_columns,
-                                   {}, keys, resources.workspace, cuda);
-        parallel->maximum(keys, cuda);
-        ops::sample_vocabulary_candidates(keys.view({1, 1, b, 1}), configs,
-                                          row(io.rows.sampling_positions, b),
-                                          ops::kSamplePurposeDecode, ids, call.valid_columns, cuda);
+        ops::vocabulary_candidates_with_lse(
+            logits.view({logits.ne[0], 1, b}), parameters.profile->local.vocabulary.begin,
+            parameters.profile->public_tokens, configs, call.valid_columns, {}, local,
+            resources.workspace, cuda);
+        parallel->gather_unsigned_words(local, gathered, cuda);
+        ops::sample_vocabulary_candidates(gathered, configs, row(io.rows.sampling_positions, b),
+                                          ops::kSamplePurposeDecode, ids, confidences,
+                                          call.valid_columns, cuda);
     } else {
-        ops::argmax(logits, ids, parameters.profile->public_tokens, cuda);
+        ops::argmax_with_probability(logits, ids, confidences, parameters.profile->public_tokens,
+                                     resources.workspace, cuda);
     }
 }
 
-void RankProgramImpl::accept_mtp(int b) {
+void RankProgramImpl::accept_mtp(int b, int w) {
     const auto& io    = frame;
     const auto& m     = *io.mtp;
     const auto& local = parameters.profile->local;
-    const int w       = shape.draft_tokens + 1;
     auto logits       = resources.packed(*io.logits, {dimension(local.vocabulary.size), w, b});
-    auto drafts       = draft_proposals(b);
+    auto drafts       = draft_proposals(b, dimension(shape.draft_tokens));
     auto positions = row(io.rows.sampling_positions, b), extents = row(io.speculative->extents, b);
     auto licensed = resources.packed(*io.sampled_ids, {w, b});
     auto counts   = row(*io.output_counts, b);
@@ -180,34 +218,35 @@ void RankProgramImpl::accept_mtp(int b) {
 }
 
 void RankProgramImpl::repair_mtp_history(const execution::BatchView& call, bool repair,
-                                         DecodeGraphSection* captured_repair) {
+                                         const SectionRecorder& record_repair) {
     const auto& io = frame;
     const auto& m  = *io.mtp;
     const int b = call.rows, w = call.tokens, c = call.attention.rows,
-              h       = parameters.profile->config.text.hidden;
-    const auto hidden = resources.packed(io.pending_hidden, {h, w, b});
-    auto accepted     = row(io.rows.accepted_columns, b);
-    auto history      = batch(m.history, w - 1, c, c, call.attention.max_visible_tokens);
-    auto conditioning = resources.packed(m.conditioning, {h, w - 1, c});
-    ops::prepare_causal_pairs(
-        {hidden,
-         resources.packed(m.previous_hidden, {h, b}),
-         call.ids,
-         call.positions,
-         {},
-         {},
-         accepted,
-         row(m.skip_first, b),
-         call.attention.to_global},
-        {conditioning, history.ids, history.positions, history.valid_columns, {}}, cuda);
+              h               = parameters.profile->config.text.hidden;
+    const auto hidden         = resources.packed(io.pending_hidden, {h, w, b});
+    auto accepted             = row(io.rows.accepted_columns, b);
     const auto& local         = call.attention;
     const auto history_update = [&] {
+        const int pairs   = std::max(1, w - 1);
+        auto history      = batch(m.history, pairs, c, c, call.attention.max_visible_tokens);
+        auto conditioning = resources.packed(m.conditioning, {h, pairs, c});
+        ops::prepare_causal_pairs(
+            {hidden,
+             resources.packed(m.previous_hidden, {h, b}),
+             call.ids,
+             call.positions,
+             {},
+             {},
+             accepted,
+             row(m.skip_first, b),
+             call.attention.to_global},
+            {conditioning, history.ids, history.positions, history.valid_columns, {}}, cuda);
         const auto tail = resources.mtp_tail(0, c);
         execution::mtp_history(parameters, {resources.workspace, *resources.mtp, tail, tail},
-                               history, conditioning.view({h, (w - 1) * c}), cuda);
+                               history, conditioning.view({h, pairs * c}), cuda);
     };
-    if (captured_repair)
-        captured_repair->capture(cuda.stream(), history_update);
+    if (record_repair)
+        record_repair(history_update);
     else if (repair)
         history_update();
     auto tail                        = resources.states.mtp_tail(local.destination_offsets);

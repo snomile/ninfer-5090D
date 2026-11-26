@@ -31,6 +31,9 @@
 
 namespace ninfer::test::causal_attention {
 using namespace float_codec;
+using ops::ContextBucket;
+using ops::ContextBucketRange;
+using ops::select_context_bucket;
 
 constexpr std::int32_t kHeadDim          = 256;
 constexpr std::int32_t kQuantGroup       = 64;
@@ -44,7 +47,7 @@ constexpr float kAttentionScale          = 0.0625f;
 constexpr std::uint16_t kOutputCanary    = 0x7fc1u;
 
 // Append and cached entries use one fixed criterion for each registered storage profile; token
-// count, geometry, execution envelope, and private launch route do not select or relax it. Native
+// count, geometry, context bucket, and private launch route do not select or relax it. Native
 // INT8-G64 / FP8 Q quantization is an accepted production approximation. The unchanged FP64 oracle
 // includes its error. Small, unit-RMS and RMS1.8 Q/K fixtures qualify that budget. These are
 // conformance-domain budgets, not bounds for arbitrary BF16 inputs or KV quality scores.
@@ -110,11 +113,12 @@ ops::AttentionHeadGeometry op_geometry(const Geometry& geometry);
 struct AttentionCase {
     std::int32_t tokens;
     std::int32_t base;
-    std::uint32_t envelope_max;
+    ContextBucket bucket;
     std::uint32_t seed;
-    bool zero_q        = false;
-    bool graph_replay  = false;
-    float qk_amplitude = 0.25f;
+    bool zero_q                 = false;
+    bool graph_replay           = false;
+    float qk_amplitude          = 0.25f;
+    std::int32_t table_capacity = 0;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -161,70 +165,54 @@ std::size_t physical_plane_elements(std::int32_t leading_extent, const Geometry&
                                     std::int32_t physical_pages);
 
 template <typename T>
-std::vector<T> scatter_paged(const std::vector<T>& logical, std::int32_t leading_extent,
-                             const Geometry& geometry, std::int32_t logical_capacity,
-                             std::span<const std::int32_t> block_table,
-                             std::int32_t physical_pages) {
-    std::vector<T> physical(static_cast<std::size_t>(leading_extent) * kPagedKVPageSize *
-                            static_cast<std::size_t>(geometry.kv_heads) *
-                            static_cast<std::size_t>(physical_pages));
-    for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
-        for (std::int32_t position = 0; position < logical_capacity; ++position) {
-            const std::int32_t page =
-                block_table[static_cast<std::size_t>(position) / kPagedKVPageSize];
-            for (std::int32_t leading = 0; leading < leading_extent; ++leading) {
-                const std::size_t source = static_cast<std::size_t>(leading) +
-                                           static_cast<std::size_t>(leading_extent) *
-                                               (static_cast<std::size_t>(position) +
-                                                static_cast<std::size_t>(logical_capacity) * head);
-                physical[paged_index(leading_extent, geometry, page, head, position, leading)] =
-                    logical[source];
-            }
-        }
-    }
+void copy_paged(std::span<T> destination, std::span<const T> source, int leading_extent,
+                const Geometry& geometry, int logical_capacity, std::span<const int> block_table,
+                bool scatter) {
+    const int logical_pages  = (logical_capacity + kPagedKVPageSize - 1) / kPagedKVPageSize;
+    const auto page_elements = std::size_t(leading_extent) * kPagedKVPageSize;
+    // The fixture maps each logical page to a distinct physical page.
+    parallel_rows(logical_pages * geometry.kv_heads,
+                  std::uint64_t(logical_capacity) * geometry.kv_heads * leading_extent,
+                  [&](int first, int last) {
+                      for (int i = first; i < last; ++i) {
+                          const int head = i / logical_pages, page = i % logical_pages;
+                          const int position = page * kPagedKVPageSize;
+                          const auto logical = std::size_t(leading_extent) *
+                                               (position + std::size_t(logical_capacity) * head);
+                          const auto physical = paged_index(leading_extent, geometry,
+                                                            block_table[page], head, position, 0);
+                          const auto count =
+                              std::min(page_elements,
+                                       std::size_t(logical_capacity - position) * leading_extent);
+                          std::copy_n(source.data() + (scatter ? logical : physical), count,
+                                      destination.data() + (scatter ? physical : logical));
+                      }
+                  });
+}
+
+template <typename T>
+void scatter_paged_into(const std::vector<T>& logical, int leading_extent, const Geometry& geometry,
+                        int logical_capacity, std::span<const int> block_table,
+                        std::vector<T>& physical) {
+    copy_paged<T>(physical, logical, leading_extent, geometry, logical_capacity, block_table, true);
+}
+
+template <typename T>
+std::vector<T> scatter_paged(const std::vector<T>& logical, int leading_extent,
+                             const Geometry& geometry, int logical_capacity,
+                             std::span<const int> block_table, int physical_pages) {
+    std::vector<T> physical(physical_plane_elements(leading_extent, geometry, physical_pages));
+    scatter_paged_into(logical, leading_extent, geometry, logical_capacity, block_table, physical);
     return physical;
 }
 
 template <typename T>
-void scatter_paged_into(const std::vector<T>& logical, std::int32_t leading_extent,
-                        const Geometry& geometry, std::int32_t logical_capacity,
-                        std::span<const std::int32_t> block_table, std::vector<T>& physical) {
-    for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
-        for (std::int32_t position = 0; position < logical_capacity; ++position) {
-            const std::int32_t page =
-                block_table[static_cast<std::size_t>(position) / kPagedKVPageSize];
-            for (std::int32_t leading = 0; leading < leading_extent; ++leading) {
-                const std::size_t source = static_cast<std::size_t>(leading) +
-                                           static_cast<std::size_t>(leading_extent) *
-                                               (static_cast<std::size_t>(position) +
-                                                static_cast<std::size_t>(logical_capacity) * head);
-                physical[paged_index(leading_extent, geometry, page, head, position, leading)] =
-                    logical[source];
-            }
-        }
-    }
-}
-
-template <typename T>
-std::vector<T> gather_paged(std::span<const T> physical, std::int32_t leading_extent,
-                            const Geometry& geometry, std::int32_t logical_capacity,
-                            std::span<const std::int32_t> block_table) {
-    std::vector<T> logical(static_cast<std::size_t>(leading_extent) * logical_capacity *
-                           static_cast<std::size_t>(geometry.kv_heads));
-    for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
-        for (std::int32_t position = 0; position < logical_capacity; ++position) {
-            const std::int32_t page =
-                block_table[static_cast<std::size_t>(position) / kPagedKVPageSize];
-            for (std::int32_t leading = 0; leading < leading_extent; ++leading) {
-                const std::size_t target = static_cast<std::size_t>(leading) +
-                                           static_cast<std::size_t>(leading_extent) *
-                                               (static_cast<std::size_t>(position) +
-                                                static_cast<std::size_t>(logical_capacity) * head);
-                logical[target] =
-                    physical[paged_index(leading_extent, geometry, page, head, position, leading)];
-            }
-        }
-    }
+std::vector<T> gather_paged(std::span<const T> physical, int leading_extent,
+                            const Geometry& geometry, int logical_capacity,
+                            std::span<const int> block_table) {
+    std::vector<T> logical(std::size_t(leading_extent) * logical_capacity * geometry.kv_heads);
+    copy_paged<T>(logical, physical, leading_extent, geometry, logical_capacity, block_table,
+                  false);
     return logical;
 }
 
@@ -290,7 +278,8 @@ HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int3
 void append_cache(HostCache& cache, const std::vector<float>& k, const std::vector<float>& v,
                   const std::vector<std::int32_t>& positions);
 
-double cache_value(const HostCache& cache, bool key, int head, int position, int d);
+void decode_cache_row(const HostCache& cache, bool key, int head, int position,
+                      std::span<double, kHeadDim> output);
 
 std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
                                     const std::vector<std::int32_t>& positions);
@@ -304,7 +293,7 @@ std::vector<T> copy_from_guarded(const GuardedDeviceBuffer& buffer, std::size_t 
 
 class DeviceCache {
 public:
-    // The table reserves the execution envelope; only the populated prefix owns physical pages.
+    // The table can reserve more logical pages than the populated prefix.
     // Future entries remain invalid, just as in a growing paged cache.
     DeviceCache(const HostCache& cache, MappingPattern mapping, std::int32_t table_capacity);
 
@@ -336,7 +325,7 @@ private:
 class BatchDeviceCache {
 public:
     BatchDeviceCache(std::span<const HostCache> rows, MappingPattern mapping,
-                     std::int32_t table_capacity);
+                     std::int32_t table_capacity, int shared_prefix = 0);
 
     PagedKVBatchLayerView view();
 
@@ -366,7 +355,6 @@ private:
     KvCacheStorage storage_;
     TestCacheLayout layout_;
     std::size_t rows_;
-    std::int32_t logical_capacity_;
     std::int32_t logical_pages_;
     std::int32_t physical_pages_;
     std::vector<std::int32_t> block_tables_host_;
@@ -413,14 +401,29 @@ struct BatchAttentionCase {
 
 int run_append_case(CudaExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                     const AttentionCase& test_case, MappingPattern mapping,
-                    std::span<const int> oracle_queries         = {},
-                    std::span<const std::uint32_t> graph_limits = {});
+                    std::span<const int> oracle_queries          = {},
+                    std::span<const ContextBucket> graph_buckets = {});
 int run_cached_case(CudaExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                     const AttentionCase& test_case, MappingPattern mapping,
                     std::span<const int> oracle_queries = {});
 int run_batch_case(CudaExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
-                   const BatchAttentionCase& test_case, int envelope_max = 0,
-                   std::span<const std::uint32_t> graph_limits = {});
+                   const BatchAttentionCase& test_case, std::optional<ContextBucket> bucket = {},
+                   std::span<const ContextBucket> graph_buckets = {});
+
+struct RaggedAttentionCase {
+    std::string name;
+    std::vector<int> lengths;
+    std::vector<int> histories = {};
+    ContextBucket bucket       = ContextBucket::K2;
+    int shared_prefix          = 0;
+    bool replay                = false;
+    bool arena_operands        = false;
+    bool offset_bf16           = false;
+};
+
+int run_ragged_case(CudaExecutionView, const Geometry&, KvCacheStorage, const RaggedAttentionCase&);
+int verify_ragged_workspace_capacity(CudaExecutionView, const Geometry&, KvCacheStorage);
+int verify_ragged_workspace_synthetic();
 int verify_workspace_capacity_contract(CudaExecutionView, KvCacheStorage);
 void add_cases(OpSuite&);
 

@@ -1,5 +1,5 @@
-#include "models/common/qwen/vision/control.h"
 #include "models/qwen3_5/session/internal.h"
+#include "models/common/qwen/vision/control.h"
 #include "models/common/context/work.h"
 
 #include <algorithm>
@@ -80,8 +80,8 @@ BindingPlan SessionImpl::plan_binding(const RequestBasePlan& base, runtime::Lane
                                      ? (first.main_frontier ? first.main_frontier - 1U : 0)
                                      : (has_backend_pool() ? first.main_frontier : 0);
     } else
-        first =
-            next_unit(resume->impl_->sequence, resume->impl_->control, resume_kind, resume_tokens);
+        first = next_unit(resume->impl_->sequence, resume->impl_->control, resume_kind,
+                          resume_tokens, resume->frontier());
     if (base.impl_->vision &&
         (first.kind == ExecutionUnitKind::Prefill || first.kind == ExecutionUnitKind::Replay)) {
         first.main_frontier =
@@ -94,8 +94,10 @@ BindingPlan SessionImpl::plan_binding(const RequestBasePlan& base, runtime::Lane
     }
     transaction.first_unit = transaction.reservation_demand = first;
     if (resume) {
-        auto coverage =
-            next_unit(resume->impl_->sequence, resume->impl_->control, resume_kind, resume_tokens);
+        // A request paused during replay may store a partial execution cursor.
+        // The protected progress unit starts at the original recovery target.
+        auto coverage = next_unit(resume->impl_->sequence, resume->impl_->control, resume_kind,
+                                  resume_tokens, resume->frontier());
         coverage.main_frontier = std::max(coverage.main_frontier, resume->frontier());
         if (has_backend_pool())
             coverage.backend_frontier =
@@ -190,12 +192,12 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
         prepared_state.ledger.reserve_output(base.summary().effective_output_tokens);
         prepared.publish_continuation = base.summary().publish_continuation;
         prepared.sampling_host        = base.impl_->sampling;
-        prepared.speculative_stats    = {
-               .backend                = speculative_backend,
-               .enabled                = speculative_backend != SpeculativeBackend::None,
-               .draft_window           = draft_window,
-               .attempted_per_position = std::vector<std::uint64_t>(draft_window, 0),
-               .accepted_per_position  = std::vector<std::uint64_t>(draft_window, 0),
+        prepared.speculative_stats = {
+            .backend                = speculative_backend,
+            .enabled                = speculative_backend != SpeculativeBackend::None,
+            .draft_window           = draft_window,
+            .attempted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+            .accepted_per_position  = std::vector<std::uint64_t>(draft_window, 0),
         };
     }
     prepared_state.prefix = context::PrefixBuilder(

@@ -33,9 +33,12 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
                    const PleBatchView& batch, const ConstPleConvStateView& before,
                    const PleConvRecordWindowView& current, const Tensor& updated,
                    const Tensor* norm_weight, float epsilon, const Tensor* normalized,
-                   CudaExecutionView execution);
+                   CudaExecutionView execution, const RaggedSequenceView* ragged = nullptr);
 void validate_extract(const ConstPleConvStateView& before, const PleConvRecordReadView& records,
                       const Tensor& accepted, const PleConvStateView& after,
                       const Tensor& live_rows, CudaExecutionView execution);
+void validate_extract(const ConstPleConvStateView& before, const Tensor& records,
+                      const RaggedSequenceView& ragged, const PleConvStateView& after,
+                      CudaExecutionView execution);
 
 } // namespace ninfer::ops::detail::ple

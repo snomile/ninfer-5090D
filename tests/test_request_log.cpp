@@ -52,6 +52,7 @@ int main() {
     options.launch.engine.prefill_chunk            = 1024;
     options.launch.logging.stats_interval_ms       = 2500;
     options.launch.engine.kv_cache                 = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
+    options.launch.engine.linear_state_dtype       = ninfer::LinearStateDType::BFloat16;
     options.launch.engine.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
     options.launch.engine.speculative.draft_tokens = 3;
     options.launch.engine.speculative.proposal_head = ninfer::ProposalHead::Optimized;
@@ -66,6 +67,7 @@ int main() {
     const Json startup = Json::parse(format_startup_config_json("test-startup", 1000, options));
     failures += check(startup.at("event") == "startup_config" &&
                           startup.at("schema_version") == kRequestLogSchemaVersion &&
+                          startup.at("configuration").at("engine.linear_state_dtype") == "bf16" &&
                           startup.at("configuration").at("generation.sampling.temperature") ==
                               static_cast<double>(0.6F) &&
                           startup.at("configuration").at("server.api_key") == "configured" &&
@@ -81,6 +83,7 @@ int main() {
     engine_options.pending_timeout_ms                = options.launch.engine.pending_timeout_ms;
     engine_options.prefill_chunk                     = options.launch.engine.prefill_chunk;
     engine_options.kv_cache                          = options.launch.engine.kv_cache;
+    engine_options.linear_state_dtype                = options.launch.engine.linear_state_dtype;
     engine_options.speculative                       = options.launch.engine.speculative;
     engine_options.enable_vision                     = options.launch.engine.enable_vision;
     engine_options.use_cuda_graph                    = options.launch.engine.use_cuda_graph;
@@ -117,6 +120,15 @@ int main() {
                                  {0, ninfer::ContextMemoryDomain::Host, 64ULL << 20, 153954304}};
     description.kv_pools.push_back({0, "main", 0});
     ninfer::StartupReport startup_report;
+    startup_report.speculative = ninfer::SpeculativeStartupSummary{
+        .backend              = ninfer::SpeculativeBackend::Mtp,
+        .length_policy        = ninfer::SpeculativeLengthPolicy::Adaptive,
+        .draft_window         = 3,
+        .calibrated           = true,
+        .calibration_anchors  = 12,
+        .calibration_contexts = 4,
+        .calibration_seconds  = 0.75,
+        .target_widths        = {1, 2, 4}};
     startup_report.load = load;
     startup_report.ranks.resize(1);
     ninfer::EngineSnapshot snapshot;
@@ -200,6 +212,8 @@ int main() {
     failures += check(server.at("server").at("default_thinking_budget") == 512,
                       "server thinking budget missing");
     failures += check(server.at("engine").at("kv_cache") == "fp8", "KV type missing");
+    failures += check(server.at("engine").at("linear_state_dtype") == "bf16",
+                      "linear state dtype missing");
     options.launch.engine.kv_cache = ninfer::KvCacheStorage::Nvfp4Group16;
     engine_options.kv_cache        = options.launch.engine.kv_cache;
     description.kv_cache           = options.launch.engine.kv_cache;
@@ -219,6 +233,17 @@ int main() {
     failures += check(server.at("engine").at("vision") == false, "Vision state missing");
     failures += check(server.at("engine").at("speculative_backend") == "mtp",
                       "speculative backend missing");
+    failures +=
+        check(server.at("engine").at("speculative_length_policy") == "adaptive" &&
+                  server.at("resources").at("speculative") == Json{{"backend", "mtp"},
+                                                                   {"length_policy", "adaptive"},
+                                                                   {"draft_window", 3},
+                                                                   {"calibrated", true},
+                                                                   {"calibration_anchors", 12},
+                                                                   {"calibration_contexts", 4},
+                                                                   {"calibration_seconds", 0.75},
+                                                                   {"target_widths", {1, 2, 4}}},
+              "startup speculative length policy and calibration are missing");
     failures +=
         check(server.at("engine").at("proposal_head") == "optimized", "proposal head missing");
     failures += check(
@@ -477,10 +502,13 @@ int main() {
                           .control_units                          = 1,
     };
     outcome.stats.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
+    outcome.stats.speculative.enabled               = true;
     outcome.stats.speculative.draft_window          = 3;
     outcome.stats.speculative.rounds                = 300;
+    outcome.stats.speculative.proposed_tokens       = 900;
     outcome.stats.speculative.drafted_tokens        = 900;
     outcome.stats.speculative.accepted_tokens       = 720;
+    outcome.stats.speculative.bypass_steps          = 3;
     outcome.stats.speculative.fallback_steps        = 2;
     outcome.stats.speculative.accepted_per_position = {290, 240, 190};
     outcome.stats.engine_request_id                 = 991;
@@ -563,8 +591,10 @@ int main() {
     failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
     failures +=
         check(done.at("speculative").at("draft_window") == 3, "speculative draft window missing");
-    failures += check(done.at("speculative").at("fallback_steps") == 2,
-                      "speculative fallback count missing");
+    failures += check(done.at("speculative").at("proposed_tokens") == 900 &&
+                          done.at("speculative").at("bypass_steps") == 3 &&
+                          done.at("speculative").at("fallback_steps") == 2,
+                      "request JSONL did not distinguish speculative counts");
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
               "speculative position counts missing");
@@ -714,10 +744,14 @@ int main() {
 
     ThroughputReport window;
     window.interval_seconds                                                                 = 5;
+    window.previous.speculative_proposed_tokens                                             = 125;
+    window.current.speculative_proposed_tokens                                              = 375;
     window.previous.speculative_draft_tokens                                                = 100;
     window.current.speculative_draft_tokens                                                 = 300;
     window.previous.speculative_accepted_tokens                                             = 50;
     window.current.speculative_accepted_tokens                                              = 110;
+    window.previous.speculative_bypass_steps                                                = 3;
+    window.current.speculative_bypass_steps                                                 = 7;
     window.current_execution[static_cast<std::size_t>(ninfer::ExecutionKind::Decode)].units = 2;
     window.current_execution[static_cast<std::size_t>(ninfer::ExecutionKind::Decode)].rows  = 4;
     window.current_execution[static_cast<std::size_t>(ninfer::ExecutionKind::Decode)]
@@ -725,17 +759,38 @@ int main() {
     const auto recent            = Json::parse(format_throughput_json("serve-test", 3002, window));
     failures += check(
         recent["speculative"]["acceptance"] == 0.3 &&
+            recent["speculative"]["proposed_tokens"] == 250 &&
+            recent["speculative"]["bypass_steps"] == 4 &&
             recent["execution"]["decode"]["mean_seconds"] == 0.01 &&
             recent["execution"]["prefill"]["mean_seconds"].is_null(),
         "recent statistics must divide token deltas and batch counts, retaining missing samples");
 
     const OperationalRecord pretty_done = render_request_done(context, outcome);
-    failures += check(
-        pretty_done.message ==
-            "req#7 done | openai-chat | output limit | prompt 401 | output 1,024 | cache 101 "
-            "(25.2%, checkpoint) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
-            "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | thinking 256/256, control 19",
-        "pretty request-done record mismatch");
+    failures +=
+        check(pretty_done.message ==
+                  "req#7 done | openai-chat | output limit | prompt 401 | output 1,024 | cache 101 "
+                  "(25.2%, checkpoint) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
+                  "decode 191.4 tok/s | mtp accepted 720/900 (80.0%), bypass 3 | thinking 256/256, "
+                  "control 19",
+              "pretty request-done record mismatch");
+    auto bypassed_outcome                              = outcome;
+    bypassed_outcome.stats.speculative.drafted_tokens  = 0;
+    bypassed_outcome.stats.speculative.accepted_tokens = 0;
+    bypassed_outcome.stats.speculative.proposed_tokens = 0;
+    bypassed_outcome.stats.speculative.rounds          = 0;
+    failures +=
+        check(render_request_done(context, bypassed_outcome).message.find(" | mtp bypass 3 |") !=
+                  std::string::npos,
+              "pretty request-done record hides all-bypass requests");
+    failures += check(render_throughput(window).message.find(
+                          "draft accepted 60/200 (30.0%), bypass 4") != std::string::npos,
+                      "pretty throughput hides bypass alongside verification");
+    window.current.speculative_draft_tokens    = window.previous.speculative_draft_tokens;
+    window.current.speculative_accepted_tokens = window.previous.speculative_accepted_tokens;
+    const auto bypass_only                     = render_throughput(window).message;
+    failures += check(bypass_only.find(" | bypass 4 |") != std::string::npos &&
+                          bypass_only.find("draft accepted") == std::string::npos,
+                      "pretty throughput hides all-bypass intervals");
 
     GenerationOutcome normalized_tool_outcome = outcome;
     normalized_tool_outcome.tool_calls.push_back(

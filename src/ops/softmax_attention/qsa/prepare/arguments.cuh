@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail::qsa {
 
@@ -55,5 +56,14 @@ struct PrepareArguments {
     float epsilon;
     double frequency[32];
     int token_begin = 0, row_begin = 0;
+    std::int64_t rope_axis_stride = 0, rope_row_stride = 0;
 };
+
+struct RaggedPrepareArguments : PrepareArguments {
+    const int *token_to_seq, *cu_seqlens;
+};
+
+template <bool Ragged>
+using PrepareInput = std::conditional_t<Ragged, RaggedPrepareArguments, PrepareArguments>;
+
 } // namespace ninfer::ops::detail::qsa

@@ -8,12 +8,56 @@ namespace ninfer::models::qwen3_5::detail {
 PendingBatch SessionImpl::generated_pending(const GeneratedResult& generated) {
     auto& current    = *execution;
     const auto batch = current.members.size();
-    if (!generated.row_stride || generated.tokens.size() != batch * generated.row_stride ||
+    if (!generated.row_stride ||
+        (current.kind == OperationKind::Prefill && generated.row_stride != 1) ||
+        generated.tokens.size() != batch * generated.row_stride ||
         generated.counts.size() != batch || generated.dead_positions.size() != batch)
         throw std::logic_error("generated result has an invalid shape");
-    if (current.kind == OperationKind::Decode &&
-        (generated.draft_extents.size() != batch || generated.accepted_drafts.size() != batch))
-        throw std::logic_error("decode result omitted its proposal extents");
+    const auto stride =
+        current.round ? current.round->route().mtp_steps + current.round->route().head_columns : 0U;
+    if (current.round) {
+        const auto& initial = *current.round;
+        const auto path     = plan.decode_path;
+        if (!generated.executed || generated.executed->verify_drafts.size() != batch)
+            throw std::logic_error("decode result omitted its executed route or extents");
+        const auto& [route, extents] = *generated.executed;
+        if (route.shape != initial.route().shape || route.width > initial.route().width ||
+            generated.row_stride != route.width ||
+            route.graph_entry.has_value() != initial.route().graph_entry.has_value())
+            throw std::logic_error("executed target route exceeds its frozen route");
+        if (route.graph_entry) {
+            const auto prepared = plan.decode_routes->at(route.shape);
+            if (std::ranges::find(prepared, route) == prepared.end())
+                throw std::logic_error("executed target used an unavailable graph");
+        }
+        std::vector<speculative::RoundMember> members;
+        std::vector<std::uint32_t> frontiers;
+        members.reserve(batch);
+        frontiers.reserve(batch);
+        for (std::size_t b = 0; b < batch; ++b) {
+            const auto limit = initial.verify_drafts()[b];
+            if (extents[b] > limit)
+                throw std::logic_error("executed target extent exceeds its frozen extent");
+            members.push_back({initial.slots()[b].owner, limit, limit});
+            frontiers.push_back(current.bases[b].metadata.execution_frontier);
+        }
+        if (route != initial.route() || !std::ranges::equal(extents, initial.verify_drafts())) {
+            auto target = speculative::DecodeRoundPlan::freeze(speculative_backend, draft_window, 1,
+                                                               members, route, extents);
+            current.observed_result.work.speculative =
+                std::make_shared<const SpeculativeExecutionGeometry>(target.geometry(path));
+            current.observed_result.work.scheduled_positions = target.valid_target_tokens();
+            current.cost_query = speculative::CostQuery::from_split_plan(
+                speculative_backend, initial, target, frontiers, capacity);
+        }
+    }
+    const auto top1_rows = current.round && draft_window && generated.row_stride == 1 ? batch : 0;
+    const auto valid_probability = [](float p) { return p >= 0.0f && p <= 1.0f; };
+    if (generated.draft_stride != stride || generated.draft_confidences.size() != batch * stride ||
+        generated.target_top1_probabilities.size() != top1_rows ||
+        !std::ranges::all_of(generated.draft_confidences, valid_probability) ||
+        !std::ranges::all_of(generated.target_top1_probabilities, valid_probability))
+        throw std::logic_error("generated probabilities differ from the decode round");
     PendingBatch out;
     out.ticket_    = current.ticket;
     out.members_   = current.members;
@@ -21,14 +65,16 @@ PendingBatch SessionImpl::generated_pending(const GeneratedResult& generated) {
     out.stride_    = generated.row_stride;
     out.execution_ = current.observed_result;
     for (std::size_t b = 0; b < batch; ++b) {
-        const auto count = generated.counts[b];
-        if (!count || count > generated.row_stride || count > 16)
+        const auto count   = generated.counts[b];
+        const bool sampled = current.kind == OperationKind::Decode || current.sampled[b];
+        if (sampled != (count != 0) || count > generated.row_stride || count > 16 ||
+            (current.kind == OperationKind::Prefill && count > 1) ||
+            (current.round && count - 1 > generated.executed->verify_drafts[b]))
             throw std::logic_error("generated result has an invalid licensed prefix");
+        if (current.kind == OperationKind::Prefill) out.sampled_.push_back(sampled);
         out.counts_.push_back(static_cast<std::int32_t>(count));
         out.failed_.push_back((generated.dead_positions[b] & ((1U << count) - 1)) != 0);
-        auto& state       = sequences[lane(current.members[b])];
-        auto& request     = requests[state.lane];
-        request.lifecycle = Lifecycle::Pending;
+        if (sampled) requests[lane(current.members[b])].lifecycle = Lifecycle::Pending;
     }
     return out;
 }
@@ -86,22 +132,29 @@ void SessionImpl::receive_result(runtime::ResultReady<ExecutionTypes>&& event) {
             request.capture_reservation && request.capture_reservation->frontier == end;
         if (current.kind == OperationKind::Prefill) {
             PrefillProgress progress;
-            progress.summary = {request.base->summary.prompt_tokens, request.prefill->base,
-                                request.prefill->reuse};
-            progress.processed_prompt_tokens = current.columns[0];
-            progress.capture_ready           = capture && !forward->generated;
-            progress.complete                = end == request.base->summary.prompt_tokens;
-
-            if (forward->generated) {
-                if (!progress.complete)
-                    throw std::logic_error("incomplete prefill produced a token");
+            progress.rows.reserve(current.members.size());
+            bool sampled = false;
+            for (std::size_t b = 0; b < current.members.size(); ++b) {
+                const auto& prefilling = requests[lane(current.members[b])];
+                const auto frontier    = current.completed[b].execution_frontier;
+                sampled |= current.sampled[b];
+                progress.rows.push_back({
+                    .summary = {prefilling.base->summary.prompt_tokens, prefilling.prefill->base,
+                                prefilling.prefill->reuse},
+                    .processed_prompt_tokens = current.columns[b],
+                    .complete                = bool(current.sampled[b]),
+                    .capture_ready           = prefilling.capture_reservation &&
+                                     prefilling.capture_reservation->frontier == frontier,
+                });
+            }
+            if (sampled != forward->generated.has_value())
+                throw std::logic_error("prefill result changed its sampling rows");
+            if (sampled) {
                 current.generated.emplace(std::move(*forward->generated));
                 progress.pending.emplace(generated_pending(*current.generated));
                 events.push_back({current.ticket, current.members, std::move(progress)});
                 return;
             }
-            if (progress.complete)
-                throw std::logic_error("completed prefill omitted its first token");
             current.completion.emplace(
                 SessionEvent{current.ticket, current.members, std::move(progress)});
         } else if (current.kind == OperationKind::Replay) {
@@ -199,6 +252,11 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
     auto& current = *execution;
     for (std::size_t b = 0; b < decisions.size(); ++b) {
         const auto& d = decisions[b];
+        if (!pending.row_sampled(b)) {
+            if (d.accepted_tokens || d.failed || d.terminal != d.cancelled)
+                throw std::logic_error("invalid unsampled prefill decision");
+            continue;
+        }
         if ((d.cancelled && d.failed) || (d.failed && !pending.failed_[b]) ||
             ((d.cancelled || d.failed)
                  ? (!d.terminal || d.accepted_tokens != 0)
@@ -242,7 +300,9 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
                 requests[l].speculative_stats.attempted_per_position.size());
             result.rows[b].speculative.accepted_per_position.reserve(
                 requests[l].speculative_stats.accepted_per_position.size());
-            physical.rows.push_back({d.accepted_tokens, d.terminal, d.cancelled || d.failed});
+            const auto physical_count =
+                pending.row_sampled(b) || d.cancelled ? d.accepted_tokens : current.columns[b];
+            physical.rows.push_back({physical_count, d.terminal, d.cancelled || d.failed});
             if (d.cancelled || d.failed) continue;
             state.ledger.prepare_append(d.accepted_tokens);
             const auto accepted = std::span<const TokenId>(pending.tokens_)
@@ -250,9 +310,12 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
             prefixes[b] =
                 state.prefix.prepare(requests[l].base->identity_view(state.ledger.view(accepted)),
                                      current.completed[b].execution_frontier);
-            recovery[b] = prepare_settlement(
-                l, current.completed[b], d.terminal ? Lifecycle::Finishable : Lifecycle::Active,
-                state.ledger.size() + d.accepted_tokens, *current.settlement);
+            recovery[b] =
+                prepare_settlement(l, current.completed[b],
+                                   !pending.row_sampled(b) ? Lifecycle::Prefilling
+                                   : d.terminal            ? Lifecycle::Finishable
+                                                           : Lifecycle::Active,
+                                   state.ledger.size() + d.accepted_tokens, *current.settlement);
         }
         current.settlement->prepare_actions();
         physical.context = current.settlement->actions();
@@ -279,7 +342,9 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
                                       .subspan(b * pending.stride_, d.accepted_tokens);
             state.ledger.append(accepted);
             state.prefix.commit(std::move(prefixes[b]));
-            request.lifecycle = d.terminal ? Lifecycle::Finishable : Lifecycle::Active;
+            request.lifecycle = !pending.row_sampled(b) ? Lifecycle::Prefilling
+                                : d.terminal            ? Lifecycle::Finishable
+                                                        : Lifecycle::Active;
             request.capture_pending =
                 request.capture_reservation &&
                 request.capture_reservation->frontier == current.completed[b].execution_frontier;
@@ -288,23 +353,29 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
             request.capture_pending = false;
             request.capture_reservation.reset();
             request.prefill.reset();
-        } else if (current.kind == OperationKind::Prefill && !request.capture_pending) {
+        } else if (current.kind == OperationKind::Prefill && pending.row_sampled(b) &&
+                   !request.capture_pending) {
             request.prefill.reset();
         }
         auto& stats = request.speculative_stats;
-        if (current.kind == OperationKind::Decode &&
+        if (current.kind == OperationKind::Decode && draft_window &&
             speculative_backend != SpeculativeBackend::None) {
-            const auto drafted  = current.generated->draft_extents.at(b);
-            const auto accepted = current.generated->accepted_drafts.at(b);
-            stats.committed_draft_tokens += std::min(d.accepted_tokens, accepted);
-            if (drafted)
-                ++stats.rounds;
-            else
-                ++stats.fallback_steps;
-            stats.drafted_tokens += drafted;
-            for (std::uint32_t i = 0; i < drafted; ++i) ++stats.attempted_per_position[i];
-            stats.accepted_tokens += accepted;
-            for (std::uint32_t j = 0; j < accepted; ++j) ++stats.accepted_per_position[j];
+            const auto& generated = *current.generated;
+            const auto drafted    = generated.executed->verify_drafts[b];
+            const auto proposed   = current.round->verify_drafts()[b];
+            const auto confidences =
+                drafted ? std::span<const float>(generated.draft_confidences)
+                              .subspan(b * generated.draft_stride, generated.draft_stride)
+                        : std::span<const float>{};
+            auto* feedback = plan.length_policy == SpeculativeLengthPolicy::Adaptive
+                                 ? &request.speculative_state
+                                 : nullptr;
+            speculative::record_speculative_commit(
+                stats, feedback, d, current.could_speculate[b], proposed, drafted,
+                generated.counts[b] - 1, confidences,
+                generated.target_top1_probabilities.empty()
+                    ? std::nullopt
+                    : std::optional{generated.target_top1_probabilities[b]});
         }
         auto& row         = result.rows[b];
         row.disposition   = d.cancelled  ? runtime::CommitDisposition::CancelledReleased
@@ -383,9 +454,16 @@ void SessionImpl::retire(runtime::DeviceRetired event) {
                                     request.base->summary.prompt_tokens);
         }
     }
+    if (current.kind == OperationKind::Decode && current.generated)
+        event.execution.work = current.observed_result.work;
     if (current.kind != OperationKind::Normalize && current.kind != OperationKind::Score)
         events.push_back({current.ticket, current.members,
                           runtime::ExecutionComplete{event.execution, current.members.size()}});
+    if (current.cost_query && current.record_online_cost && !current.discarded &&
+        std::ranges::none_of(current.decisions,
+                             [](const auto& d) { return d.cancelled || d.failed; }))
+        cost_model.observe_retired_step(*current.cost_query,
+                                        double(event.execution.latency.total_ns) * 1.0e-6);
     for (std::size_t b = 0; b < current.members.size(); ++b) {
         if (!valid_sequence(current.members[b])) continue;
         const auto l  = lane(current.members[b]);

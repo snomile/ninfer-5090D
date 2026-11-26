@@ -1,5 +1,7 @@
 #pragma once
 
+#include "suite.h"
+
 // Test-owned packed-weight fixtures for every registered quantized Weight format. Physical
 // row-split and block-scale codecs remain format-specific beneath one logical fixture interface.
 
@@ -140,12 +142,14 @@ inline double decode_e4m3fn(std::uint8_t word) {
     const std::uint32_t m = word & 0x07U;
     double magnitude      = 0.0;
     if (e == 0) {
-        magnitude = m == 0 ? 0.0 : static_cast<double>(m) * std::ldexp(1.0, -9);
+        magnitude = m == 0 ? 0.0 : static_cast<double>(m) * 0x1p-9;
     } else {
         if (e == 0x0fU && m == 0x07U) {
             throw std::invalid_argument("quantized-weight fixture: E4M3FN NaN scale");
         }
-        magnitude = (1.0 + static_cast<double>(m) / 8.0) * std::ldexp(1.0, static_cast<int>(e) - 7);
+        constexpr double powers[]{0, 0x1p-6, 0x1p-5, 0x1p-4, 0x1p-3, 0x1p-2, 0x1p-1, 1,
+                                  2, 4,      8,      16,     32,     64,     128,    256};
+        magnitude = (1.0 + static_cast<double>(m) / 8.0) * powers[e];
     }
     return negative ? -magnitude : magnitude;
 }
@@ -166,7 +170,7 @@ inline QuantSpec quant_spec(QType qtype) {
     case QType::Q6_G64_FP16:
         return {6, 64, 31, -32};
     case QType::Q8_G32_FP16:
-        return {8, 32, 127, -127};
+        return {8, 32, 127, -128};
     default:
         throw std::invalid_argument("row-split test packer: unsupported qtype");
     }
@@ -948,9 +952,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             const std::uint32_t row_mix =
                 static_cast<std::uint32_t>(row ^ (row >> 8) ^ (row >> 16));
             for (std::uint64_t byte = 0; byte < code_bytes_per_group; ++byte) {
-                std::uint8_t code = static_cast<std::uint8_t>(
+                const std::uint8_t code = static_cast<std::uint8_t>(
                     (row_mix * 37u + group * 29u + byte * 17u + seed) & 0xffu);
-                if (qtype == QType::Q8_G32_FP16 && code == 0x80u) { code = 0x81u; }
                 packed
                     .payload[static_cast<std::size_t>(group_index * code_bytes_per_group + byte)] =
                     code;
@@ -968,10 +971,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         for (std::size_t pattern = 0; pattern < 256; ++pattern) {
             std::uint64_t state = detail::mix64(static_cast<std::uint64_t>(seed) << 32 | pattern);
             for (std::size_t byte = 0; byte < code_bytes_per_group; ++byte) {
-                state              = detail::mix64(state + byte);
-                std::uint8_t value = static_cast<std::uint8_t>(state >> 56);
-                if (qtype == QType::Q8_G32_FP16 && value == 0x80U) { value = 0x81U; }
-                code_patterns[pattern][byte] = value;
+                state                        = detail::mix64(state + byte);
+                code_patterns[pattern][byte] = static_cast<std::uint8_t>(state >> 56);
             }
             for (std::size_t byte = 0; byte < high_bytes_per_group; ++byte) {
                 state                        = detail::mix64(state + 0x100U + byte);
@@ -1013,10 +1014,12 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             detail::pack_lowbit_group(codes, spec, nibble, high);
         }
     }
-    constexpr std::uint16_t kUnitScales[]  = {0x3800u, 0x3a00u, 0x3c00u, 0x3d00u};
-    constexpr std::uint16_t kSmallScales[] = {0x2040u, 0x2440u, 0x2840u, 0x2c40u};
-    constexpr std::uint16_t kTinyScales[]  = {0x1840u, 0x1c40u, 0x2040u, 0x2440u};
-    const std::uint16_t* scales            = nullptr;
+    constexpr std::uint16_t kUnitScales[]  = {0x3800u, 0xba00u, 0x3c00u, 0xbd00u};
+    constexpr std::uint16_t kSmallScales[] = {0x2040u, 0xa440u, 0x2840u, 0xac40u};
+    // Keep Tiny signs uniform per row (odd rows negated below) so correlated K-reduction tests
+    // exercise negative FP16 scales without cancelling out coherent sums.
+    constexpr std::uint16_t kTinyScales[] = {0x1840u, 0x1c40u, 0x2040u, 0x2440u};
+    const std::uint16_t* scales           = nullptr;
     switch (options.row_split_scale) {
     case RowSplitScalePattern::Unit:
         scales = kUnitScales;
@@ -1036,9 +1039,12 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             options.row_split_codes == RowSplitCodePattern::Hashed
                 ? (detail::mix64(i ^ (static_cast<std::uint64_t>(seed) << 17)) >> 8) & 3U
                 : (row ^ (row >> 8) ^ group ^ seed) & 3U;
+        const std::uint16_t sign_bit =
+            (options.row_split_scale == RowSplitScalePattern::Tiny && (row & 1U) != 0U) ? 0x8000u
+                                                                                        : 0u;
         detail::store_u16_le(packed.payload,
                              static_cast<std::size_t>(packed.scale_plane_offset + i * 2),
-                             scales[scale_index]);
+                             static_cast<std::uint16_t>(scales[scale_index] ^ sign_bit));
     }
 
     packed.weight.qtype            = qtype;
@@ -1174,14 +1180,16 @@ inline std::vector<float> materialize_rows_fp32(const PackedWeight& packed,
         throw std::invalid_argument("quantized-weight fixture: row selection is empty");
     }
     std::vector<float> result(static_cast<std::size_t>(packed.weight.k) * rows.size());
-    for (std::size_t selected = 0; selected < rows.size(); ++selected) {
-        const std::int32_t row = rows[selected];
-        for (std::int32_t column = 0; column < packed.weight.k; ++column) {
-            result[selected * static_cast<std::size_t>(packed.weight.k) +
-                   static_cast<std::size_t>(column)] =
-                static_cast<float>(logical_weight_fp64(packed, row, column));
+    parallel_rows(rows.size(), result.size(), [&](int first, int last) {
+        for (int selected = first; selected < last; ++selected) {
+            const std::int32_t row = rows[selected];
+            for (std::int32_t column = 0; column < packed.weight.k; ++column) {
+                result[selected * static_cast<std::size_t>(packed.weight.k) +
+                       static_cast<std::size_t>(column)] =
+                    static_cast<float>(logical_weight_fp64(packed, row, column));
+            }
         }
-    }
+    });
     return result;
 }
 

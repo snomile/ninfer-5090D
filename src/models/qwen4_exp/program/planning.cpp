@@ -13,7 +13,7 @@ namespace {
 PersistentLayout persistent(const execution::ModelProfile& p, const EngineOptions& o) {
     LayoutBuilder b;
     PersistentLayout out;
-    out.state = plan_state_image(p.config, p.local.gdn);
+    out.state = plan_state_image(p.config, p.local.gdn, o.linear_state_dtype);
     out.main  = plan_qsa_cache(b, p.local.qsa, p.config.text.qsa_layers, o.max_context,
                                o.max_concurrency, o.kv_cache);
     if (p.mtp)
@@ -83,9 +83,12 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
     if (!batches || batches->resident_capacity() != o.max_concurrency ||
         batches->attention_owners() != 1)
         throw std::invalid_argument("Qwen4Exp batch plan differs from execution configuration");
-    out.batches           = std::move(batches);
-    out.profile           = std::move(profile);
-    out.shape             = describe_execution_shape(*out.profile, o);
+    out.batches = std::move(batches);
+    out.profile = std::move(profile);
+    out.shape   = describe_execution_shape(*out.profile, o);
+    if (out.shape.cuda_graph)
+        out.decode_routes = std::make_shared<const speculative::DecodeGraphRoutes>(
+            *out.batches, o.speculative.backend, out.shape.draft_tokens);
     out.persistent        = persistent(*out.profile, o);
     out.workspace         = execution::plan_workspace(*out.profile, o, o.prefill_chunk,
                                                       device.multiprocessor_count(), schedule);
@@ -114,7 +117,8 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
     if (out.persistent.buffers.sampled_ids) {
         out.pinned_sampling_bytes = out.persistent.buffers.grammar_masks->region.bytes;
         const auto& buffers       = out.persistent.buffers;
-        const auto end            = *buffers.output_counts;
+        const auto& end =
+            buffers.draft_confidences ? *buffers.draft_confidences : *buffers.output_counts;
         out.pinned_output_bytes =
             end.region.offset + end.region.bytes - buffers.sampled_ids->region.offset;
     }
@@ -135,7 +139,9 @@ ExecutionShape describe_execution_shape(const execution::ModelProfile& profile,
             o.purpose,
             o.context_cache.enabled,
             o.use_cuda_graph,
-            o.observability.gpu_timing};
+            o.observability.gpu_timing,
+            o.speculative.length_policy,
+            o.linear_state_dtype};
 }
 
 std::size_t ExecutionPlan::device_bytes() const {

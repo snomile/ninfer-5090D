@@ -7,18 +7,21 @@
 
 namespace ninfer::ops::detail::qsa {
 
+template <bool StridedRope>
 __device__ __forceinline__ int coordinate(const PrepareArguments& a, int t, int b, int axis) {
-    return a.rope[t + std::int64_t(a.tokens) * ((a.axes == 1 ? 0 : axis) + a.axes * b)];
+    const int aidx = a.axes == 1 ? 0 : axis;
+    if constexpr (StridedRope) return a.rope[t + a.rope_axis_stride * aidx + a.rope_row_stride * b];
+    return a.rope[t + std::int64_t(a.tokens) * (aidx + a.axes * b)];
 }
 
-template <bool BoundedPhase>
+template <bool BoundedPhase, bool StridedRope>
 __device__ __forceinline__ void prepare_raw(const PrepareArguments& a, int t, int b, int lane,
                                             std::int64_t m) {
     const int record = a.offsets[b] + t;
 #pragma unroll
     for (int j = 0; j < 4; ++j)
         *a.raw_records.at(lane + 32 * j, record, b) = a.ik[m * 128 + lane + 32 * j];
-    if (lane < 3) *a.rope_records.at(lane, record, b) = coordinate(a, t, b, lane);
+    if (lane < 3) *a.rope_records.at(lane, record, b) = coordinate<StridedRope>(a, t, b, lane);
     const int p = a.positions[m];
     if (p % 4 != 3) return;
     const int base = a.positions[std::int64_t(b) * a.tokens], first = p - 3;
@@ -34,8 +37,8 @@ __device__ __forceinline__ void prepare_raw(const PrepareArguments& a, int t, in
 #pragma unroll
     for (int c = 0; c < 4; ++c) pooled[c] = __bfloat162float(__float2bfloat16_rn(pooled[c]));
     const int axis = lane % 3;
-    const int rho =
-        first < base ? *a.first_rope.at(axis, 0, b) : coordinate(a, first - base, b, axis);
+    const int rho   = first < base ? *a.first_rope.at(axis, 0, b)
+                                   : coordinate<StridedRope>(a, first - base, b, axis);
     const float2 sc = prepare_sincos<BoundedPhase>(a.frequency[lane], rho);
     norm_rotate<128>(pooled, a.wik, a.epsilon, sc, lane);
     const auto page = a.tables[p / 64 + std::int64_t(a.table_rows[b]) * a.table_stride];
@@ -57,7 +60,7 @@ struct PrepareGeometry {
 // Compression reads immutable projections/tail, never records.
 // A carried block retains its first token's three axes even when current coordinates use A=1.
 template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights, bool TokenMajor,
-          int KvHeads, bool Queries, bool VectorKv = KvHeads == 4>
+          int KvHeads, bool Queries, bool VectorKv = KvHeads == 4, bool StridedRope = false>
 __global__ __launch_bounds__(128) void prepare_kernel(const __grid_constant__ PrepareArguments a) {
     using Geometry = PrepareGeometry<KvHeads, Queries>;
     const int t    = a.token_begin + (TokenMajor ? blockIdx.x / Geometry::groups : blockIdx.x);
@@ -71,8 +74,8 @@ __global__ __launch_bounds__(128) void prepare_kernel(const __grid_constant__ Pr
     // prepare_raw itself; it never consumes the current token's coefficients.
     const bool current_coefficients = group * Geometry::warps < Geometry::raw_task;
     if (live && current_coefficients && threadIdx.x < 32)
-        coefficients[lane] =
-            prepare_sincos<BoundedPhase>(a.frequency[lane], coordinate(a, t, b, lane % 3));
+        coefficients[lane] = prepare_sincos<BoundedPhase>(
+            a.frequency[lane], coordinate<StridedRope>(a, t, b, lane % 3));
     __syncthreads();
     if constexpr (Queries) {
         if (task < Geometry::query_heads) {
@@ -102,7 +105,91 @@ __global__ __launch_bounds__(128) void prepare_kernel(const __grid_constant__ Pr
                                          coefficients[lane]);
         }
     } else if (live && task == Geometry::raw_task) {
-        prepare_raw<BoundedPhase>(a, t, b, lane, m);
+        prepare_raw<BoundedPhase, StridedRope>(a, t, b, lane, m);
+    }
+}
+
+template <bool BoundedPhase, bool SingleSegment>
+__device__ __forceinline__ void prepare_ragged_pool(const RaggedPrepareArguments& a, int t,
+                                                    int lane) {
+    const int p = a.positions[t];
+    if (p % 4 != 3) return;
+    const int seg       = SingleSegment ? 0 : a.token_to_seq[t];
+    const int seg_begin = SingleSegment ? 0 : a.cu_seqlens[seg];
+    const int base = a.positions[seg_begin], first = p - 3;
+    float pooled[4]{};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int token = first + j;
+        const auto* raw = token < base ? a.tail.at(0, token - (base - base % 4), seg)
+                                       : a.ik + (std::int64_t(seg_begin) + token - base) * 128;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) pooled[c] += 0.25F * __bfloat162float(raw[lane + 32 * c]);
+    }
+#pragma unroll
+    for (int c = 0; c < 4; ++c) pooled[c] = __bfloat162float(__float2bfloat16_rn(pooled[c]));
+    const int axis  = lane % 3;
+    const int rho   = first < base ? *a.first_rope.at(axis, 0, seg)
+                                   : coordinate<true>(a, seg_begin + (first - base), 0, axis);
+    const float2 sc = prepare_sincos<BoundedPhase>(a.frequency[lane], rho);
+    norm_rotate<128>(pooled, a.wik, a.epsilon, sc, lane);
+    const auto page = a.tables[p / 64 + std::int64_t(a.table_rows[seg]) * a.table_stride];
+    auto* out       = a.index_keys.at((p / 4) % 16, 0, page);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) out[lane + 32 * j] = __float2bfloat16_rn(pooled[j]);
+}
+
+template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights, bool TokenMajor,
+          int KvHeads, bool Queries, bool VectorKv, bool SingleSegment>
+__global__ __launch_bounds__(128) void prepare_ragged_kernel(
+    const __grid_constant__ RaggedPrepareArguments a) {
+    using Geometry  = PrepareGeometry<KvHeads, Queries>;
+    const int t     = a.token_begin + (TokenMajor ? blockIdx.x / Geometry::groups : blockIdx.x);
+    const int lane  = threadIdx.x % 32;
+    const int group = TokenMajor ? blockIdx.x % Geometry::groups : blockIdx.z;
+    const int task  = group * Geometry::warps + threadIdx.x / 32;
+    const auto m    = std::int64_t(t);
+    __shared__ float2 coefficients[32];
+    // A raw-only group needs the pooled block's first coordinate, computed by
+    // prepare_raw itself; it never consumes the current token's coefficients.
+    const bool current_coefficients = group * Geometry::warps < Geometry::raw_task;
+    if (current_coefficients && threadIdx.x < 32)
+        coefficients[lane] =
+            prepare_sincos<BoundedPhase>(a.frequency[lane], coordinate<true>(a, t, 0, lane % 3));
+    __syncthreads();
+    if constexpr (Queries) {
+        if (task < Geometry::query_heads) {
+            const auto offset = (m * Geometry::query_heads + task) * 256;
+            vector_head<256, VectorWeights>(a.q + offset, a.wq, a.out_q + offset, a.epsilon,
+                                            coefficients, lane, true);
+            return;
+        }
+        if (task < Geometry::key_task) {
+            const auto offset = (m * 4 + task - Geometry::query_heads) * 128;
+            vector_head<128, VectorWeights>(a.iq + offset, a.wiq, a.out_iq + offset, a.epsilon,
+                                            coefficients, lane, true);
+            return;
+        }
+    }
+    if (task < Geometry::raw_task) {
+        // The cache helpers consume one rectangular row. Bind its table selector to
+        // the packed token's segment, keeping the projection/position index flat.
+        PrepareArguments token = a;
+        if constexpr (!SingleSegment) token.table_rows += a.token_to_seq[t];
+        if constexpr (VectorKv) {
+            prepare_kv_vector<Storage, KvHeads>(token, task - Geometry::key_task, t, 0, lane,
+                                                coefficients);
+        } else if constexpr (Storage == KvCacheStorage::Nvfp4Group16 ||
+                             Storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            __shared__ float scratch[KvHeads][256];
+            prepare_kv<Storage, KvHeads>(token, task - Geometry::key_task, t, 0, lane,
+                                         coefficients[lane], scratch[task - Geometry::key_task]);
+        } else {
+            prepare_kv<Storage, KvHeads>(token, task - Geometry::key_task, t, 0, lane,
+                                         coefficients[lane]);
+        }
+    } else if (task == Geometry::raw_task) {
+        prepare_ragged_pool<BoundedPhase, SingleSegment>(a, t, lane);
     }
 }
 

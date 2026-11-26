@@ -64,6 +64,10 @@ Vision 窗口和通信资源分别由其 owner 计费。互斥 scratch 取峰值
 快照中，不重复扣费。正式资源与控制侧目录建立后再核验总预算，自动容量允许有界纠偏，
 显式容量保持原要求。模型、Op 和实际分配错误保留自身原因。
 
+自适应 speculative 启动在 Graph 规划中用全宽基线门控窄 target 图，以保留 Context 容量。
+正式 Program 与 Context 准备后、接纳请求前，`StartupPhase::SpeculativeCalibration` 在临时
+COW Context 分支校准执行成本。门控和测量口径见[Speculative 执行](speculative-decoding.md#物理成本模型启动校准与窄图门控)。
+
 实现入口：[启动预算](../../src/runtime/engine/startup_memory.h)、
 [容量求解](../../src/runtime/engine/context_capacity.h)、
 [Graph 准备](../../src/models/common/graph_preparation.h)。
@@ -79,8 +83,12 @@ lane 的复用不改变旧 ticket 的成员身份。暂停保存请求的输出�
 恢复可以绑定新的 lane。Replay 重建数学状态，不重复发布旧输出、采样或计入生成预算。
 
 调度先消费完成和终态事件，为必要恢复及已驻留请求取得执行许可，再以余量接纳新请求。
-Control、紧凑 Decode 和分块 Prefill/Replay 共享这套生命周期。Prefill 内部的媒体和数学分段
-由模型推进，不自动形成新的调度轮次。缓存与抢占规则见[Context 管理](context-management.md)。
+Control、紧凑 Decode、多请求打包 Prefill 和独占 Replay 共享这套生命周期。
+多请求 Prefill 按模型声明的 `PrefillBudgetPolicy` 与 placement 公平水位线（water-filling）分配本步 token 预算：
+主请求持有硬 Context 预留，其余文本 Prefill 请求仅在存在即时可用容量时搭车入批，不触发缓存驱逐、迁移或抢占；
+主请求未填满预算且有新请求正在无传输绑定时，允许有界短窗口等待以合并打包。
+Vision Prefill 与 Replay 仍独占单请求执行步；单请求内部的媒体和数学分段由模型推进，不自动形成新的调度轮次。
+缓存与抢占规则见[Context 管理](context-management.md)，打包批次合同见[并发执行](concurrent-execution.md#packed-prefill)。
 
 Session 组合 Context 预留与 Executor 额度后，才进入不可撤销的目录准备。许可包含后续决定、
 提交或丢弃所需的资源；不能计算完再竞争用于提交的空间。尚未提交的独立预留可以撤销；
@@ -97,7 +105,8 @@ Session 组合 Context 预留与 Executor 额度后，才进入不可撤销的�
 
 生成先产生 provisional 结果。Frontend preview 确定符合 EOS、停止、预算和取消要求的实际前缀；
 模型接受提交后，Session 更新账本与前沿，OutputSession 才正式接受并发布输出。
-提交失败不能留下已经对外发布却没有模型状态支持的 token。
+多请求打包 Prefill 允许在同一冻结成员事务中混合“完成 prompt 后缀并采样首 token 的行”与“仅推进中间块的续算行”，
+二者共用单次提交与退役边界。提交失败不能留下已经对外发布却没有模型状态支持的 token。
 
 接受长度驱动 State fold、history 覆盖、conditioning 和计数更新。未采用后缀可能仍留有物理字节，
 但不成为可恢复内容。可观察结果返回、逻辑采用与最终异步退役各有边界；
@@ -115,7 +124,9 @@ CPU 任务池处理独立任务，CPU collective 团队服务算术；模型调�
 
 Eager 与 Graph 使用同源数学组合。图绑定稳定 backing、frame 和执行表，实际请求通过 offsets、
 positions、有效长度和行映射进入。图变体只表达必要的物理几何与计算主体；采样配置、实际采用长度
-和请求身份作为数据输入。Attention 的局部节点更新遵循 Op 合同，不改变外层通信次序。
+和请求身份作为数据输入。Attention/Indexer 随 `ops::ContextBucket` 变化，由
+`ContextBucketSite` 在扁平 `DecodeGraphSuite` 图内更新 `DecodeGraphKernelSlice` 的 kernel 参数，
+保持外层拓扑和 collective 次序。双槽 Host producer/hook 交接使用 `SlotPatchSite` 更新 child graph。
 
 需要 Host grammar、CPU expert 或最终接受结果的边界显式交接。可捕获的连续设备段保持完整，
 PLE 的数据来源本身不决定 Main 切图。图、事件和注册视图先于其借用的 backing 销毁。

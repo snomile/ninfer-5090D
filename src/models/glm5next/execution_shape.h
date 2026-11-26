@@ -11,6 +11,9 @@ struct ExecutionShape {
     EnginePurpose purpose;
     bool context_cache, gpu_timing;
     SpeculativeBackend speculative               = SpeculativeBackend::None;
+    bool narrow_dflash_targets                   = false;
+    SpeculativeLengthPolicy length_policy        = SpeculativeLengthPolicy::Adaptive;
+    LinearStateDType linear_state_dtype          = LinearStateDType::Float32;
     bool operator==(const ExecutionShape&) const = default;
 };
 

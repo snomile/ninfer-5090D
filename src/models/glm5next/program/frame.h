@@ -39,7 +39,7 @@ struct SpeculativeFrameLayout {
 };
 
 struct DFlashFrameLayout {
-    TensorRegion features, ids, positions, valid_columns, window_count;
+    TensorRegion features, ids, positions, valid_columns, proposal_rows, window_count;
     TensorRegion candidate_ids, proposal_q;
 };
 
@@ -55,6 +55,28 @@ struct MtpFrameLayout {
     std::array<TensorRegion, 3> tail_offsets;
 };
 
+struct RaggedLayout {
+    TensorRegion cu_seqlens, seq_lengths, token_to_seq;
+};
+
+struct PackedMtpLayout {
+    RaggedLayout ragged;
+    TensorRegion input_segments, skip_first, base_positions, table_rows;
+    TensorRegion source_offsets, destination_offsets;
+};
+
+struct PackedDFlashLayout {
+    RaggedLayout ragged;
+    TensorRegion source_indices, local_indices;
+};
+
+struct PackedPrefillLayout {
+    RaggedLayout global, local;
+    TensorRegion source_offsets, destination_offsets, local_tables, sampled_offsets;
+    std::optional<PackedMtpLayout> mtp;
+    std::optional<PackedDFlashLayout> dflash;
+};
+
 struct FrameLayout {
     BatchLayout main, decode;
     RowLayout rows;
@@ -66,12 +88,14 @@ struct FrameLayout {
     std::optional<SpeculativeFrameLayout> speculative;
     std::optional<MtpFrameLayout> mtp;
     std::optional<DFlashFrameLayout> dflash;
+    std::optional<PackedPrefillLayout> packed_prefill;
     std::optional<TensorRegion> logits, token_counts, sampling, grammar_masks;
     std::optional<TensorRegion> candidates, gathered_candidates, sampled_ids, output_counts;
+    std::optional<TensorRegion> top1_probabilities, draft_confidences;
     std::optional<TensorRegion> visual_indices;
 };
 
-void reshape_frame_controls(FrameLayout&, PhysicalBatchShape, std::uint32_t width);
+void reshape_frame_controls(FrameLayout&, PhysicalBatchShape);
 
 [[nodiscard]] FrameLayout plan_frame(LayoutBuilder&, const execution::ModelProfile&,
                                      const ExecutionShape&);

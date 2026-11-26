@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
         auto& device = ninfer::bench::device_context();
         L2FlushBuffer flush(options.timing.flush_bytes);
         measurement::Csv csv(options.timing.csv_out,
-                             std::string(gdn::Traffic::columns) + ",row_metadata");
+                             std::string(gdn::Traffic::columns) + ",row_metadata,state_dtype");
         for (int t : options.tokens) {
             measurement::Row row;
             row.op            = options.op;
@@ -31,22 +31,18 @@ int main(int argc, char** argv) {
                             execution, cache, traffic.active_rows == 0);
                         csv.write(row, r, execution, cache,
                                      traffic.csv(r.gpu.median_us) + ',' +
-                                         (options.op == "fold" ? options.row_metadata : "none"));
+                                         (options.op == "fold" ? options.row_metadata : "none") + ',' +
+                                         gdn_replay::state_dtype_name(options.state_dtype));
                     }
             };
             if (options.op == "fold") {
-                gdn_replay::FoldFixture f(options.profile, t, options.batch);
+                gdn_replay::FoldFixture f(options.profile, t, options.batch, options.state_dtype);
                 const auto counts = gdn_replay::extents(options.commits, t, options.batch, true);
-                constexpr int small_records[] = {10, 2, 8, 0, 6, 4, 9, 1};
-                const auto record             = [&](int b) {
-                    return options.batch <= 8 ? small_records[b] : b + 3;
-                };
+                const auto offsets = f.offsets();
                 std::vector<ops::GdnReplayFoldRow> rows;
                 for (int b = 0; b < options.batch; ++b)
-                    rows.push_back({f.byte_offset(record(b)), f.byte_offset(record(b)), counts[b]});
+                    rows.push_back({offsets[b], offsets[b], counts[b]});
                 const bool on_device = options.row_metadata == "device";
-                std::vector<std::int64_t> offsets(options.batch);
-                for (int b = 0; b < options.batch; ++b) offsets[b] = f.byte_offset(record(b));
                 auto selected = on_device ? gdn_replay::make_offsets(offsets) : DeviceBuffer{};
                 auto prefixes = on_device ? measurement::make_i32(counts) : DeviceBuffer{};
                 Tensor selectors, commits;
@@ -65,14 +61,15 @@ int main(int argc, char** argv) {
                     [&](CudaExecutionView cuda) { f.restore(cuda); },
                     gdn::fold_traffic(options.profile.layers, options.profile.qk_heads,
                                       options.profile.value_heads, options.profile.conv_channels,
-                                      counts));
+                                      counts, options.state_dtype));
             } else {
                 auto valid = gdn_replay::extents(options.valid, t, options.batch, false);
                 const auto traffic =
                     gdn::record_traffic(options.profile.qk_heads, options.profile.value_heads, t,
-                                        valid, options.valid != "dense");
+                                        valid, options.valid != "dense", options.state_dtype);
                 if (options.valid == "dense") valid.clear();
-                gdn_replay::RecordFixture f(options.profile, t, options.batch, valid);
+                gdn_replay::RecordFixture f(options.profile, t, options.batch, valid,
+                                            options.state_dtype);
                 row.valid = gdn_replay::csv_extent(options.valid);
                 run([&](CudaExecutionView cuda) { f.launch_record(cuda); }, [](auto) {}, traffic);
             }

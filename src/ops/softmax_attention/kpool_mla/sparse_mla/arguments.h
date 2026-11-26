@@ -28,7 +28,6 @@ struct SparseMlaArguments {
     int first_row = 0, last_row = 0;
     int preferred_splits = 0, split_wave_size = 0;
     float scale;
-    bool direct              = false;
     std::size_t latent_bytes = 0;
 
     __device__ MlaWork work(int local) const {
@@ -57,5 +56,19 @@ struct SparseMlaArguments {
     __device__ std::int64_t partial(int local, int split, int head, int stride) const {
         return (std::int64_t(local) * stride + split) * 64 + head;
     }
+};
+
+struct PackedSparseMlaArguments : SparseMlaArguments {
+    const int* token_to_seq;
+
+    __device__ MlaWork work(int local) const {
+        if (local >= width) return {};
+        const int row = selection_rows[begin + local], end = ends[row], pools = counts[row];
+        return {row, end, pools, 4 * pools + end % 4};
+    }
+
+    __device__ int segment(int local) const { return token_to_seq[begin + local]; }
+
+    __device__ int execution_splits() const { return splits; }
 };
 } // namespace ninfer::ops::detail::kpool

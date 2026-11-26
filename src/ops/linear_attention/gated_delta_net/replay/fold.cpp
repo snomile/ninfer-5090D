@@ -10,6 +10,12 @@ namespace ninfer::ops {
 namespace {
 using detail::gated_delta_net::kStateDim;
 using detail::gated_delta_net::kHostFoldRows;
+using ninfer::detail::GdnReplayRecordAccess;
+
+std::array<const Tensor*, 4> record_planes(const GdnReplayRecords& records) {
+    const auto [key, delta, alpha] = GdnReplayRecordAccess::planes(records);
+    return {&records.conv, &key, &delta, &alpha};
+}
 
 void validate_fold_records(const GdnReplayRecords& records) {
     constexpr const char* kOp       = "gdn_replay_fold";
@@ -25,17 +31,17 @@ void validate_fold_records(const GdnReplayRecords& records) {
     const std::int32_t outer = spec.layers * spec.record_capacity;
     common::operand::tensor(records.conv, DType::BF16, {spec.conv_channels, spec.width, outer}, 256,
                             kOp, "conv records", records.conv.device);
-    common::operand::tensor(records.key, DType::BF16, {kStateDim, spec.qk_heads, spec.width, outer},
-                            256, kOp, "key records", records.conv.device);
-    common::operand::tensor(records.value, DType::BF16,
-                            {kStateDim, spec.value_heads, spec.width, outer}, 256, kOp,
-                            "value records", records.conv.device);
-    common::operand::tensor(records.gate, DType::FP32, {2, spec.value_heads, spec.width, outer},
-                            256, kOp, "gate records", records.conv.device);
+    const auto [key, delta, alpha] = GdnReplayRecordAccess::planes(records);
+    common::operand::tensor(key, DType::BF16, {kStateDim, spec.qk_heads, spec.width, outer}, 256,
+                            kOp, "key records", records.conv.device);
+    common::operand::tensor(delta, DType::FP32, {kStateDim, spec.value_heads, spec.width, outer},
+                            256, kOp, "delta records", records.conv.device);
+    common::operand::tensor(alpha, DType::FP32, {spec.value_heads, spec.width, outer}, 256, kOp,
+                            "alpha records", records.conv.device);
 
     const std::array<common::operand::Range, 4> record_ranges{
-        common::operand::range(records.conv, kOp), common::operand::range(records.key, kOp),
-        common::operand::range(records.value, kOp), common::operand::range(records.gate, kOp)};
+        common::operand::range(records.conv, kOp), common::operand::range(key, kOp),
+        common::operand::range(delta, kOp), common::operand::range(alpha, kOp)};
     common::operand::disjoint(record_ranges, "gdn_replay_fold: record planes overlap");
 }
 
@@ -48,11 +54,12 @@ void validate_fold_states(const GdnReplayRecords& records,
         state.conv_channels != record.conv_channels || state.conv_width != 3 ||
         state.value_heads != record.value_heads || state.value_head_dim != kStateDim ||
         state.key_head_dim != kStateDim || state.conv_dtype != DType::BF16 ||
+        !detail::gated_delta_net::is_supported_state_dtype(state.recurrent_dtype) ||
         states.conv.field.layers != state.layers || states.recurrent.field.layers != state.layers)
         throw std::invalid_argument("gdn_replay_fold: state geometry does not match records");
     common::operand::state_field(states.conv, DType::BF16, {record.conv_channels, 3}, 256, op,
                                  "convolution state", records.conv.device, false);
-    common::operand::state_field(states.recurrent, DType::FP32,
+    common::operand::state_field(states.recurrent, state.recurrent_dtype,
                                  {kStateDim, kStateDim, record.value_heads}, 256, op,
                                  "recurrent state", records.conv.device, false);
     if (states.conv.records.storage.data != states.recurrent.records.storage.data ||
@@ -92,8 +99,7 @@ void validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAll
                              selected_field(states.recurrent, selected.destination_offset)};
         for (const auto& fields : {sources[row], destinations[row]})
             for (const auto& field : fields)
-                for (const auto* record :
-                     {&records.conv, &records.key, &records.value, &records.gate})
+                for (const auto* record : record_planes(records))
                     if (common::operand::overlaps(
                             field, common::operand::range(*record, "gdn_replay_fold")))
                         throw std::invalid_argument(
@@ -165,10 +171,14 @@ void GdnReplayFoldPlan::execute(const Tensor& source_offsets, const Tensor& dest
                                 execution.device());
     common::operand::tensor(commit_columns, DType::I32, {batch}, 4, op, "commit columns",
                             execution.device());
-    for (const auto* metadata : {&source_offsets, &destination_offsets, &commit_columns})
-        for (const auto* record : {&records_.conv, &records_.key, &records_.value, &records_.gate})
-            common::operand::disjoint(common::operand::range(*metadata, op),
-                                      common::operand::range(*record, op), op);
+    const auto state_arena = states_.conv.records.storage;
+    for (const auto* metadata : {&source_offsets, &destination_offsets, &commit_columns}) {
+        const auto range = common::operand::range(*metadata, op);
+        common::operand::disjoint(
+            range, common::operand::range(state_arena.data, state_arena.bytes, op), op);
+        for (const auto* record : record_planes(records_))
+            common::operand::disjoint(range, common::operand::range(*record, op), op);
+    }
     for (std::int64_t begin = 0; begin < batch; begin += 65535)
         detail::gated_delta_net::launch_replay_fold(
             records_, states_,

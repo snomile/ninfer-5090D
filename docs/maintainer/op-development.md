@@ -16,6 +16,10 @@ Family 按计算与维护关系组织。相同模型层的多个计算不自动�
 Text/MTP token 轴的合法范围由语义合同决定。私有 tile、网格和 route 阈值不能收紧公开范围；
 实现可以拆分合法调用。Host envelope 只承诺 Device 值的范围，精确数学仍由设备输入决定。
 
+Attention/Indexer 的公开 [`ContextBucket` / `OpGraphProfile`](../../include/ninfer/ops/context_bucket.h)
+合同让调用方随上下文增长在扁平 CUDA Graph 内更新 kernel 参数切片。调用方据 Op 返回的
+profile 判断哪些桶可共享 patch，内部 selector 由 Op 维护。
+
 ## 代码组织
 
 | 职责 | 内容 |
@@ -47,8 +51,8 @@ alias 与资源要求。实际注册 shape 在实现中维护。头文件不记�
 文档也不复制这些声明。
 
 Observable 中间舍入属于合同；私有 accumulator、reduction tree、staging 和执行分解由实现决定。
-随机 Op 显式接收 seed、逻辑位置及所需概率输入。Exact transform 或 ReplaySSM 的精确关系按其
-专门合同说明，不能推广为所有浮点实现逐 bit 一致。
+随机 Op 显式接收 seed、逻辑位置及所需概率输入。Exact transform/codec 及各 Op 明确声明的精确
+写域（如卷积 history words、零尾与未触及槽位）按其专门合同说明，不能推广为所有浮点实现逐 bit 一致。
 
 CUDA Op 接收 owning DeviceContext 传下来的 CudaExecutionView，CPU Op 借用 CpuExecutionView。
 检查真实 operands 和 workspace 的位置；不在调用点从 tensor 与裸 stream 临时拼装执行环境。
@@ -59,15 +63,29 @@ Workspace 由调用者提供，Op 仅在 scope 中借用，不隐藏设备分配
 必须覆盖非单调 route 的高水位；不能只测区间上界。固定零 scratch 的入口省去 arena 和查询。
 Host scope 退出不结束 GPU 使用，复用仍遵循 stream 与消费者寿命。
 
+### Ragged / Varlen 合同
+
+支持多请求打包 Prefill 的有状态算子通过公共 [RaggedSequenceView](../../include/ninfer/ops/ragged.h) 接入，
+沿一维紧凑 token 轴处理 `S = num_seqs() >= 1` 个非空段（每段长度 `L_s >= 1`），总列数为 `N = total_tokens()`：
+
+- `host_cu_seqlens` 长度为 `S + 1`，从 `0` 严格递增至 `N`；调用方保证设备侧连续 `I32` 元数据
+  `cu_seqlens`、`seq_lengths`、`token_to_seq` 与 Host 布局一致，算子在执行流上直接消费，不做 D2H 回读。
+- 带 workspace 的 Ragged 入口提供 `*_ragged_workspace_capacity_bytes(..., min_tokens, max_tokens, min_segments, max_segments)`
+  容量查询，覆盖区间内任意合法分段组合（含短段/长段混合路由）的峰值需求。
+- Ragged Prefill 入口运行于 Eager 路径，不并入 Decode CUDA Graph；原生多段 kernel 须保持单段（`S = 1`）
+  与既有密集单请求实现等价的性能基线，且避免逐段宿主循环启动。
+- 独立数学验证复现完整公式并覆盖 `S = 1`、均长/异长多段、跨页与 tile 边界及 `distinct/alias/permuted/shared-source`
+  状态偏移，公共构造见 [ragged_fixture.h](../../tests/ops/ragged_fixture.h)。
+
 ## 数值验证
 
 验证公开合同和实际生产入口。数学 Op 使用独立 FP32/FP64 参考，按 public represented inputs
 解码权重、执行完整公式；不复制生产路线的激活量化、内部 cast、reduction 或 workspace 精度。
 融合参考计算完整公式，不拼接若干生产 Op 的舍入输出。模型输出正常、两条实现一致都不能替代数学参考。
 
-Exact transform/codec 使用独立精确参考。ReplaySSM 等明确承诺与某次执行相同的合同，
-使用同一初始状态、同一物理输入块和对应 trajectory 检查；较短输入的另一次投影不是该参考。
-它的精确关系与原始 recurrence 的数学精度分别验收。
+Exact transform/codec 使用独立精确参考。ReplaySSM 的 readout 与 fold state 按数学语义对照独立
+数值参考验收，并检查从同一初始状态连续多轮采用后的轨迹；卷积 history 与未触及写域仍按精确 words 检查，
+详细合同见[Speculative 执行](speculative-decoding.md#replayssm)。
 
 Criterion 由公开数值政策或表示决定，不由 target、私有精度、T 或某个 case 决定。
 Linear-family 的 `A16Only`、`AllowA8`、`AllowA4` 分别使用 A16、A8、A4 要求，

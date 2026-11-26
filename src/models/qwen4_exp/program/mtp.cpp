@@ -39,7 +39,7 @@ execution::BatchView RankProgramImpl::mtp_inputs(const MtpBatchLayout& layout,
         offsets(layout.destination_offsets)[b] = -1;
         host(layout.table_rows)[b]             = -1;
         host(layout.base_positions)[b]         = 0;
-        host(layout.record_offsets)[b]         = 0;
+        host(layout.record_offsets)[b]         = -1;
     }
     for (std::size_t b = 0; b < rows.size(); ++b) {
         host(layout.live_rows)[b] = 1;
@@ -92,8 +92,8 @@ execution::MtpRun RankProgramImpl::draft_run(std::uint32_t step, std::int32_t ba
     const auto& frame   = *buffers.mtp;
     const auto channels = dimension(parameters.profile->config.text.residual_width());
     const auto call     = resources.mtp_batch(frame.draft_steps[step], 1, batch, visible);
-    const auto before   = step == 0 ? resources.states->mtp_tail(call.source_offsets)
-                                    : mtp_working_tail(step == 1 ? 0 : 1 + (step - 2) % 2, batch);
+    // Slot zero starts at the committed frontier and retains the first reusable pair.
+    const auto before   = mtp_working_tail(step < 2 ? 0 : 1 + (step - 2) % 2, batch);
     auto after          = mtp_working_tail(step == 0 ? 0 : 1 + (step - 1) % 2, batch);
     auto working        = packed_tensor(frame.hidden, {channels, batch, 2});
     const auto previous = step == 0 ? packed_tensor(frame.base_conditioning, {channels, batch})
@@ -105,7 +105,7 @@ execution::MtpRun RankProgramImpl::draft_run(std::uint32_t step, std::int32_t ba
 }
 
 void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible,
-                                    const DecodeGraphDefinition* mixer, DecodeGraphChild* child) {
+                                    const execution::QsaSubmit& submit) {
     const auto& buffers = resources.buffers();
     const auto& frame   = *buffers.mtp;
     const auto channels = dimension(parameters.profile->config.text.residual_width());
@@ -116,22 +116,21 @@ void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std:
     {
         auto run = draft_run(step, batch, visible);
         run.stem();
-        if (mixer)
-            *child = mixer->append_to(cuda.stream());
-        else
-            run.local_mixer();
-        run.finish_mixer();
+        run.mixer(submit);
         run.feed_forward();
         run.finish({sample, next});
     }
     auto logits =
         packed_tensor(*buffers.logits, {dimension(parameters.profile->local.vocabulary), batch});
     execution::project_head(sample, parameters.mtp->head, logits, resources.workspace, cuda);
-    auto ids = draft_output_ids(step, batch);
+    auto ids         = draft_output_ids(step, batch);
+    auto confidences = device_tensor(*buffers.draft_confidences).slice(1, step, 1).view({batch});
     if (parallel)
-        vocabulary_draft(logits, device_tensor(frame.draft_steps[step].valid_columns), ids);
+        vocabulary_draft(logits, device_tensor(frame.draft_steps[step].valid_columns), ids,
+                         confidences);
     else
-        ops::argmax(logits, ids, parameters.profile->public_tokens, cuda);
+        ops::argmax_with_probability(logits, ids, confidences, parameters.profile->public_tokens,
+                                     resources.workspace, cuda);
 }
 
 Tensor RankProgramImpl::draft_proposals(std::int32_t batch) {
@@ -150,12 +149,19 @@ void RankProgramImpl::install_decode(std::int32_t batch) {
     copy_bytes_async(io.ingress.bind(resources.persistent()),
                      resources.ingress().subspan(0, io.ingress.bytes), cuda);
     if (!io.mtp) return;
-    const auto& mtp    = *io.mtp;
-    const int channels = dimension(parameters.profile->config.text.residual_width());
-    const std::array fields{ops::StateGather{
-        resources.states->conditioning(device_tensor(io.batch.source_offsets).slice(0, 0, batch)),
-        device_tensor(io.batch.valid_columns).slice(0, 0, batch),
-        packed_tensor(mtp.base_conditioning, {channels, batch})}};
+    const auto& mtp      = *io.mtp;
+    const int channels   = dimension(parameters.profile->config.text.residual_width());
+    const auto source    = device_tensor(io.batch.source_offsets).slice(0, 0, batch);
+    const auto live      = device_tensor(io.batch.live_rows).slice(0, 0, batch);
+    auto tail            = resources.states->mtp_tail(source);
+    const auto key_count = dimension(parameters.profile->config.text.qsa.index_key_width() *
+                                     (parameters.profile->config.text.qsa.compression - 1));
+    tail.raw_keys.field.tensor.shape = {key_count, 1, 1, 1};
+    const std::array fields{
+        ops::StateGather{resources.states->conditioning(source), live,
+                         packed_tensor(mtp.base_conditioning, {channels, batch})},
+        ops::StateGather{tail.raw_keys, live, packed_tensor(mtp.tail_keys, {key_count, batch})},
+        ops::StateGather{tail.first_rope, live, packed_tensor(mtp.tail_coordinates, {3, batch})}};
     ops::gather_state_fields(fields, cuda);
 }
 
@@ -244,14 +250,140 @@ void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tok
                  compute->batch.live_rows, cuda);
 }
 
-void RankProgramImpl::accept_forward(std::int32_t batch) {
+void RankProgramImpl::align_packed_mtp() {
+    const auto& f       = *compute;
+    const auto& packed  = *f.packed;
+    const auto& buffers = resources.buffers();
+    const auto rank     = parameters.profile->local.rank;
+    const auto policy   = execution::sequence_parallel_policy(parameters.profile->local.size);
+    const auto main     = policy.partition(f.tokens, rank);
+    const auto copy     = [&](const Tensor& destination, const Tensor& source) {
+        copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
+                             {source.data, source.bytes(), cuda.device()}, cuda);
+    };
+    const auto state = [&](std::uint32_t b, bool destination) {
+        const auto& offsets = f.rows[b].states.at(rank);
+        return resources.states->conditioning(destination ? offsets.destination : offsets.source);
+    };
+
+    std::vector<std::uint32_t> members;
+    members.reserve(packed.segments.size());
+    std::int32_t total = 0;
+    for (const auto b : packed.segments) {
+        const auto& row   = f.rows[b];
+        const auto length = dimension(row.ids.size()) - (row.main_frontier == 0);
+        if (!length) continue;
+        members.push_back(b);
+        total += length;
+    }
+    const auto history =
+        main.split() && total ? policy.partition(total, rank) : TokenPartition(std::max(1, total));
+    Tensor aligned;
+    if (total) aligned = device_tensor(*buffers.prefill_aligned).slice(1, 0, history.count);
+
+    // Main columns used for causal pairs and segment-final States are disjoint. Both ranks
+    // derive the same ordered transfer list, including when MTP history is replicated.
+    struct PeerColumn {
+        std::int32_t main, history;
+        std::uint32_t member;
+    };
+
+    std::array<std::vector<PeerColumn>, 2> peer;
+    std::int32_t history_start = 0;
+    for (const auto b : packed.segments) {
+        const auto& row     = f.rows[b];
+        const auto length   = dimension(row.ids.size());
+        const auto last     = packed.last_columns[b];
+        const auto first    = last + 1 - length;
+        const auto previous = row.main_frontier > 0;
+        const auto end      = history_start + length - !previous;
+        if (previous && history_start >= history.begin &&
+            history_start < history.begin + history.count)
+            copy(aligned.slice(1, history_start - history.begin, 1), state(b, false));
+
+        const auto start       = history_start + previous;
+        const auto local_begin = std::max({start, history.begin, start + main.begin - first});
+        const auto local_end =
+            std::min({end, history.begin + history.count, start + main.begin + main.count - first});
+        if (local_begin < local_end) {
+            const auto count = local_end - local_begin;
+            copy(aligned.slice(1, local_begin - history.begin, count),
+                 f.conditioning.slice(1, first + local_begin - start - main.begin, count));
+        }
+        if (main.split()) {
+            for (auto h = start; h < end; ++h) {
+                const auto column = first + h - start;
+                const auto owner  = column / main.segment;
+                if (!history.split() || h / history.segment != owner)
+                    peer[owner].push_back({column, h, b});
+            }
+        }
+        const auto owner = static_cast<std::uint32_t>(last / main.segment);
+        if (!main.split() || owner == rank)
+            copy(state(b, true), f.conditioning.slice(1, last - main.begin, 1));
+        if (main.split()) peer[owner].push_back({last, -1, b});
+        history_start = end;
+    }
+
+    if (main.split()) {
+        const auto scratch  = device_tensor(buffers.mtp->base_conditioning);
+        const auto capacity = static_cast<std::size_t>(scratch.ne[1]);
+        for (std::uint32_t owner = 0; owner < main.ranks; ++owner) {
+            const auto& columns = peer[owner];
+            for (std::size_t begin = 0; begin < columns.size(); begin += capacity) {
+                const auto count = std::min(capacity, columns.size() - begin);
+                auto transfer    = scratch.slice(1, 0, dimension(count));
+                if (rank == owner) {
+                    for (std::size_t i = 0; i < count;) {
+                        const auto first = columns[begin + i].main;
+                        std::size_t run  = 1;
+                        while (i + run < count &&
+                               columns[begin + i + run].main == first + dimension(run))
+                            ++run;
+                        copy(transfer.slice(1, i, run),
+                             f.conditioning.slice(1, first - main.begin, run));
+                        i += run;
+                    }
+                }
+                parallel->broadcast(transfer, owner, cuda);
+                if (rank != owner) {
+                    for (std::size_t i = 0; i < count;) {
+                        const auto& column = columns[begin + i];
+                        std::size_t run    = 1;
+                        if (column.history < 0) {
+                            copy(state(column.member, true), transfer.slice(1, i, 1));
+                        } else {
+                            while (i + run < count && columns[begin + i + run].history ==
+                                                          column.history + dimension(run))
+                                ++run;
+                            copy(aligned.slice(1, column.history - history.begin, run),
+                                 transfer.slice(1, i, run));
+                        }
+                        i += run;
+                    }
+                }
+            }
+        }
+    }
+    if (!total) return;
+    ops::RaggedSequenceView ragged;
+    const auto layout =
+        packed_input_view(*buffers.packed_history, total, dimension(members.size()));
+    const auto batch = prepare_packed_inputs(layout, members, total, true, ragged);
+    execution::mtp_history(
+        parameters.profile->config.text, parameters.profile->local.qsa, *parameters.mtp,
+        {aligned, history, &ragged}, batch, resources.states->mtp_tail(batch.source_offsets),
+        resources.states->mtp_tail(batch.destination_offsets), resources.mtp->layer(0), {},
+        resources.workspace, cuda, parallel ? &*parallel : nullptr);
+}
+
+void RankProgramImpl::accept_forward(std::int32_t batch, std::int32_t width) {
     if (parallel) {
-        vocabulary_accept(batch);
+        vocabulary_accept(batch, width);
         return;
     }
     const auto& buffers   = resources.buffers();
     const auto& frame     = *buffers.mtp;
-    const auto width      = shape.draft_tokens + 1;
     const auto vocabulary = parameters.profile->public_tokens;
     const auto row = [&](const TensorRegion& r) { return device_tensor(r).slice(0, 0, batch); };
     auto drafts    = draft_proposals(batch);
@@ -282,8 +414,8 @@ void RankProgramImpl::prepare_mtp() {
     const auto& buffers = resources.buffers();
     const auto& frame   = *buffers.mtp;
     const auto batch    = static_cast<std::int32_t>(f.physical.rows);
-    const auto k = shape.draft_tokens, width = k + 1;
-    auto& inputs = input_rows;
+    const auto width    = work.speculative->verify_width;
+    auto& inputs        = input_rows;
     for (std::size_t b = 0; b < f.rows.size(); ++b) {
         const auto& row = f.rows[b];
         inputs[b] = {{row.member.sequence.value, row.member.sequence.generation, row.main_frontier,
@@ -306,33 +438,43 @@ void RankProgramImpl::prepare_mtp() {
         return device_tensor(region).slice(0, 0, batch);
     };
     auto drafts      = draft_proposals(batch);
-    const auto steps = k;
-    std::vector<execution::BatchView> calls;
-    calls.reserve(steps);
+    const auto steps = work.speculative->mtp_steps;
+    std::vector<std::uint32_t> visible;
+    if (f.graph_route)
+        f.draft_buckets.reserve(steps);
+    else
+        visible.reserve(steps);
     for (std::uint32_t step = 0; step < steps; ++step) {
         auto& step_inputs = mtp_rows;
         for (std::size_t b = 0; b < f.rows.size(); ++b)
-            step_inputs[b] = {f.rows[b].main_frontier - 1 + std::min(step, round.extents[b]),
-                              step == 0 || step < round.extents[b]
-                                  ? std::span<const TokenId>(f.rows[b].ids)
-                                  : std::span<const TokenId>{}};
-        calls.push_back(mtp_inputs(frame.draft_steps[step], f.rows, 1,
-                                   {step_inputs.data(), f.rows.size()}, false));
-        f.draft_visible.push_back(calls.back().max_visible_tokens);
+            step_inputs[b] = {f.rows[b].mtp_frontier + std::min(step, round.extents[b]),
+                              step < round.extents[b] ? std::span<const TokenId>(f.rows[b].ids)
+                                                      : std::span<const TokenId>{}};
+        const auto call = mtp_inputs(frame.draft_steps[step], f.rows, 1,
+                                     {step_inputs.data(), f.rows.size()}, false);
+        if (f.graph_route)
+            f.draft_buckets.push_back(ops::select_context_bucket(call.max_visible_tokens));
+        else
+            visible.push_back(call.max_visible_tokens);
     }
-    if (device_graphs) {
+    for (std::uint32_t step = steps; step < frame.draft_steps.size(); ++step)
+        (void)mtp_inputs(frame.draft_steps[step], {}, 1, {}, false);
+    if (f.graph_route && !host_ple) {
         prepare_main();
         return;
     }
-    if (!graphs) install_decode(batch);
+    if (!f.graph_route) install_decode(batch);
     gpu_timer.begin_draft();
     {
         const nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp);
-        if (graphs && host_ple)
-            graphs->draft(batch, calls, *f.ple, round.extents);
-        else {
+        if (f.graph_route) {
+            graphs->launch_proposal(*f.graph_route,
+                                    {.buckets = f.draft_buckets, .slot = f.ple->slot});
+            for (std::uint32_t step = 0; step < steps; ++step)
+                host_ple->append_submitted(*f.ple, round.extents, step);
+        } else {
             for (std::uint32_t step = 0; step < steps; ++step) {
-                draft_forward(step, batch, calls[step].max_visible_tokens);
+                draft_forward(step, batch, visible[step]);
                 auto ids = draft_output_ids(step, batch);
                 if (host_ple) {
                     host_ple->append_device(*f.ple, ids, round.extents, step);
@@ -345,11 +487,11 @@ void RankProgramImpl::prepare_mtp() {
     gpu_timer.end_draft();
     for (std::size_t b = 0; b < f.rows.size(); ++b) valid[b] = round.extents[b] + 1;
     if (host_ple) host_ple->seal(*f.ple, {valid.data(), f.rows.size()});
-    ops::prepare_verify_ids(row_tensor(buffers.anchors), drafts, row_tensor(frame.extents),
-                            f.batch.ids, cuda);
+    if (!f.graph_route)
+        ops::prepare_verify_ids(row_tensor(buffers.anchors), drafts, row_tensor(frame.extents),
+                                f.batch.ids, cuda);
     if (!host_ple) {
-        copy_verify_inputs(batch);
-        prepare_device_ple(f.batch);
+        prepare_device_ple(f.batch, std::ranges::any_of(f.rows, &WorkRow::constrained));
     }
     prepare_main();
 }

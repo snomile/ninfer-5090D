@@ -2,6 +2,7 @@
 
 #include "core/buffer.h"
 #include "core/layout.h"
+#include "ninfer/ops/ragged.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/types.h"
 
@@ -31,8 +32,7 @@ struct FrameIngressLayout {
     TensorRegion backend_frontiers;
     TensorRegion extents;
     TensorRegion valid_columns;
-    TensorRegion proposal_valid_columns;
-    TensorRegion budgets;
+    TensorRegion proposal_valid_columns, proposal_live_rows;
     TensorRegion main_table_rows;
     TensorRegion backend_table_rows;
     TensorRegion residency_slots;
@@ -63,6 +63,7 @@ struct FrameCommitLayout {
 
 struct FrameEgressLayout {
     TensorRegion tokens, counts;
+    std::optional<TensorRegion> top1_probabilities, draft_confidences;
     std::size_t bytes = 0;
 };
 
@@ -79,8 +80,7 @@ struct FrameIngressView {
     std::span<std::int32_t> backend_frontiers;
     std::span<std::int32_t> extents;
     std::span<std::int32_t> valid_columns;
-    std::span<std::int32_t> proposal_valid_columns;
-    std::span<std::int32_t> budgets;
+    std::span<std::int32_t> proposal_valid_columns, proposal_live_rows;
     std::span<std::int32_t> main_table_rows;
     std::span<std::int32_t> backend_table_rows;
     std::span<std::int32_t> residency_slots;
@@ -110,6 +110,7 @@ struct FrameCommitView {
 struct FrameEgressView {
     std::span<TokenId> tokens;
     std::span<std::int32_t> counts;
+    std::span<float> top1_probabilities, draft_confidences;
 };
 
 [[nodiscard]] FrameControlLayout plan_frame_controls(const FrameSpec&, std::uint32_t rows);
@@ -134,6 +135,39 @@ struct DFlashFrameLayout {
     TensorRegion drafts;
     std::optional<TensorRegion> candidate_ids;
     std::optional<TensorRegion> proposal_q;
+};
+
+template <class T>
+struct RaggedPrefillMetadata {
+    T cu_seqlens, seq_lengths, token_to_seq;
+};
+
+template <class T>
+struct PackedMtpMetadata {
+    RaggedPrefillMetadata<T> ragged;
+    T input_segments, previous_rows, skip_first, previous_rope;
+    T source_offsets, backend_tables;
+};
+
+template <class T>
+struct PackedDFlashMetadata {
+    RaggedPrefillMetadata<T> ragged;
+    T source_indices;
+};
+
+template <class T>
+struct PackedPrefillMetadata {
+    RaggedPrefillMetadata<T> ragged;
+    T main_tables, backend_tables, source_offsets, destination_offsets, sampled_offsets;
+    T sampling_positions, live_rows, residency_slots;
+    std::optional<PackedMtpMetadata<T>> mtp;
+    std::optional<PackedDFlashMetadata<T>> dflash;
+};
+
+struct PackedPrefillLayout {
+    PackedPrefillMetadata<TensorRegion> metadata;
+    LayoutRegion device, host, sampling;
+    TensorRegion sampled_hidden, sampled_rows, sample_slots;
 };
 
 struct FrameHostLayout {
@@ -172,6 +206,7 @@ struct FrameLayout {
     std::optional<TensorRegion> control_ids;
     std::optional<MtpFrameLayout> mtp;
     std::optional<DFlashFrameLayout> dflash;
+    std::optional<PackedPrefillLayout> packed_prefill;
     FrameHostLayout host;
 };
 
@@ -192,15 +227,31 @@ struct MtpFrame {
     [[nodiscard]] Tensor proposals(std::int32_t batch) const;
 };
 
+namespace execution {
+struct DraftOutputs;
+}
+
 struct DFlashFrame {
     Tensor proposal_ids, proposal_positions, append_positions, append_counts, drafts;
     Tensor candidate_ids, proposal_q;
 
     DFlashFrame(MemorySpan backing, const DFlashFrameLayout& layout);
+    [[nodiscard]] execution::DraftOutputs proposal(std::int32_t batch, std::int32_t columns) const;
 };
 
 struct FrameInputView {
     Tensor ids, cache_positions, rope_positions, hidden;
+};
+
+struct PackedPrefillFrame {
+    MemorySpan device_storage, host_storage;
+    PackedPrefillMetadata<Tensor> device, host;
+    const ops::SamplingConfig* sampling;
+    std::span<ops::SamplingConfig> host_sampling;
+    Tensor sampled_hidden;
+    std::span<std::int32_t> sampled_rows, sample_slots;
+
+    PackedPrefillFrame(MemorySpan device, MemorySpan host, const PackedPrefillLayout&);
 };
 
 // One stable device frame and its pinned transfer storage. The execution ticket retains both
@@ -238,20 +289,21 @@ public:
     Tensor host_step_positions, host_step_rope_positions, host_step_valid_columns;
     MemorySpan ingress, commit, egress;
     Tensor live_rows, anchors, frontiers, backend_frontiers, extents, valid_columns;
-    Tensor proposal_valid_columns, budgets, main_table_rows, backend_table_rows;
+    Tensor proposal_valid_columns, proposal_live_rows, main_table_rows, backend_table_rows;
     Tensor state_source_offsets, state_destination_offsets, residency_slots, rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampling_positions, history_skip, previous_rope;
     Tensor decode_positions, decode_rope;
     Tensor commit_destination_offsets, last_columns, count_columns, accepted_columns;
     Tensor draft_append_starts, draft_append_ends;
-    Tensor output_tokens, output_counts;
+    Tensor output_tokens, output_counts, top1_probabilities, draft_confidences;
     Tensor input_ids, cache_positions, rope_positions, hidden;
     Tensor input_embeddings;
     Tensor visual_indices;
     Tensor logits, target_argmax, masks, score_targets, score_logprobs;
     std::optional<MtpFrame> mtp;
     std::optional<DFlashFrame> dflash;
+    std::optional<PackedPrefillFrame> packed_prefill;
 
 private:
     MemorySpan ingress_storage_, commit_storage_, egress_storage_;

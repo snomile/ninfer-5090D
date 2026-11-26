@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/tensor.h"
+#include "ninfer/ops/ragged.h"
 #include <cstdint>
 
 namespace ninfer::ops {
@@ -38,8 +39,44 @@ struct CausalPairOutputs {
 void prepare_causal_pairs(const CausalPairInputs& input, const CausalPairOutputs& output,
                           CudaExecutionView execution);
 
+struct RaggedCausalPairInputs {
+    RaggedSequenceView ragged; // S_in segments over N_in input tokens.
+    Tensor hidden;             // BF16 [D, N_in].
+    Tensor previous_hidden;    // BF16 [D, B_prev].
+    Tensor ids;                // I32 [N_in].
+    Tensor positions;          // I32 [N_in].
+    Tensor rope;               // Optional I32 [N_in, A], A in {1, 3}.
+    Tensor previous_rope;      // Optional I32 [A, B_prev].
+    Tensor input_segments; // Optional I32 [S_out] in [0, S_in); empty means identity (S_out==S_in).
+    Tensor previous_rows;  // Optional I32 [S_out] in [0, B_prev); empty means input_segments[m].
+    Tensor skip_first;     // I32 [S_out] in {0, 1}.
+};
+
+struct RaggedCausalPairOutputs {
+    RaggedSequenceView ragged; // S_out non-empty segments over N_out paired tokens.
+    Tensor hidden;             // BF16 [D, N_out].
+    Tensor ids;                // I32 [N_out].
+    Tensor positions;          // I32 [N_out].
+    Tensor rope;               // Optional I32 [N_out, A].
+};
+
 /**
- *   For row b and 0<=j<=K:
+ * Packed ragged form of prepare_causal_pairs. For output segment m in [0, S_out), let
+ * b = input_segments[m] (or m when absent), r = previous_rows[m] (or b when absent),
+ * skip = skip_first[m], and output length L_out = out.ragged.segment_length(m) >= 1,
+ * requiring L_out == in.ragged.segment_length(b) - skip. The caller guarantees the Device
+ * selectors, skip values, and their agreement with the output lengths. For 0 <= j < L_out and i = j
+ * + skip, in_col = in.ragged.cu_seqlens[b] + i, out_col = out.ragged.cu_seqlens[m] + j:
+ *   out.hidden[:, out_col] = in.hidden[:, in_col - 1] if i > 0 else in.previous_hidden[:, r];
+ *   out.ids[out_col]       = in.ids[in_col];
+ *   out.positions[out_col] = in.positions[in_col] - 1;
+ *   out.rope[out_col, :]   = in.rope[in_col - 1, :] if i > 0 else in.previous_rope[:, r].
+ */
+void prepare_causal_pairs(const RaggedCausalPairInputs& input,
+                          const RaggedCausalPairOutputs& output, CudaExecutionView execution);
+
+/**
+ *   For row b and 0<=j<W:
  *     verify_ids[j,b] = anchors[b]                         when j=0
  *                       drafts[j-1,b]                     when 0<j<=Pcur[b]
  *                       anchors[b]                        otherwise;
@@ -47,8 +84,8 @@ void prepare_causal_pairs(const CausalPairInputs& input, const CausalPairOutputs
  *
  *   All tensors are I32, contiguous except drafts, which permits positive, naturally aligned,
  *   non-overlapping strides. anchors/base_positions/current_extents are [B], drafts is
- *   [K,B] with K>=1 and B>=1, and verify_ids/positions are [K+1,B]. Each current extent is in
- *   [0,K]. Inputs and outputs do not overlap.
+ *   [D,B] with D,B>=1, and verify_ids/positions are [W,B] with W>=2. The caller provides
+ *   current_extents[b] in [0,min(D,W-1)]. Inputs and outputs do not overlap.
  *
  *   Writes every physical output element, including safe invalid-tail values. Inputs remain
  *   unchanged.

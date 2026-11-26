@@ -124,9 +124,8 @@ struct ChainFixture {
                 ops::ProjectionWeights{ops::SingleProjectionWeight{query_weight}}, split_rows, B,
                 T * B),
             index.workspace_bytes,
-            ops::kpool_sparse_mla_workspace_capacity_bytes({64, 256, 256, 512}, storage,
-                                                           index.envelope, B, 1, T,
-                                                           cuda.multiprocessor_count())};
+            ops::kpool_sparse_mla_workspace_capacity_bytes(
+                {64, 256, 256, 512}, storage, index.bucket, B, 1, T, cuda.multiprocessor_count())};
         index.workspace.reset();
         index.workspace_bytes = *std::max_element(capacities.begin(), capacities.end());
         index.scratch         = DeviceBuffer(cuda.device(), index.workspace_bytes + 512);
@@ -167,7 +166,7 @@ struct ChainFixture {
             query.view,
             {dense_weight(key_up.view, 16384, 512), dense_weight(value_up.view, 16384, 512)},
             cache.latent, {index.positions.view, index.valid.view, index.selectors.view},
-            index.selection, selection_rows.view, scale, index.envelope, *index.workspace,
+            index.selection, selection_rows.view, scale, index.bucket, *index.workspace,
             output.view, cuda);
     }
 

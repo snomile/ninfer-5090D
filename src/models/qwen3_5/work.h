@@ -1,7 +1,7 @@
 #pragma once
 
 #include "models/common/token_input.h"
-#include "models/common/batch.h"
+#include "models/common/speculative/controller.h"
 
 #include "models/common/context/contract.h"
 #include "models/common/context/directory/state.h"
@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <variant>
@@ -40,6 +41,7 @@ struct ExecutionRow {
 struct SamplingInput {
     ResolvedSamplingParameters parameters;
     bool constrained = false;
+    bool sample      = false;
 };
 
 struct InputWindow {
@@ -65,15 +67,28 @@ struct ForwardWork {
 
 struct DecodeRow {
     ExecutionRow binding;
-    TokenId anchor                        = 0;
-    std::uint32_t draft_extent            = 0;
-    std::uint32_t output_tokens_remaining = 0;
+    TokenId anchor = 0;
     SamplingInput sampling;
 };
 
+struct SplitProposalNarrowingInput {
+    struct Row {
+        speculative::RoundMember member;
+        std::uint32_t frontier;
+        speculative::SequenceSpeculativeState state;
+    };
+
+    speculative::SpeculativeCostModel cost;
+    std::vector<Row> rows;
+    std::uint32_t max_context;
+};
+
 struct DecodeWork {
+    DecodeWork(speculative::DecodeRoundPlan, ExecutionPath);
+    std::shared_ptr<const speculative::DecodeRoundPlan> plan;
+    std::shared_ptr<const SpeculativeExecutionGeometry> geometry;
     std::vector<DecodeRow> rows;
-    PhysicalBatchShape shape;
+    std::optional<SplitProposalNarrowingInput> narrowing;
 };
 
 // DFlash target features occupy a residency's persistent plane until this range is appended.
@@ -109,10 +124,11 @@ struct Work {
 struct GeneratedResult {
     std::vector<TokenId> tokens;
     std::vector<std::uint32_t> counts;
-    std::vector<std::uint32_t> draft_extents;
-    std::vector<std::uint32_t> accepted_drafts;
     std::vector<std::uint32_t> dead_positions;
     std::uint32_t row_stride = 1;
+    std::vector<float> draft_confidences, target_top1_probabilities;
+    std::uint32_t draft_stride = 0;
+    std::optional<speculative::NarrowedTargetPlan> executed;
 };
 
 struct ForwardResult {

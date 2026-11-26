@@ -15,6 +15,7 @@ struct Traffic {
     double projection_flops = 0;
     double matrix_tensor_us = 0;
     bool mxfp8_reference    = false;
+    bool route_modeled      = true;
 
     std::string csv(double us) const {
         const auto bytes = read + write;
@@ -27,9 +28,15 @@ struct Traffic {
         s << ',';
         if (mxfp8_reference && projection_flops)
             s << projection_flops / (kRoofline.mxfp8_f32_tflops * 1e6);
-        s << ',' << workspace_read << ',' << workspace_write << ',' << projection_flops / us / 1e6
-          << ',' << bytes / (us * 1000) / kRoofline.sustained_read_gbs * 100 << ','
-          << bytes / (us * 1000) / kRoofline.memory_gbs * 100 << ',' << matrix_tensor_us;
+        s << ',';
+        if (route_modeled)
+            s << workspace_read << ',' << workspace_write;
+        else
+            s << ',';
+        s << ',' << projection_flops / us / 1e6 << ','
+          << bytes / (us * 1000) / kRoofline.sustained_read_gbs * 100 << ','
+          << bytes / (us * 1000) / kRoofline.memory_gbs * 100 << ',';
+        if (route_modeled) s << matrix_tensor_us;
         return s.str();
     }
 
@@ -42,12 +49,33 @@ struct Traffic {
         "reference_us";
 };
 
+inline Traffic traffic(const RaggedFixture& f) {
+    Traffic out;
+    out.route_modeled = false;
+    out.state_read    = f.state_bytes * f.offsets.num_source_records;
+    out.state_write   = f.state_bytes * f.s;
+    if (f.input_update) {
+        out.read = f.weights.projection.model_weight_bytes() + f.weights.conv.size() + f.x.size() +
+                   out.state_read;
+        out.write            = f.q.size() + f.k.size() + f.v.size() + out.state_write;
+        out.projection_flops = 2.0 * f.channels * 4096 * f.n;
+        out.mxfp8_reference  = f.weights.projection.weight.qtype == QType::MXFP8 &&
+                              f.weights.policy == ops::LinearPolicy::AllowA8;
+    } else {
+        out.read = f.q.size() + f.k.size() + f.v.size() + f.g.size() + f.beta.size() +
+                   f.weights.a_log.size() + f.weights.bias.size() + out.state_read;
+        out.write = f.out.size() + out.state_write;
+    }
+    return out;
+}
+
 inline Traffic traffic(Fixture& f, const std::string& op) {
     const auto n = std::accumulate(f.valid_counts.begin(), f.valid_counts.end(), std::uint64_t(0));
     const auto active =
         std::count_if(f.valid_counts.begin(), f.valid_counts.end(), [](int n) { return n != 0; });
-    const std::uint64_t state         = 4ULL * 128 * 128 * f.h * active;
-    const std::uint64_t record_column = 2ULL * 128 * f.qh + 6ULL * 128 * f.h + 4ULL * f.h;
+    const std::uint64_t state_elem_bytes = dtype_size(f.o.state_dtype);
+    const std::uint64_t state            = state_elem_bytes * 128ULL * 128 * f.h * active;
+    const std::uint64_t record_column = 2ULL * 128 * f.qh + 8ULL * 128 * f.h;
     Traffic out;
     const std::uint64_t m = std::uint64_t(f.t) * f.b;
     if (op.starts_with("layer-")) {
@@ -88,7 +116,7 @@ inline Traffic traffic(Fixture& f, const std::string& op) {
     if (op == "fold") {
         for (int m : f.commit_counts)
             if (m) {
-                const auto bytes = 4ULL * 128 * 128 * f.h * f.layers;
+                const auto bytes = state_elem_bytes * 128ULL * 128 * f.h * f.layers;
                 out.state_read += bytes + 2ULL * f.channels * f.layers * std::max(0, 3 - m);
                 out.state_write += bytes + 6ULL * f.channels * f.layers;
                 out.record_read +=
@@ -139,8 +167,7 @@ inline Traffic traffic(Fixture& f, const std::string& op) {
     } else {
         out.state_read    = state;
         out.state_write   = op == "record" ? 0 : state;
-        const auto copied = f.aliases_kv_records() ? 0 : 2ULL * 128 * (f.qh + f.h);
-        out.record_write  = op == "record" ? (copied + 4ULL * 129 * f.h) * n : 0;
+        out.record_write  = op == "record" ? record_column * n : 0;
         out.read          = (4ULL * 128 * f.qh + 4ULL * 128 * f.h + 2ULL * f.h) * n +
                    (active ? 4ULL * 129 * f.h : 0) + out.state_read;
         out.write      = 2ULL * 128 * f.h * f.t * f.b + out.state_write + out.record_write;

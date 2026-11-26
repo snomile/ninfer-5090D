@@ -204,19 +204,21 @@ public:
             },
             active);
         initialize_description();
-        StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         std::visit(
             [&](auto& instance) {
                 using Instance = typename std::remove_cvref_t<decltype(instance)>::element_type;
                 if (options.purpose == EnginePurpose::CausalScoring) {
+                    StartupPhaseScope phase(options.startup_observer, StartupPhase::EngineFinalize);
                     core = std::make_unique<runtime::CausalScoreCore<Instance>>(*instance);
+                    phase.complete();
                 } else {
-                    core = std::make_unique<runtime::EngineCore<Instance>>(
+                    auto generation = std::make_unique<runtime::EngineCore<Instance>>(
                         *instance, options, std::move(constructed.context_cost));
+                    startup.speculative = generation->take_speculative_startup();
+                    core                = std::move(generation);
                 }
             },
             active);
-        finalize_phase.complete();
     }
 
     ~Impl() noexcept { core.emplace<std::monostate>(); }
@@ -250,8 +252,9 @@ private:
         description.model_name      = startup.load.model_name;
         description.max_context     = options.max_context;
         description.max_concurrency = options.max_concurrency;
-        description.prefill_chunk   = options.prefill_chunk;
-        description.kv_cache        = options.kv_cache;
+        description.prefill_chunk      = options.prefill_chunk;
+        description.kv_cache           = options.kv_cache;
+        description.linear_state_dtype = options.linear_state_dtype;
         std::visit(
             [&](const auto& instance) {
                 description.context_token_capacity_estimate =

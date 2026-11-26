@@ -116,7 +116,8 @@ RequestBasePlan SessionImpl::plan_request(qwen::PreparedPromptData&& prompt,
 
     base->prefix_identity_tag = static_cast<std::uint32_t>(speculative_backend) |
                                 (static_cast<std::uint32_t>(plan.proposal_head) << 8U) |
-                                (static_cast<std::uint32_t>(plan.kv_storage) << 16U);
+                                (static_cast<std::uint32_t>(plan.kv_storage) << 16U) |
+                                (static_cast<std::uint32_t>(plan.linear_state_dtype) << 24U);
     base->prompt = std::make_shared<const qwen::PreparedPromptData>(std::move(prompt));
     for (const auto& item : base->prompt->vision_items) base->media.push_back({&item});
     base->query = context::PrefixQuery(prefixes, base->prefix_identity_tag, base->identity_view());
@@ -164,16 +165,18 @@ UnitDemand SessionImpl::prefill_unit(std::uint32_t prompt, std::uint32_t cursor)
 }
 
 UnitDemand SessionImpl::next_unit(const SequenceState& state, const RequestControl& request,
-                                  ExecutionUnitKind kind, std::uint32_t tokens) const {
+                                  ExecutionUnitKind kind, std::uint32_t tokens,
+                                  std::uint32_t f) const {
     UnitDemand out{.kind = kind, .tokens = tokens};
-    const auto f = state.continuation.metadata.execution_frontier;
     switch (kind) {
-    case ExecutionUnitKind::Prefill:
+    case ExecutionUnitKind::Prefill: {
         if (request.lifecycle != Lifecycle::Prefilling || !request.prefill)
             throw std::logic_error("prefill demand requires a prefill cursor");
-        out.main_frontier = window_end(state, request, request.prefill->cursor,
-                                       request.prefill->prompt_tokens, vision::Window{});
+        const auto prompt = request.prefill->prompt_tokens;
+        const auto limit  = tokens ? f + std::min(tokens, prompt - f) : prompt;
+        out.main_frontier = window_end(state, request, f, limit, vision::Window{});
         break;
+    }
     case ExecutionUnitKind::Replay:
         if (request.lifecycle != Lifecycle::Replaying)
             throw std::logic_error("request is not replaying");
@@ -181,12 +184,9 @@ UnitDemand SessionImpl::next_unit(const SequenceState& state, const RequestContr
                                        vision::Window{});
         break;
     case ExecutionUnitKind::Decode:
-        if (request.lifecycle != Lifecycle::Active || !tokens || f >= capacity)
-            throw std::logic_error("decode demand requires an active token and output budget");
-        out.main_frontier = f + 1 +
-                            (speculative_backend == SpeculativeBackend::None
-                                 ? 0
-                                 : std::min({tokens - 1, capacity - f - 1, draft_window}));
+        if (request.lifecycle != Lifecycle::Active || tokens != 1 || f >= capacity)
+            throw std::logic_error("decode requires one active anchor within context");
+        out.main_frontier = f + 1;
         break;
     case ExecutionUnitKind::Control:
         if (request.lifecycle != Lifecycle::Active || !tokens || tokens > capacity - f)
@@ -228,7 +228,8 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
         need.lane         = lane;
         auto& request     = requests[lane];
         const auto& state = active_sequence(lane);
-        need.demand       = next_unit(state, request, unit.kind, unit.tokens);
+        need.demand       = next_unit(state, request, unit.kind, unit.tokens,
+                                      state.continuation.metadata.execution_frontier);
         if (unit.kind == ExecutionUnitKind::Prefill || unit.kind == ExecutionUnitKind::Replay) {
             auto& demand = need.demand;
             demand.main_frontier =
@@ -243,7 +244,10 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
             need.demand.main_frontier == state.continuation.metadata.execution_frontier &&
             state.continuation.metadata.execution_frontier < request.base->summary.prompt_tokens)
             return {.status = runtime::UnitReservationStatus::ExecutionUnavailable};
-        if (request.permit) {
+        if (request.permit && unit.kind == ExecutionUnitKind::Prefill &&
+            request.permit->kind != unit.kind)
+            throw std::logic_error("an existing execution permit cannot change its operation");
+        if (request.permit && unit.kind != ExecutionUnitKind::Prefill) {
             const auto& permit = *request.permit;
             if (permit.kind != unit.kind || permit.tokens != unit.tokens)
                 throw std::logic_error("an existing execution permit cannot change its operation");
@@ -262,7 +266,7 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
         if (need.demand.main_frontier > need.coverage.main_frontier ||
             need.demand.backend_frontier > need.coverage.backend_frontier)
             throw std::logic_error("execution exceeds the retained recovery capacity");
-        if (request.permit) continue;
+        if (request.permit && unit.kind != ExecutionUnitKind::Prefill) continue;
         const auto main = text_kv_histories->write_pages(state.kv->text.handle(),
                                                          state.continuation.metadata.text_kv_valid,
                                                          need.coverage.main_frontier);
@@ -280,7 +284,7 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
     ContextDemand bundle;
     for (auto& need : needs) {
         const auto lane = need.lane;
-        if (requests[lane].permit) continue;
+        if (requests[lane].permit && !need.add_main && !need.add_backend) continue;
         const auto& state = active_sequence(lane);
         need.main_id =
             bundle.add_growth(*text_kv_histories, state.kv->text.handle(), need.add_main);
@@ -295,7 +299,7 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
     try {
         for (auto& need : needs) {
             const auto lane = need.lane;
-            if (requests[lane].permit) { continue; }
+            if (requests[lane].permit && !need.add_main && !need.add_backend) continue;
             auto& state = active_sequence(lane);
             need.added  = true;
             auto main   = reserved.reservation->take(need.main_id);
@@ -306,7 +310,6 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
                 backend_kv_histories->prepare_growth(state.kv->backend->handle(), backend);
                 backend_kv_histories->adopt_growth(state.kv->backend->handle(), std::move(backend));
             }
-            requests[lane].permit = need.demand;
         }
     } catch (...) {
         for (const auto& need : needs) {
@@ -317,10 +320,12 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
             if (state.kv->backend) {
                 backend_kv_histories->shrink_growth(state.kv->backend->handle(), need.old_backend);
             }
-            requests[lane].permit.reset();
         }
         throw;
     }
+    for (const auto& need : needs)
+        if (!requests[need.lane].permit || need.demand.kind == ExecutionUnitKind::Prefill)
+            requests[need.lane].permit = need.demand;
     return {.status = runtime::UnitReservationStatus::Granted};
 }
 

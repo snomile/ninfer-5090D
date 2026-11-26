@@ -20,6 +20,10 @@ namespace ninfer {
 struct DeviceContext;
 }
 
+namespace ninfer::models::speculative {
+class DecodeGraphRoutes;
+}
+
 namespace ninfer::models::moe {
 struct Plan;
 }
@@ -62,6 +66,9 @@ class RankProgram;
 enum class TextPhase { Prefill, Verify };
 
 struct SessionPlan {
+    std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
+    ExecutionPath decode_path     = ExecutionPath::Eager;
+    bool split_proposal_narrowing = false;
     std::shared_ptr<const BatchExecutionPlan> batch_execution;
     std::shared_ptr<const execution::ModelProfile> profile;
     context::ContextDirectorySpec context;
@@ -71,9 +78,12 @@ struct SessionPlan {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    SpeculativeLengthPolicy length_policy  = SpeculativeLengthPolicy::Adaptive;
+    std::uint32_t hybrid_max_tokens        = 0;
     ContextCacheOptions context_cache;
-    KvCacheStorage kv_storage  = KvCacheStorage::BFloat16;
-    ProposalHead proposal_head = ProposalHead::Full;
+    KvCacheStorage kv_storage           = KvCacheStorage::BFloat16;
+    LinearStateDType linear_state_dtype = LinearStateDType::Float32;
+    ProposalHead proposal_head          = ProposalHead::Full;
     TransferWork state_transfer;
     std::optional<LayoutRegion> dflash_local_group;
     std::optional<TransferWork> dflash_local_transfer;
@@ -129,13 +139,15 @@ private:
 
     friend SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile>,
                                                  DeviceContext&, const EngineOptions&,
-                                                 std::shared_ptr<const moe::Plan>);
+                                                 std::shared_ptr<const moe::Plan>,
+                                                 std::span<const std::uint32_t>);
 };
 
 [[nodiscard]] SessionPlan plan_session(const SequencePlan&);
 [[nodiscard]] SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile>,
                                                     DeviceContext&, const EngineOptions&,
-                                                    std::shared_ptr<const moe::Plan> = {});
+                                                    std::shared_ptr<const moe::Plan> = {},
+                                                    std::span<const std::uint32_t>   = {});
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
                                                     const EngineOptions&);
 [[nodiscard]] std::unique_ptr<RankProgram>

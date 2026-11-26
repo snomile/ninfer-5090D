@@ -51,12 +51,14 @@ public:
     void sum_scatter(const Tensor&, Tensor&, CudaExecutionView);
     // Each U32 word has one contributing rank; all other ranks supply zero.
     void merge_unique(Tensor&, CudaExecutionView);
-    // Unsigned 64-bit ordering for packed vocabulary candidates.
-    void maximum(Tensor&, CudaExecutionView);
     void gather(const Tensor&, Tensor&, CudaExecutionView);
+    // Vocabulary Ops use I64 storage. Gather the same bits as unsigned records.
+    void gather_unsigned_words(const Tensor&, Tensor&, CudaExecutionView);
     void broadcast(Tensor&, CudaExecutionView);
     void broadcast(Tensor&, std::uint32_t owner, CudaExecutionView);
     void exchange(std::span<const distributed::PeerTransfer>, CudaExecutionView);
+    [[nodiscard]] bool supports_graph_gating() const noexcept;
+    [[nodiscard]] CommunicationGraphWork captured_work() const;
     void record_graph(CommunicationGraphWork&, const std::function<void()>&);
     void replayed(const CommunicationGraphWork&) const;
 

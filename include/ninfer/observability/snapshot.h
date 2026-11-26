@@ -4,6 +4,7 @@
 #include "ninfer/observability/execution.h"
 #include "ninfer/observability/request.h"
 #include "ninfer/deployment.h"
+#include "ninfer/linear_state_format.h"
 
 #include <filesystem>
 
@@ -45,10 +46,12 @@ struct RuntimeStats {
     // All committed output tokens, including the first token and Engine-injected control tokens.
     std::uint64_t generated_tokens        = 0;
     std::uint64_t injected_control_tokens = 0;
-    // Native verification work, using the same acceptance semantics as SpeculativeStats.
+    // Speculative decode work, using the same semantics as SpeculativeStats.
     std::uint64_t speculative_rounds                 = 0;
+    std::uint64_t speculative_proposed_tokens        = 0;
     std::uint64_t speculative_draft_tokens           = 0;
     std::uint64_t speculative_accepted_tokens        = 0;
+    std::uint64_t speculative_bypass_steps           = 0;
     std::uint64_t speculative_fallback_steps         = 0;
     std::uint64_t speculative_committed_draft_tokens = 0;
     std::vector<std::uint64_t> speculative_attempted_per_position;
@@ -168,12 +171,27 @@ struct EngineDescription {
     std::vector<ContextPoolCapacity> context_pools;
     std::uint64_t context_token_capacity_estimate = 0;
     KvCacheStorage kv_cache                       = KvCacheStorage::BFloat16;
+    LinearStateDType linear_state_dtype           = LinearStateDType::Float32;
     std::vector<ContextKvPoolUsage> kv_pools;
+};
+
+enum class SpeculativeLengthPolicy : std::uint8_t;
+
+struct SpeculativeStartupSummary {
+    SpeculativeBackend backend = SpeculativeBackend::None;
+    SpeculativeLengthPolicy length_policy{}; // Adaptive, defined in ninfer/types.h.
+    std::uint32_t draft_window         = 0;
+    bool calibrated                    = false;
+    std::uint32_t calibration_anchors  = 0;
+    std::uint32_t calibration_contexts = 0;
+    double calibration_seconds         = 0.0;
+    std::vector<std::uint32_t> target_widths;
 };
 
 struct StartupReport {
     LoadSummary load;
     std::vector<RankMemoryBudget> ranks;
+    std::optional<SpeculativeStartupSummary> speculative;
 };
 
 struct SnapshotStamp {

@@ -3,8 +3,12 @@
 #include "ops/common/host/operands.h"
 #include "ops/kv_cache/append/dispatch.h"
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -188,6 +192,107 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
         throw std::invalid_argument("kv_cache_append: T exceeds cache capacity");
     }
     detail::kv_cache_append_dispatch(k, v, positions, cache, stream);
+}
+
+void kv_cache_append(const Tensor& k, const Tensor& v, const RaggedSequenceView& ragged,
+                     const Tensor& positions, const Tensor& table_rows,
+                     PagedKVBatchLayerView cache, CudaExecutionView execution) {
+    const auto stream = execution.stream();
+    const auto device = execution.device();
+    common::operand::ragged_batch(ragged, positions, table_rows, kAppendOp, device);
+    const bool full_geometry    = k.ne[0] == kFullHeadDim && (k.ne[1] == 2 || k.ne[1] == 4);
+    const bool compact_geometry = k.ne[0] == kHeadDim && k.ne[1] == kKVHeads;
+    if (!full_geometry && !compact_geometry) {
+        throw std::invalid_argument("kv_cache_append: unsupported KV head geometry");
+    }
+    const std::int32_t head_dim = full_geometry ? kFullHeadDim : kHeadDim;
+    const std::int32_t kv_heads = full_geometry ? k.ne[1] : kKVHeads;
+    const std::int32_t tokens   = ragged.total_tokens();
+    common::operand::tensor(k, DType::BF16, {head_dim, kv_heads, tokens}, 16, kAppendOp, "k",
+                            device);
+    common::operand::tensor(v, DType::BF16, {head_dim, kv_heads, tokens}, 16, kAppendOp, "v",
+                            device);
+    std::uint32_t max_segment = 0;
+    for (std::int32_t s = 0; s < ragged.num_seqs(); ++s) {
+        max_segment = std::max(max_segment, static_cast<std::uint32_t>(ragged.segment_length(s)));
+    }
+    if (full_geometry) {
+        const std::uint32_t capacity = validate_full_cache(cache, kv_heads, device, kAppendOp);
+        if (max_segment > capacity) {
+            throw std::invalid_argument("kv_cache_append: segment exceeds cache capacity");
+        }
+    } else {
+        validate_paged_cache(cache, {0, max_segment}, device);
+    }
+    const auto storage = common::operand::range(cache.k_pages.records.storage.data,
+                                                cache.k_pages.records.storage.bytes, kAppendOp);
+    const std::array inputs{
+        common::operand::range(k, kAppendOp),
+        common::operand::range(v, kAppendOp),
+        common::operand::range(positions, kAppendOp),
+        common::operand::range(table_rows, kAppendOp),
+        common::operand::range(ragged.cu_seqlens, kAppendOp),
+        common::operand::range(ragged.seq_lengths, kAppendOp),
+        common::operand::range(ragged.token_to_seq, kAppendOp),
+        common::operand::range(cache.k_pages.records.page_offsets, kAppendOp),
+    };
+    for (const auto input : inputs) common::operand::disjoint(storage, input, kAppendOp);
+    std::array<common::operand::Range, 4> planes{};
+    std::size_t plane_count = 0;
+    for (const auto* plane :
+         {&cache.k_pages, &cache.v_pages, &cache.k_scale_pages, &cache.v_scale_pages}) {
+        if (!plane->data()) continue;
+        const auto& region = plane->plane.tensor.region;
+        planes[plane_count++] =
+            common::operand::range(static_cast<const std::byte*>(plane->records.storage.data) +
+                                       region.offset,
+                                   region.bytes, kAppendOp);
+    }
+    common::operand::disjoint(std::span<const common::operand::Range>(planes.data(), plane_count),
+                              kAppendOp);
+    detail::kv_cache_append_dispatch(k, v, ragged, positions, table_rows, cache, stream);
+}
+
+void kv_cache_append(const Tensor& k, const Tensor& v, const RaggedSequenceView& ragged,
+                     const Tensor& positions, CyclicKVCacheLayerView cache,
+                     CudaExecutionView execution) {
+    const auto stream = execution.stream();
+    const auto device = execution.device();
+    common::operand::ragged_sequence(ragged, kAppendOp, device);
+    const std::int32_t tokens   = ragged.total_tokens();
+    const std::int32_t segments = ragged.num_seqs();
+    common::operand::tensor(positions, DType::I32, {tokens}, 4, kAppendOp, "positions", device);
+    common::operand::tensor(k, DType::BF16, {kHeadDim, kKVHeads, tokens}, 16, kAppendOp, "k",
+                            device);
+    common::operand::tensor(v, DType::BF16, {kHeadDim, kKVHeads, tokens}, 16, kAppendOp, "v",
+                            device);
+    std::uint32_t max_segment = 0;
+    for (std::int32_t s = 0; s < segments; ++s) {
+        max_segment = std::max(max_segment, static_cast<std::uint32_t>(ragged.segment_length(s)));
+    }
+    validate_cyclic_cache(cache, segments, {0, max_segment}, device);
+    const auto storage = common::operand::range(cache.k.records.storage.data,
+                                                cache.k.records.storage.bytes, kAppendOp);
+    const std::array inputs{
+        common::operand::range(k, kAppendOp),
+        common::operand::range(v, kAppendOp),
+        common::operand::range(positions, kAppendOp),
+        common::operand::range(ragged.cu_seqlens, kAppendOp),
+        common::operand::range(ragged.seq_lengths, kAppendOp),
+        common::operand::range(ragged.token_to_seq, kAppendOp),
+        common::operand::range(cache.k.records.byte_offsets, kAppendOp),
+    };
+    for (const auto input : inputs) common::operand::disjoint(storage, input, kAppendOp);
+    const auto k_region = common::operand::range(
+        static_cast<const std::byte*>(cache.k.records.storage.data) +
+            cache.k.field.tensor.region.offset,
+        cache.k.field.tensor.region.bytes, kAppendOp);
+    const auto v_region = common::operand::range(
+        static_cast<const std::byte*>(cache.v.records.storage.data) +
+            cache.v.field.tensor.region.offset,
+        cache.v.field.tensor.region.bytes, kAppendOp);
+    common::operand::disjoint(k_region, v_region, kAppendOp);
+    detail::kv_cache_append_dispatch(k, v, ragged, positions, cache, stream);
 }
 
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,

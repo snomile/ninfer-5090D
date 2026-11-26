@@ -1,8 +1,7 @@
 #pragma once
 
-#include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/execution/attention.h"
 #include "ninfer/ops/kv_cache_append.h"
-#include "ninfer/ops/softmax_attention.h"
 #include "ninfer/types.h"
 
 namespace ninfer::models::qwen3_5::execution {
@@ -43,15 +42,21 @@ struct MtpInputs {
     const Tensor* input_embeddings = nullptr;
 };
 
-void mtp_forward(MtpExecutionView state, const MtpInputs& inputs,
-                 ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden);
+void mtp_forward(MtpExecutionView state, const MtpInputs& inputs, ops::ContextBucket,
+                 Tensor& hidden, const CausalAttentionSubmit& = {});
+void bind_mtp_attention_readout(MtpExecutionView, const MtpInputs&, const CausalAttentionSubmit&);
 
 // Materialize K/V from true target conditioning without running query attention or the MLP.
 void mtp_history(MtpExecutionView state, const MtpInputs& inputs,
                  ops::KVCacheAppendPrefixExecutionEnvelope envelope);
+// Flat [N,1] token axes and segment-indexed counts and KV table rows.
+void mtp_history(MtpExecutionView state, const MtpInputs& inputs,
+                 const ops::RaggedSequenceView& ragged);
 
-// hidden is BF16 [H,C] and ids is I32 [C]. Full uses caller-owned BF16 [V,C] logits;
+// hidden is BF16 [H,C], ids is I32 [C] and confidences is FP32 [C].
+// Full uses caller-owned BF16 [V,C] logits;
 // Optimized uses its selected proposal head and optional token-ID map, leaving full_logits alone.
-void mtp_propose(MtpExecutionView state, const Tensor& hidden, Tensor& full_logits, Tensor& ids);
+void mtp_propose(MtpExecutionView state, const Tensor& hidden, Tensor& full_logits, Tensor& ids,
+                 Tensor& confidences);
 
 } // namespace ninfer::models::qwen3_5::execution

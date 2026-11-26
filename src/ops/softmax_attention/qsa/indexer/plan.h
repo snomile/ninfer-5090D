@@ -5,27 +5,31 @@
 #include "ninfer/ops/qsa.h"
 
 #include <algorithm>
+#include <limits>
+#include <optional>
+#include <span>
 
 namespace ninfer::ops::detail::qsa {
 
 inline constexpr int kIndexerPartition = 4096;
 
 struct IndexerPlan {
-    int window_tokens, request_rows, columns, partitions;
+    int window_tokens, window_queries, columns, partitions;
 };
 
 int indexer_window_capacity(int batch);
 
-inline IndexerPlan select_indexer_plan(int tokens, int batch, std::uint32_t visible_tokens) {
-    const int capacity = indexer_window_capacity(batch);
-    // Retain tuned small batches. Larger calls give each request a whole query window
-    // where possible, reusing its keys before the next group uses the same score storage.
-    const int requests =
-        batch <= 8 ? batch : std::min(batch, capacity / std::min(tokens, capacity));
-    const int blocks = visible_tokens / 4;
-    return {std::min(tokens, capacity / requests), requests,
-            (blocks + kIndexerKeyTile - 1) / kIndexerKeyTile * kIndexerKeyTile,
-            (blocks + kIndexerPartition - 1) / kIndexerPartition};
+inline IndexerPlan select_indexer_plan(int tokens, int batch, ContextBucket bucket) {
+    const int window_tokens = std::max(1, indexer_window_capacity(batch) / batch);
+    const int columns       = context_bucket_tokens(bucket) / 4;
+    const int partitions =
+        columns <= kIndexerSelected ? 0 : std::max(1, columns / kIndexerPartition);
+    return {window_tokens, std::min(tokens, window_tokens) * batch, columns, partitions};
+}
+
+inline int indexer_workers(int waves, int sms, std::int64_t tasks) {
+    return static_cast<int>(std::clamp<std::int64_t>(std::min(std::int64_t(waves) * sms, tasks), 1,
+                                                     std::numeric_limits<int>::max()));
 }
 
 enum class IndexerScore { Mma, Simt16, Simt8, Tma };
@@ -41,28 +45,42 @@ struct IndexerWindowPlan {
 IndexerWindowPlan select_indexer_window(IndexerPlan plan, int width, int batch, int sms,
                                         bool tma_cache);
 
-template <class Launch>
-void for_each_indexer_window(IndexerArguments input, IndexerPlan plan, Launch&& launch) {
-    for (std::int64_t first = 0; first < input.batch; first += plan.request_rows) {
-        auto a            = input;
-        const auto column = first * input.tokens;
-        a.query += column * 512;
-        a.positions += column;
-        a.valid += first;
-        a.table_rows += first;
-        a.ids += column * kIndexerSelected;
-        a.counts += column;
-        a.batch = std::min<std::int64_t>(plan.request_rows, input.batch - first);
-        for (std::int64_t begin = 0; begin < a.tokens; begin += plan.window_tokens) {
-            a.begin = int(begin);
-            a.width = std::min(plan.window_tokens, a.tokens - a.begin);
-            launch(a);
-        }
+template <class Arguments, class Launch>
+void for_each_indexer_window(Arguments input, IndexerPlan plan, Launch&& launch) {
+    for (std::int64_t begin = 0; begin < input.tokens; begin += plan.window_tokens) {
+        input.begin = int(begin);
+        input.width = std::min(plan.window_tokens, input.tokens - input.begin);
+        launch(input);
     }
 }
 
-void launch_indexer_windows(IndexerArguments input, IndexerPlan plan, std::size_t key_bytes,
-                            std::size_t key_alignment, CudaExecutionView execution);
+// Segment membership is fixed by the validated host partition. A whole window
+// inside one segment can use a rectangular score/select chain with live Device
+// positions, lengths and table selectors. The scratch indices still start at zero.
+inline std::optional<IndexerArguments>
+single_segment_indexer_window(const RaggedIndexerArguments& a,
+                              std::span<const std::int32_t> offsets) {
+    if (a.partitions <= 1) return std::nullopt;
+    const auto after = std::upper_bound(offsets.begin(), offsets.end(), a.begin);
+    if (a.width > *after - a.begin) return std::nullopt;
+    const auto segment       = after - offsets.begin() - 1;
+    const std::int64_t first = offsets[segment];
+    IndexerArguments row     = a;
+    row.query += first * 512;
+    row.positions += first;
+    row.valid += segment;
+    row.table_rows += segment;
+    row.ids += first * kIndexerSelected;
+    row.counts += first;
+    row.tokens = *after - first;
+    row.begin -= first;
+    return row;
+}
+
+template <class Arguments>
+void launch_indexer_windows(Arguments input, IndexerPlan plan, std::size_t key_bytes,
+                            std::size_t key_alignment, CudaExecutionView execution,
+                            std::span<const std::int32_t> offsets = {});
 
 struct IndexerWorkspace {
     Tensor scores, candidates;
@@ -71,15 +89,17 @@ struct IndexerWorkspace {
 template <class Allocator>
 IndexerWorkspace allocate_indexer_workspace(Allocator& allocator, IndexerPlan plan) {
     IndexerWorkspace out;
-    if (plan.columns <= kIndexerSelected) return out;
-    const int rows = plan.window_tokens * plan.request_rows;
-    out.scores     = allocator.alloc(DType::FP32, {plan.columns, rows}, 256);
-    out.candidates = allocator.alloc(DType::I64, {kIndexerSelected, plan.partitions, rows}, 256);
+    if (plan.partitions == 0) return out;
+    out.scores = allocator.alloc(DType::FP32, {plan.columns, plan.window_queries}, 256);
+    if (plan.partitions > 1)
+        out.candidates = allocator.alloc(
+            DType::I64, {kIndexerSelected, plan.partitions, plan.window_queries}, 256);
     return out;
 }
 
 void launch_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
                     const QsaBatchView& batch, IndexerPlan plan, const IndexerWorkspace& scratch,
-                    QsaBlockSelection& out, CudaExecutionView execution);
+                    QsaBlockSelection& out, CudaExecutionView execution,
+                    const RaggedSequenceView* ragged = nullptr);
 
 } // namespace ninfer::ops::detail::qsa

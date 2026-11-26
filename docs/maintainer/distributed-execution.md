@@ -81,9 +81,14 @@ Native 使用 RDMA 链路、设备 kernel 与 Host progress 线程完成传输�
 仍履行已安排的通信。多个 communicator 的相对提交顺序也属于模型执行合同。
 Host 入队、网络推进与设备完成分别处理，后续工作按实际 stream 依赖推进。
 
-计算和通信可以一起捕获。上下文长度只改变局部 Attention kernel 时，在固定外层图内更新 child，
-保持通信节点和缓冲稳定。只有实际需要不同计算几何或通信形状时才创建图变体，
+计算和通信可以一起捕获。上下文桶变化时，按 `ContextBucket` 在固定外层图内更新 Attention/Indexer
+的局部 kernel 参数切片，保持通信节点和缓冲稳定。只有实际需要不同计算几何或通信形状时才创建图变体，
 不按 owner 向量、采样方式和每行接受长度枚举图。
+
+多请求 Packed Prefill 保持 Eager 执行：GLM ADP 在冻结分组阶段按 attention owner 排列成员，使每个 rank
+的 MLA/Indexer 仅处理本地 owner 段的打包视图（`local_mla_ragged`）并并行推进，同时 KDA、mHC 与 FFN
+仍在 TP 组上消费统一全局打包 token 流；TP2 下的 DFlash2 打包上下文特征按 rank 局部切片单次汇聚并广播后，
+一次性物化所有段的局部上下文 KV。
 
 权重分片后的普通 Linear/MoE 贡献遵循既有输出数值合同，分布式层不统一强制 FP32。
 Router、selection 和 token 决策需要共同离散结果时，由模型保证生产方式与消费一致。

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen4_exp/session/session.h"
+#include "models/common/speculative/round_plan.h"
 #include "models/qwen4_exp/state/continuation.h"
 #include "models/qwen4_exp/definition.h"
 #include "models/common/context/snapshot.h"
@@ -98,6 +99,7 @@ struct Sequence {
     std::uint64_t membership_mark = 0;
     bool computing                = false;
     SpeculativeStats speculative;
+    speculative::SequenceSpeculativeState speculative_state;
 };
 
 struct Suspended {
@@ -219,7 +221,10 @@ struct ComputeTransaction {
     std::uint64_t vision_id = 0;
     std::vector<SequenceHandle> members;
     std::vector<WorkRow> rows;
-    std::vector<std::uint32_t> extents;
+    std::optional<speculative::DecodeRoundPlan> round;
+    std::vector<std::uint8_t> could_speculate;
+    std::optional<speculative::CostQuery> cost_query;
+    bool record_online_cost = true;
     std::optional<ComputeResult> result;
     ExecutionSample observed_result;
     std::vector<runtime::CommitDecision> decisions;
@@ -329,6 +334,7 @@ public:
 
     std::shared_ptr<const ModelDefinition> definition;
     const SessionPlan plan;
+    speculative::SpeculativeCostModel cost_model;
     vision::Window vision_window;
     [[nodiscard]] std::optional<qwen::VisionWork>
     prepare_visual(const Sequence&, std::uint32_t begin, std::uint32_t end);

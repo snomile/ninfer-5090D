@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/session/session.h"
+#include "models/common/speculative/round_plan.h"
 #include "models/qwen3_5/state/continuation.h"
 #include "models/common/context/snapshot.h"
 #include "models/common/context/prefix.h"
@@ -121,6 +122,7 @@ struct RequestControl {
     Lifecycle lifecycle = Lifecycle::Empty;
     ResolvedSamplingParameters sampling_host;
     SpeculativeStats speculative_stats;
+    speculative::SequenceSpeculativeState speculative_state;
     std::shared_ptr<const RequestBasePlanImpl> base;
     std::optional<UnitDemand> permit;
     std::optional<RecoveryPermit> recovery;
@@ -292,7 +294,7 @@ struct PendingContext {
 
 class SessionImpl {
 public:
-    SessionImpl(std::shared_ptr<const ModelDefinition>, SessionPlan);
+    explicit SessionImpl(SessionPlan);
     std::uint64_t next_lane_mark();
     ~SessionImpl();
     [[nodiscard]] RequestBasePlan plan_request(qwen::PreparedPromptData&& prompt,
@@ -374,12 +376,30 @@ public:
     [[nodiscard]] bool execution_pending(SequenceHandle sequence) const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] runtime::PrefillCandidateInfo prefill_candidate(SequenceHandle) const;
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_prefill(SequenceHandle,
                                                                         bool constrained = false);
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
+        start_prefill(std::span<const SequenceHandle>, std::span<const runtime::PrefillGrant>);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
-    start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,
-                 std::span<const std::uint8_t> constrained = {});
+    start_decode_round(std::span<const SequenceHandle>, speculative::DecodeRoundRequest,
+                       std::span<const std::uint8_t> constrained = {});
+
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
+    start_decode(std::span<const SequenceHandle> members,
+                 std::span<const runtime::RoundBudget> budgets,
+                 std::span<const std::uint8_t> constrained = {}) {
+        return start_decode_round(members, {.budgets = budgets}, constrained);
+    }
+
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
+    start_decode_extents(std::span<const SequenceHandle> members,
+                         std::span<const std::uint32_t> verify_drafts,
+                         std::span<const std::uint8_t> constrained = {}) {
+        return start_decode_round(members, {.extents = verify_drafts}, constrained);
+    }
+
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_control(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t stride);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_score(qwen::PreparedPromptData&&,
@@ -394,7 +414,6 @@ public:
     void fail_all_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
 
-    std::shared_ptr<const ModelDefinition> definition;
     SessionPlan plan;
     vision::Window vision_window;
     [[nodiscard]] std::optional<qwen::VisionWork>
@@ -416,6 +435,7 @@ public:
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
+    speculative::SpeculativeCostModel cost_model;
     const ContextCacheOptions context_cache;
     const bool vision_enabled;
     const bool causal_scoring;
@@ -467,9 +487,14 @@ public:
         std::vector<Continuation> bases;
         std::vector<ContinuationMetadata> completed;
         std::vector<std::uint32_t> columns;
+        std::vector<std::uint8_t> sampled;
         std::vector<std::vector<TokenId>> inputs;
         std::unique_ptr<context::ContextTransaction> preparation;
         std::unique_ptr<context::ContextTransaction> settlement;
+        std::shared_ptr<const speculative::DecodeRoundPlan> round;
+        std::vector<std::uint8_t> could_speculate;
+        std::optional<speculative::CostQuery> cost_query;
+        bool record_online_cost = true;
         std::optional<GeneratedResult> generated;
         ExecutionSample observed_result;
         std::optional<SessionEvent> completion;
@@ -500,8 +525,9 @@ public:
     [[nodiscard]] const SequenceState& active_sequence(std::uint32_t) const;
     void invalidate_lane(std::uint32_t) noexcept;
     [[nodiscard]] UnitDemand prefill_unit(std::uint32_t prompt, std::uint32_t cursor) const;
-    [[nodiscard]] UnitDemand next_unit(const SequenceState&, const RequestControl&,
-                                       ExecutionUnitKind, std::uint32_t tokens) const;
+[[nodiscard]] UnitDemand next_unit(const SequenceState&, const RequestControl&,
+                                       ExecutionUnitKind, std::uint32_t tokens,
+                                       std::uint32_t frontier) const;
     void require_unit(std::uint32_t, ExecutionUnitKind, std::uint32_t tokens = 0) const;
     [[nodiscard]] bool prepare_settlement(std::uint32_t lane,
                                           const ContinuationMetadata& continuation,

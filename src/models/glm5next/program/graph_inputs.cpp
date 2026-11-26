@@ -52,15 +52,16 @@ void GraphInputs::prepare() {
     for (std::uint32_t row = 0; row < p.shape.max_concurrency; ++row)
         states_.push_back(allocate(0));
     for (int pool = 0; pool < (r.mtp ? 2 : 1); ++pool) {
-        auto& tables    = (pool ? *r.mtp : r.main).tables();
-        mappings_[pool] = PinnedHostBuffer(p.shape.max_concurrency * sizeof(std::int64_t));
-        auto* offsets   = static_cast<std::int64_t*>(mappings_[pool].data());
+        auto& tables         = (pool ? *r.mtp : r.main).tables();
+        const auto capacity  = tables.logical_page_capacity();
+        const auto row_bytes = std::size_t(capacity) * sizeof(std::int64_t);
+        mappings_[pool]      = PinnedHostBuffer(p.shape.max_concurrency * row_bytes);
         for (std::uint32_t row = 0; row < p.shape.max_concurrency; ++row) {
-            offsets[row] = allocate(pool + 1);
-            tables.publish(
-                row, 0, {offsets + row, 1},
-                mappings_[pool].span().subspan(row * sizeof(std::int64_t), sizeof(std::int64_t)),
-                p.cuda);
+            const auto page_offset = allocate(pool + 1);
+            const auto staging     = mappings_[pool].span().subspan(row * row_bytes, row_bytes);
+            auto* offsets          = static_cast<std::int64_t*>(staging.data);
+            std::fill_n(offsets, capacity, page_offset);
+            tables.publish(row, 0, {offsets, capacity}, staging, p.cuda);
         }
     }
     p.device.synchronize();
@@ -71,7 +72,7 @@ GraphInputs::~GraphInputs() {
     for (auto id : allocations_) records_->release(id);
 }
 
-void GraphInputs::set(int g, int c, int depth) {
+void GraphInputs::set(int g, int c, int width, int depth) {
     auto& p = owner_;
     auto& r = p.resources;
     p.device.synchronize();
@@ -87,10 +88,12 @@ void GraphInputs::set(int g, int c, int depth) {
         begins[i] = real_rows;
         real_rows += counts[i];
     }
-    const int width  = depth ? p.shape.draft_tokens + 1 : 1;
-    const int base   = std::max(0, std::min(4, int(p.shape.max_context) - width));
-    const int extent = std::min(depth, int(p.shape.max_context) - base - 1);
-    const auto i32   = [&](const TensorRegion& region) {
+    const int capacity       = dimension(p.shape.max_context);
+    const int block          = io.dflash && depth ? dimension(p.shape.draft_tokens + 1) : width;
+    const int base           = std::clamp(capacity - block, 0, 4);
+    const bool proposal_fits = io.mtp ? base != 0 : block <= capacity;
+    const int extent         = proposal_fits ? std::min(depth, capacity - base - 1) : 0;
+    const auto i32           = [&](const TensorRegion& region) {
         return static_cast<int*>(p.host(region).data);
     };
     const auto i64 = [&](const TensorRegion& region) {
@@ -143,21 +146,24 @@ void GraphInputs::set(int g, int c, int depth) {
             i32(io.speculative->extents)[j]      = j < int(real_rows) ? extent : 0;
             i32(io.speculative->last_columns)[j] = j < int(real_rows) ? 0 : -1;
         }
-    if (io.dflash)
-        for (int j = 0; j < g; ++j)
-            i32(io.dflash->valid_columns)[j] = j < int(real_rows) ? p.shape.draft_tokens + 1 : 0;
+    if (io.dflash) {
+        for (int j = 0; j < g; ++j) {
+            const bool active                = j < int(real_rows) && extent;
+            i32(io.dflash->valid_columns)[j] = active ? p.shape.draft_tokens + 1 : 0;
+            i32(io.dflash->proposal_rows)[j] = active;
+        }
+    }
     if (io.mtp) {
         const auto& m = *io.mtp;
-        for (int s = 0; s < depth; ++s)
-            batch(m.draft_steps[s], 1, std::max(base - 1, 0) + std::min(s, extent), s < extent,
+        for (int s = 0; s < int(m.draft_steps.size()); ++s)
+            batch(m.draft_steps[s], 1, s < extent ? std::max(base - 1, 0) + s : 0, s < extent,
                   false);
         for (int j = 0; j < g; ++j)
             i32(m.skip_first)[j] = j < int(real_rows) && (depth ? extent != 0 : base == 0);
     }
     p.fill_local_metadata(io.decode, width, c);
     if (io.mtp)
-        for (int step = 0; step < depth; ++step)
-            p.fill_local_metadata(io.mtp->draft_steps[step], 1, c);
+        for (const auto& step : io.mtp->draft_steps) p.fill_local_metadata(step, 1, c);
     auto* configs = static_cast<ops::SamplingConfig*>(p.host(*io.sampling).data);
     for (int j = 0; j < g; ++j) configs[j] = {.temperature = 0, .top_k = 1, .top_p = 1};
     p.upload_region(io.ingress, io.ingress.bytes);

@@ -1,11 +1,14 @@
 #pragma once
 
+#include "ninfer/ops/ragged.h"
+
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/record_view.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ninfer/ops/context_bucket.h"
 #include "ninfer/ops/projection_weights.h"
 
 #include <cstddef>
@@ -60,18 +63,23 @@ inline constexpr std::int32_t kKpoolPoolSize          = 4;
 inline constexpr std::int32_t kKpoolSelectedPools     = 512;
 inline constexpr std::uint32_t kKpoolMaxVisibleTokens = 1048576;
 
+// Live positions in each row are consecutive and nonnegative; padding consumes no ordinal.
 struct KpoolMlaBatchView {
     Tensor positions;     // Device I32 [T,B], original-token ordinals.
     Tensor valid_columns; // Device I32 [B], 0<=n[b]<=T.
     Tensor table_rows;    // Device I32 [B], row of the page-offset table.
 };
 
-// Live positions in each row are consecutive and nonnegative; padding consumes no ordinal.
-// Every live p+1 fits the page table and the semantic context limit. The Host envelope is only
-// a resource bound, not an exact length or a claim that selections are full. Zero permits no
-// live queries. A valid envelope change must not change mathematical output.
-struct KpoolExecutionEnvelope {
-    std::uint32_t max_visible_tokens = 0;
+// Flat packed positions are consecutive per segment. Table rows select one page table per segment.
+struct KpoolMlaRaggedBatchView {
+    RaggedSequenceView ragged;
+    Tensor positions;  // Device I32 [N].
+    Tensor table_rows; // Device I32 [S].
+
+    KpoolMlaRaggedBatchView() = default;
+
+    KpoolMlaRaggedBatchView(RaggedSequenceView ragged, Tensor positions, Tensor table_rows)
+        : ragged(ragged), positions(positions), table_rows(table_rows) {}
 };
 
 // A layer borrows planes of one page-group record. The data plane is BF16 or E4M3FN [Dc,64,1]
@@ -338,17 +346,18 @@ void kpool_mla_prepare_update(const Tensor& x, const KpoolMlaPrepareParameters& 
  * output row m=t+T*b; Nselection must equal T*B. Inert rows write count=E=0, leave IDs undefined
  * and do not read positions, query, coefficients, cache or selectors. IDs beyond count are
  * undefined. Inputs/cache are preserved. Mathematical operands and computed scores are finite.
- * Each live E fits both the page table and envelope.max_visible_tokens<=kKpoolMaxVisibleTokens.
+ * Each live E <= min<std::int64_t>(context_bucket_tokens(bucket), std::int64_t(table.ne[0]) * 64),
+ * where table is the cache page-offset table.
  *
  * Mixed per-row lengths/all-select/inert cases are Device decisions. Scratch is reused across
- * bounded query windows. Fixed T/B/profile/index format/device facts keep Graph node count/order
- * compatible across envelope updates; changing a Host variable alone does not update captured
- * nodes.
+ * query windows. K2 uses zero scratch. Fixed T/B/profile/index format/device produce a linear
+ * kernel chain with the same node count across K2..M1. Both cudaGraphExecKernelNodeSetParams and
+ * cudaGraphExecUpdate can install the launches captured for a different bucket.
  */
 void kpool_indexer(const Tensor& index_query, const Tensor& head_coeff,
                    const ConstKpoolIndexCacheView& cache, const KpoolMlaBatchView& batch,
-                   KpoolExecutionEnvelope envelope, MemoryArena& workspace,
-                   KpoolBlockSelection& out, CudaExecutionView execution);
+                   ContextBucket bucket, MemoryArena& workspace, KpoolBlockSelection& out,
+                   CudaExecutionView execution);
 
 struct KpoolMlaFactors {
     // Logical [Hq*Dq,Dc] / [Hq*Dv,Dc], preserving the native per-head row order.
@@ -363,8 +372,10 @@ struct KpoolMlaFactors {
 /**
  * Complete factorized attention. query is BF16 [Dq,Hq,T,B], out is BF16 [Dv,Hq,T,B].
  * Device I32 selection_rows[T,B] maps each live query to a selected row in [0,Nselection).
- * For its frozen E/count, require 0<=E<=p+1<=envelope.max_visible_tokens<=context limit,
- * 0<=count<=min(512,floor(E/4)), and distinct IDs[0:count] in [0,floor(E/4)). Caller supplies
+ * For its frozen E/count, require 0<=E<=p+1<=context_bucket_tokens(bucket),
+ * E<=page_columns*64, 0<=count<=min(512,floor(E/4)), and distinct IDs[0:count] in
+ * [0,floor(E/4)). The page table has at least one page column. Supported buckets are K2
+ * through M1. Caller supplies
  * a selection belonging to the same request/layer/history. It need not be this query's TopK.
  *   J = union({4*g,4*g+1,4*g+2,4*g+3} for selected g) union [4*floor(E/4),E);
  *   q_latent_h = transpose(U_K[h]) * query_h;
@@ -390,15 +401,15 @@ struct KpoolMlaFactors {
  * Empty J and inert queries write exact BF16 +0, without reading their query, factors or cache
  * payload in any stage. Inert queries also do not read positions, selection mappings/contents
  * or table selectors. Never read invalid ID suffixes or a fourth incomplete-tail token.
- * Caller-scoped scratch covers every private stage. Fixed T/B/profile/storage/device facts
- * keep Graph node count/order compatible across envelope updates; workspace and the actual
- * capture/update must cover the chosen bound. No expanded global BF16 cache is created.
+ * Caller-scoped scratch covers every private stage. At fixed T/B/profile/storage/device,
+ * capture emits four ordered nodes per query window across buckets and supports per-node
+ * patching and whole-graph updates. No expanded global BF16 cache is created.
  */
 void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
                       const ConstKpoolMlaLatentCacheView& cache, const KpoolMlaBatchView& batch,
                       const KpoolBlockSelection& selected, const Tensor& selection_rows,
-                      float attention_scale, KpoolExecutionEnvelope envelope,
-                      MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+                      float attention_scale, ContextBucket bucket, MemoryArena& workspace,
+                      Tensor& out, CudaExecutionView execution);
 
 /**
  * Restore the raw tail of an accepted prefix, across L layers in one call. accepted_columns
@@ -428,7 +439,8 @@ void kpool_tail_extract(ConstKpoolTailStateView before, const KpoolRawRecordRead
 
 /**
  * Minimum sufficient Op-local high-water bytes over the inclusive positive T interval, with
- * fixed profile/storage/B/envelope and the execution device's positive physical sm_count.
+ * fixed profile/storage/B and the execution device's positive physical sm_count. Indexer
+ * and sparse MLA capacities cover the inclusive bucket range.
  * Include every legal length, pool phase, alias form, private route and internal alignment gap;
  * exclude trailing padding and caller outputs/cache/tail/records/selection. Count from a
  * 256-byte-aligned local cursor. Invalid/unsupported profiles or intervals throw; zero means
@@ -445,41 +457,57 @@ void kpool_tail_extract(ConstKpoolTailStateView before, const KpoolRawRecordRead
     KvCacheVectorFormat index_format, std::int32_t batch_size, std::int32_t min_tokens,
     std::int32_t max_tokens, std::int32_t sm_count);
 
-[[nodiscard]] std::size_t kpool_indexer_workspace_capacity_bytes(
-    const KpoolIndexerProfile& profile, KvCacheVectorFormat index_format,
-    KpoolExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
-    std::int32_t max_tokens, std::int32_t sm_count);
+[[nodiscard]] std::size_t
+kpool_indexer_workspace_capacity_bytes(const KpoolIndexerProfile& profile,
+                                       KvCacheVectorFormat index_format, ContextBucketRange buckets,
+                                       std::int32_t batch_size, std::int32_t min_tokens,
+                                       std::int32_t max_tokens, std::int32_t sm_count);
 
 [[nodiscard]] std::size_t
 kpool_sparse_mla_workspace_capacity_bytes(const KpoolSparseMlaProfile& profile,
-                                          KpoolMlaStorage storage, KpoolExecutionEnvelope envelope,
+                                          KpoolMlaStorage storage, ContextBucketRange buckets,
                                           std::int32_t batch_size, std::int32_t min_tokens,
                                           std::int32_t max_tokens, std::int32_t sm_count);
 
-// Equality identifies identical captured launch parameters and scratch layout at fixed
-// operands/profile/storage/device. Device positions, validity and mappings remain replay inputs.
-// A changed value requires a new capture/update; the value has no caller-interpretable fields.
-class KpoolGraphProfile {
-public:
-    bool operator==(const KpoolGraphProfile&) const = default;
-private:
-    std::array<std::uint64_t, 24> words_{};
-    friend KpoolGraphProfile kpool_indexer_graph_profile(const KpoolIndexerProfile&,
-                                                         KvCacheVectorFormat,
-                                                         KpoolExecutionEnvelope, std::int32_t,
-                                                         std::int32_t, std::int32_t);
-    friend KpoolGraphProfile kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile&,
-                                                            KpoolMlaStorage, KpoolExecutionEnvelope,
-                                                            std::int32_t, std::int32_t,
-                                                            std::int32_t);
-};
-
-[[nodiscard]] KpoolGraphProfile
-kpool_indexer_graph_profile(const KpoolIndexerProfile&, KvCacheVectorFormat, KpoolExecutionEnvelope,
-                            std::int32_t batch_size, std::int32_t tokens, std::int32_t sm_count);
-[[nodiscard]] KpoolGraphProfile
-kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile&, KpoolMlaStorage,
-                               KpoolExecutionEnvelope, std::int32_t batch_size, std::int32_t tokens,
+// Equality guarantees identical launches and scratch layout at fixed operands.
+[[nodiscard]] OpGraphProfile
+kpool_indexer_graph_profile(const KpoolIndexerProfile& profile, KvCacheVectorFormat index_format,
+                            ContextBucket bucket, std::int32_t batch_size, std::int32_t tokens,
+                            std::int32_t sm_count);
+[[nodiscard]] OpGraphProfile
+kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile& profile, KpoolMlaStorage storage,
+                               ContextBucket bucket, std::int32_t batch_size, std::int32_t tokens,
                                std::int32_t sm_count);
+
+
+// Packed forms use a flat N-token axis and select one tail or table row per segment.
+// Prepare emits BF16 q_r [1536,N] when requested and FP32 head_coeff [32,N] for Full.
+// Indexer writes one selection per packed column. Sparse MLA uses global selection_rows [N].
+void kpool_mla_prepare_update(const Tensor& x, const KpoolMlaPrepareParameters& parameters,
+                              const KpoolMlaRaggedBatchView& batch, ConstKpoolTailStateView before,
+                              KpoolMlaCacheView cache, KpoolTailStateView after,
+                              KpoolMlaPrepareOutputs outputs, MemoryArena& workspace,
+                              CudaExecutionView execution);
+void kpool_indexer(const Tensor& index_query, const Tensor& head_coeff,
+                   const ConstKpoolIndexCacheView& cache, const KpoolMlaRaggedBatchView& batch,
+                   ContextBucket bucket, MemoryArena& workspace, KpoolBlockSelection& out,
+                   CudaExecutionView execution);
+void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
+                      const ConstKpoolMlaLatentCacheView& cache,
+                      const KpoolMlaRaggedBatchView& batch, const KpoolBlockSelection& selected,
+                      const Tensor& selection_rows, float attention_scale, ContextBucket bucket,
+                      MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+
+[[nodiscard]] std::size_t kpool_mla_prepare_update_ragged_workspace_capacity_bytes(
+    const KpoolMlaPrepareProfile& profile, KpoolMlaStorage latent_storage,
+    KvCacheVectorFormat index_format, int min_tokens, int max_tokens, int min_segments,
+    int max_segments, int sm_count);
+[[nodiscard]] std::size_t kpool_indexer_ragged_workspace_capacity_bytes(
+    const KpoolIndexerProfile& profile, KvCacheVectorFormat index_format,
+    ContextBucketRange buckets, int min_tokens, int max_tokens, int min_segments, int max_segments,
+    int sm_count);
+[[nodiscard]] std::size_t kpool_sparse_mla_ragged_workspace_capacity_bytes(
+    const KpoolSparseMlaProfile& profile, KpoolMlaStorage storage, ContextBucketRange buckets,
+    int min_tokens, int max_tokens, int min_segments, int max_segments, int sm_count);
 
 } // namespace ninfer::ops

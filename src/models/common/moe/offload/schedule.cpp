@@ -28,7 +28,12 @@ class Definition;
 class Executable final : public moe::LayerGraphExecutable {
 public:
     explicit Executable(const Definition&);
-    void update(const moe::LayerGraphDefinition&) override;
+
+    void update_mixer_slice(std::size_t index, const DecodeGraphKernelPatch& patch) override {
+        executable_.update_mixer_slice(index, patch);
+    }
+
+    void upload_mixer(cudaStream_t stream) override { executable_.upload_mixer(stream); }
 
     void upload(cudaStream_t stream) override { executable_.upload(stream); }
 
@@ -57,17 +62,14 @@ public:
     std::unique_ptr<moe::LayerGraphExecutable> instantiate() const override {
         return std::make_unique<Executable>(*this);
     }
+
+    std::size_t mixer_slice_count() const noexcept override {
+        return definition.mixer_slices.size();
+    }
 };
 
 Executable::Executable(const Definition& source)
     : resources_(source.resources), bank_(source.bank), executable_(source.definition) {}
-
-void Executable::update(const moe::LayerGraphDefinition& source) {
-    const auto& definition = dynamic_cast<const Definition&>(source);
-    if (&definition.resources != &resources_ || definition.bank != bank_)
-        throw std::logic_error("MoE graph update changed its execution owner");
-    executable_.update(definition.definition);
-}
 
 class Execution final : public moe::Schedule {
 public:
@@ -91,19 +93,9 @@ public:
 
     std::shared_ptr<const moe::LayerGraphDefinition>
     capture_layer(ExpertBankId bank, CudaExecutionView cuda, TokenGeometry geometry,
-                  const std::function<void()>& mixer, const GpuBody& body,
-                  const std::function<void()>& feature,
-                  const std::shared_ptr<const moe::LayerGraphDefinition>& shared) override {
+                  const MixerBody& mixer, const GpuBody& body,
+                  const std::function<void()>& feature) override {
         auto out = std::make_shared<Definition>(resources_, bank);
-        if (shared) {
-            const auto& existing = dynamic_cast<const Definition&>(*shared);
-            if (&existing.resources != &resources_ || existing.bank != bank)
-                throw std::logic_error("MoE graph sharing changed its execution owner");
-            out->definition.moe      = existing.definition.moe;
-            out->definition.validity = existing.definition.validity;
-        } else {
-            out->definition.moe = std::make_shared<SubsetGraphDefinitions>();
-        }
         offload::capture_layer(
             out->definition, resources_, bank, cuda, geometry, mixer,
             [&](const PreparedExecution& call) {

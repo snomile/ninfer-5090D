@@ -1,5 +1,4 @@
 #include "models/qwen4_exp/program/internal.h"
-#include "models/qwen4_exp/program/device_graphs.h"
 #include "core/startup.h"
 
 #include <algorithm>
@@ -44,8 +43,6 @@ RankProgramImpl::~RankProgramImpl() {
     } catch (const std::logic_error&) { std::terminate(); } catch (...) {
     }
     graphs.reset();
-    device_graphs.reset();
-    commit_graphs.reset();
     for (auto& resident : bindings)
         if (resident) retire_vision(*resident);
 }
@@ -66,7 +63,8 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                  bool(parameters.mtp),
                  bool(parameters.vision),
                  parameters.profile->control_token_limit,
-                 resources.plan.batches}
+                 resources.plan.batches,
+                 resources.plan.decode_routes}
         .validate(work, kind);
     const auto check_resident = [&](const runtime::ExecutionMember& member) {
         const auto& resident = bindings[member.residency.lane.value];
@@ -149,7 +147,8 @@ void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, const Comm
                  bool(parameters.mtp),
                  bool(parameters.vision),
                  parameters.profile->control_token_limit,
-                 resources.plan.batches}
+                 resources.plan.batches,
+                 resources.plan.decode_routes}
         .validate_commit(frame.request.work, frame.result.rows, commit);
     for (const auto& row : commit.rows)
         check_selectors(row.states.at(parameters.profile->local.rank), resources.states->storage());

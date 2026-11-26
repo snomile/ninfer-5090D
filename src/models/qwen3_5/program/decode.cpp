@@ -24,15 +24,27 @@ Tensor dense_prefix(const Tensor& tensor, std::initializer_list<std::int32_t> sh
     return Tensor({tensor.data, tensor.bytes(), tensor.device}, tensor.dtype, shape);
 }
 
+execution::DraftInputs draft_inputs(const ExecutionFrame& frame, int batch) {
+    return {frame.anchors.slice(0, 0, batch),
+            frame.frontiers.slice(0, 0, batch),
+            frame.proposal_valid_columns.slice(0, 0, batch),
+            frame.state_destination_offsets.slice(0, 0, batch),
+            frame.backend_table_rows.slice(0, 0, batch),
+            frame.proposal_live_rows.slice(0, 0, batch),
+            frame.sampling};
+}
+
 } // namespace
 
 void RankProgramImpl::append_draft_history(ComputeOperation& operation) {
     if (!resources.dflash) return;
-    const bool forward    = std::holds_alternative<ForwardWork>(operation.request.work.operation);
-    const auto batch      = forward ? 1 : static_cast<int>(operation.shape.rows);
+    const bool forward = std::holds_alternative<ForwardWork>(operation.request.work.operation);
+    const bool sequential_forward = forward && !operation.packed_prefill;
+    const auto batch              = sequential_forward ? 1 : static_cast<int>(operation.shape.rows);
     std::uint32_t minimum = std::numeric_limits<std::uint32_t>::max(), maximum = 0;
-    const auto rows = forward ? std::span(operation.rows).subspan(operation.forward_row, 1)
-                              : std::span(operation.rows);
+    const auto rows = sequential_forward
+                          ? std::span(operation.rows).subspan(operation.forward_row, 1)
+                          : std::span(operation.rows);
     for (const auto& row : rows) {
         const auto count = row.main_frontier - row.backend_frontier;
         minimum          = std::min(minimum, count);
@@ -62,80 +74,163 @@ void RankProgramImpl::append_draft_history(std::uint32_t batch_size,
                                     frame.backend_table_rows.slice(0, 0, batch), envelope);
 }
 
-void RankProgramImpl::run_dflash_draft(std::uint32_t batch_value, std::uint32_t minimum,
-                                       std::uint32_t maximum) {
-    auto& frame      = resources.frame;
-    auto& draft      = *frame.dflash;
-    const int batch  = static_cast<int>(batch_value);
-    const int drafts = static_cast<int>(draft_window), width = drafts + 1;
-    execution::DraftInputs inputs{frame.anchors.slice(0, 0, batch),
-                                  frame.frontiers.slice(0, 0, batch),
-                                  (backend == SpeculativeBackend::DFlash2
-                                       ? frame.proposal_valid_columns
-                                       : frame.valid_columns)
-                                      .slice(0, 0, batch),
-                                  frame.state_destination_offsets.slice(0, 0, batch),
-                                  frame.backend_table_rows.slice(0, 0, batch),
-                                  frame.live_rows.slice(0, 0, batch),
-                                  frame.sampling};
-    execution::DraftOutputs outputs{
-        dense_prefix(draft.proposal_ids, {width, batch}),
-        dense_prefix(draft.proposal_positions, {width, batch}),
-        dense_prefix(draft.drafts, {drafts, batch}),
-        draft.candidate_ids.data
-            ? dense_prefix(draft.candidate_ids, {draft.candidate_ids.ne[0], drafts, batch})
-            : Tensor{},
-        draft.proposal_q.data
-            ? dense_prefix(draft.proposal_q, {draft.proposal_q.ne[0], drafts, batch})
-            : Tensor{}};
-    execution::DraftEnvelopes envelopes{{minimum, maximum}, {minimum, maximum}};
-    execution::draft_propose(draft_view(*this), inputs, outputs, envelopes);
+void RankProgramImpl::bind_dflash_draft(const speculative::RoundRoute& route,
+                                        const execution::DraftReadoutSubmit& submit) {
+    const auto& frame  = resources.frame;
+    const auto batch   = static_cast<int>(route.shape.rows);
+    const auto outputs = frame.dflash->proposal(batch, static_cast<int>(route.head_columns));
+    execution::bind_draft_readouts(draft_view(*this), draft_inputs(frame, batch), outputs, submit);
+}
+
+void RankProgramImpl::run_dflash_draft(const speculative::RoundRoute& route,
+                                       std::span<const ops::ContextBucket> buckets,
+                                       const execution::DraftReadoutSubmit& submit) {
+    const auto& frame   = resources.frame;
+    const auto batch    = static_cast<int>(route.shape.rows);
+    auto outputs        = frame.dflash->proposal(batch, static_cast<int>(route.head_columns));
+    outputs.confidences = frame.draft_confidences.slice(0, 0, batch * route.head_columns)
+                              .view({static_cast<int>(route.head_columns), batch});
+    execution::draft_propose(draft_view(*this), draft_inputs(frame, batch), outputs,
+                             {buckets.front(), buckets.back()}, submit);
+}
+
+Tensor RankProgramImpl::draft_tokens(const speculative::RoundRoute& route) const {
+    const auto& frame = resources.frame;
+    const auto batch  = static_cast<int>(route.shape.rows);
+    if (frame.mtp) return frame.mtp->proposals(batch);
+    return frame.dflash->proposal(batch, static_cast<int>(route.head_columns)).drafts;
+}
+
+void RankProgramImpl::prepare_verification(const speculative::RoundRoute& target,
+                                           const speculative::RoundRoute& proposal) {
+    auto& frame          = resources.frame;
+    const auto batch     = static_cast<int>(target.shape.rows);
+    const auto produced  = proposal.mtp_steps + proposal.head_columns;
+    const auto proposals = draft_tokens(proposal).slice(0, 0, std::min(produced, target.width - 1));
+    auto ids             = frame.decode_view(target.width, batch).ids;
+    ops::prepare_verify_ids(frame.anchors.slice(0, 0, batch), proposals,
+                            frame.extents.slice(0, 0, batch), ids, device.execution_view());
+}
+
+ProposalBuckets RankProgramImpl::proposal_buckets(const speculative::RoundRoute& route) const {
+    const auto& ingress = resources.frame.host_ingress;
+    ProposalBuckets out;
+    if (route.mtp_steps) {
+        out.count = route.mtp_steps;
+        for (std::uint32_t step = 0; step < route.mtp_steps; ++step) {
+            std::uint32_t maximum = 1;
+            for (std::uint32_t row = 0; row < route.shape.rows; ++row) {
+                if (ingress.extents[row] > static_cast<int>(step))
+                    maximum = std::max(maximum,
+                                       static_cast<std::uint32_t>(ingress.frontiers[row]) + step);
+            }
+            out.values[step] = ops::select_context_bucket(std::min(capacity, maximum));
+        }
+    } else if (route.head_columns) {
+        std::uint32_t frontier = 0;
+        for (std::uint32_t row = 0; row < route.shape.rows; ++row)
+            if (ingress.extents[row])
+                frontier = std::max(frontier, static_cast<std::uint32_t>(ingress.frontiers[row]));
+        const auto local_visible = std::min(capacity, frontier + draft_window + 1);
+        out.values[0]            = ops::select_context_bucket(std::max(1U, local_visible));
+        out.count                = 1;
+        if (backend == SpeculativeBackend::DFlash) {
+            out.values[1] = ops::select_context_bucket(std::max(1U, frontier));
+            out.count     = 2;
+        }
+    }
+    return out;
+}
+
+ops::ContextBucket RankProgramImpl::target_bucket() const {
+    const auto& ingress   = resources.frame.host_ingress;
+    std::uint32_t maximum = 1;
+    for (std::size_t row = 0; row < ingress.valid_columns.size(); ++row) {
+        if (ingress.valid_columns[row] <= 0) continue;
+        const auto end =
+            static_cast<std::uint32_t>(ingress.frontiers[row] + ingress.valid_columns[row]);
+        maximum = std::max(maximum, end);
+    }
+    return ops::select_context_bucket(maximum);
+}
+
+void RankProgramImpl::readback_drafts(const speculative::RoundRoute& route) {
+    const auto& frame    = resources.frame;
+    const auto proposals = draft_tokens(route);
+    if (backend == SpeculativeBackend::Mtp) {
+        const auto row_bytes = std::size_t(route.shape.rows) * sizeof(TokenId);
+        CUDA_CHECK(cudaMemcpy2DAsync(frame.host_drafts.data, row_bytes, proposals.data,
+                                     frame.mtp->drafts.nb[1], row_bytes, route.mtp_steps,
+                                     cudaMemcpyDeviceToHost, device.stream()));
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(frame.host_drafts.data, proposals.data, proposals.bytes(),
+                                   cudaMemcpyDeviceToHost, device.stream()));
+    }
 }
 
 void RankProgramImpl::begin_draft(ComputeOperation& operation) {
-    auto& frame           = resources.frame;
-    const int batch       = static_cast<int>(operation.shape.rows);
-    const int drafts      = static_cast<int>(draft_window);
-    const int width       = drafts + 1;
-    std::uint32_t minimum = capacity, maximum = 0;
-    for (const auto& row : operation.rows) {
-        minimum = std::min(minimum, row.main_frontier);
-        maximum = std::max(maximum, row.main_frontier);
-    }
-    if (!graphs) gpu_timer.begin_draft();
+    const auto& route = operation.proposal_route();
+    if (graphs && graphs->topology() != ProposalTopology::SplitProposal) return;
+    const auto buckets = proposal_buckets(route);
+    const bool narrow =
+        resources.moe && std::get<DecodeWork>(operation.request.work.operation).narrowing;
     if (graphs) {
-        (void)graphs->start(GraphPhase::Draft, operation.shape.rows, maximum, 0,
-                            device.execution_view());
-    } else if (backend == SpeculativeBackend::Mtp) {
-        begin_mtp_draft(operation);
+        graphs->launch_proposal(
+            route, {.buckets = buckets.span(), .readback = operation.read_drafts_for_masks});
     } else {
-        run_dflash_draft(operation.shape.rows, minimum, maximum);
-    }
-    if (!graphs) gpu_timer.end_draft();
-    Tensor proposals = backend == SpeculativeBackend::Mtp
-                           ? frame.mtp->proposals(batch)
-                           : dense_prefix(frame.dflash->drafts, {drafts, batch});
-    auto input       = frame.decode_view(width, batch);
-    ops::prepare_verify_ids(frame.anchors.slice(0, 0, batch), proposals,
-                            frame.extents.slice(0, 0, batch), input.ids, device.execution_view());
-    const bool constrained = std::any_of(operation.sampling.begin(), operation.sampling.end(),
-                                         [](const auto& row) { return row.constrained; });
-    if (constrained) {
+        gpu_timer.begin_draft();
         if (backend == SpeculativeBackend::Mtp) {
-            const auto row_bytes = std::size_t(batch) * sizeof(TokenId);
-            CUDA_CHECK(cudaMemcpy2DAsync(frame.host_drafts.data, row_bytes, proposals.data,
-                                         frame.mtp->drafts.nb[1], row_bytes, operation.drafts,
-                                         cudaMemcpyDeviceToHost, device.stream()));
+            gather_mtp_conditioning(route.shape.rows);
+            for (std::uint32_t step = 0; step < route.mtp_steps; ++step)
+                run_mtp_draft_step(route.shape.rows, step, buckets.values[step]);
         } else {
-            CUDA_CHECK(cudaMemcpyAsync(frame.host_drafts.data, proposals.data, proposals.bytes(),
-                                       cudaMemcpyDeviceToHost, device.stream()));
+            run_dflash_draft(route, buckets.span());
         }
-        drafts_ready.record(device.stream());
+        gpu_timer.end_draft();
+        if (operation.read_drafts_for_masks) readback_drafts(route);
     }
+    if (narrow) {
+        const auto& frame = resources.frame;
+        const auto count  = std::size_t(route.shape.rows) * (route.mtp_steps + route.head_columns);
+        CUDA_CHECK(cudaMemcpyAsync(frame.host_egress.draft_confidences.data(),
+                                   frame.draft_confidences.data, count * sizeof(float),
+                                   cudaMemcpyDeviceToHost, device.stream()));
+    }
+    if (narrow || (!graphs && operation.read_drafts_for_masks))
+        drafts_ready.record(device.stream());
+}
+
+void RankProgramImpl::narrow_target(ComputeOperation& operation) {
+    const auto& work     = std::get<DecodeWork>(operation.request.work.operation);
+    const auto& input    = *work.narrowing;
+    const auto& proposal = operation.proposal_route();
+    const auto stride    = proposal.mtp_steps + proposal.head_columns;
+    std::vector<speculative::AdaptiveRowInput> rows;
+    rows.reserve(input.rows.size());
+    for (const auto& row : input.rows) rows.push_back({row.member, row.frontier, &row.state});
+    auto confidences = std::span<const float>(resources.frame.host_egress.draft_confidences);
+    std::vector<float> row_major;
+    if (proposal.mtp_steps) {
+        row_major.resize(rows.size() * stride);
+        for (std::size_t row = 0; row < rows.size(); ++row)
+            for (std::uint32_t step = 0; step < stride; ++step)
+                row_major[row * stride + step] = confidences[step * proposal.shape.rows + row];
+        confidences = row_major;
+    }
+    operation.narrowed = speculative::narrow_after_proposal(
+        backend, draft_window, 1, work.geometry->path, decode_routes.get(), input.cost, *work.plan,
+        rows, confidences, stride, input.max_context);
+    operation.width = operation.decode_route().width;
+    prepare_target_ingress(operation, operation.narrowed->verify_drafts);
+    if (!graphs || resources.dflash || operation.width > 1) upload_ingress();
 }
 
 void RankProgramImpl::begin_target(ComputeOperation& operation) {
     if (!operation.width) return;
+    if (operation.packed_prefill) {
+        begin_packed_target(operation);
+        return;
+    }
     auto& frame        = resources.frame;
     const bool forward = std::holds_alternative<ForwardWork>(operation.request.work.operation) ||
                          std::holds_alternative<ScoreWork>(operation.request.work.operation);
@@ -150,17 +245,28 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
         for (std::uint32_t row = 0; row < operation.batch; ++row)
             active_tokens += frame.host_ingress.valid_columns[row];
     operation.attention.valid_positions += active_tokens;
-    auto input = forward ? frame.input_view(width, batch) : frame.decode_view(width, batch);
+    auto input        = forward ? frame.input_view(width, batch) : frame.decode_view(width, batch);
+    const auto bucket = target_bucket();
     if (!forward && graphs) {
-        const auto phase       = operation.speculative ? GraphPhase::Verify : GraphPhase::Main;
-        std::uint32_t frontier = 0;
-        for (const auto& row : operation.rows) frontier = std::max(frontier, row.main_frontier);
+        const auto& route = operation.decode_route();
+        TargetReplay replay{.bucket        = bucket,
+                            .head          = true,
+                            .active_tokens = static_cast<std::int32_t>(active_tokens)};
+        ProposalBuckets buckets;
+        if (operation.verifies_drafts() && graphs->topology() != ProposalTopology::SplitProposal) {
+            buckets         = proposal_buckets(route);
+            replay.proposal = {.buckets  = buckets.span(),
+                               .readback = operation.read_drafts_for_masks};
+        }
+        if (resources.moe) operation.graph_target = &graphs->target(route);
         operation.graph_started = true;
         operation.projected     = true;
-        operation.row_finished = graphs->start(phase, operation.shape.rows, frontier, active_tokens,
-                                               device.execution_view());
+        operation.row_finished  = graphs->start_target(route, replay) == TargetProgress::Complete;
+        if (operation.row_finished) operation.graph_target = nullptr;
         return;
     }
+    if (!forward && operation.verifies_drafts())
+        prepare_verification(operation.decode_route(), operation.proposal_route());
     execution::TextInputs inputs{input.ids,
                                  input.cache_positions,
                                  input.rope_positions,
@@ -174,15 +280,8 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
     if (forward) {
         const auto& row = operation.rows[operation.forward_row];
         update = execution::SequenceUpdate{row.state_offsets.source, row.state_offsets.destination};
-    } else if (operation.speculative) {
-        update.emplace<execution::ReplayRecords>(*resources.replay_records);
-    }
-    std::uint32_t minimum = capacity, maximum = 0;
-    for (std::uint32_t row = 0; row < (forward ? 1 : operation.batch); ++row) {
-        const auto end = static_cast<std::uint32_t>(frame.host_ingress.frontiers[row] +
-                                                    frame.host_ingress.valid_columns[row]);
-        minimum        = std::min(minimum, end);
-        maximum        = std::max(maximum, end);
+    } else if (operation.verifies_drafts()) {
+        update.emplace<execution::ReplayRecords>(resources.replay(width).records);
     }
     std::optional<execution::DFlashFeatureSink> features;
     if (resources.dflash) {
@@ -204,17 +303,20 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
         execution::TextExecutionView{parameters, resources.work, device.execution_view(),
                                      resources.decoder.text_kv, resources.state_images.linear(),
                                      resources.moe.get()},
-        std::move(inputs), update, ops::CausalAttentionExecutionEnvelope{minimum, maximum},
-        input.hidden, features ? &*features : nullptr);
+        std::move(inputs), update, bucket, input.hidden, features ? &*features : nullptr);
     operation.row_finished = operation.text->start();
 }
 
 bool RankProgramImpl::advance_target(ComputeOperation& operation) {
     if (!operation.width) return true;
-    if (!operation.row_finished)
-        operation.row_finished = operation.graph_started ? graphs->poll() : operation.text->poll();
+    if (!operation.row_finished) {
+        operation.row_finished = operation.graph_target
+                                     ? operation.graph_target->poll() == TargetProgress::Complete
+                                     : operation.text->poll();
+    }
     if (!operation.row_finished) return false;
-    workspace_peak = std::max(workspace_peak, resources.work.peak_used());
+    workspace_peak         = std::max(workspace_peak, resources.work.peak_used());
+    operation.graph_target = nullptr;
     operation.text.reset();
     return true;
 }

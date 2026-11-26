@@ -4,6 +4,7 @@
 
 #include "core/buffer.h"
 #include "state_fixture.cuh"
+#include "ragged_fixture.cuh"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/qsa.h"
 #include "../../../../tools/support/paged_kv_fixture.h"
@@ -50,19 +51,6 @@ __global__ void copy_sparse_plane(const std::uint8_t* src, std::size_t src_recor
     }
 }
 
-inline std::vector<int> sparse_contexts(const Options& o, int tokens) {
-    if (o.prefixes.empty()) return broadcast(o.contexts, o.batch);
-    auto result      = broadcast(o.prefixes, o.batch);
-    const auto valid = o.valid == "dense" ? std::vector<int>(o.batch, tokens)
-                                          : broadcast(measurement::integers(o.valid, 0), o.batch);
-    for (int b = 0; b < o.batch; ++b) {
-        if (valid[b] > 262144 || result[b] > 262144 - valid[b])
-            throw std::invalid_argument("prefix/valid exceeds maximum context");
-        result[b] += valid[b];
-    }
-    return result;
-}
-
 struct SparseGqaFixture {
     DeviceBuffer query_data;
     DeviceBuffer gate_data;
@@ -78,30 +66,89 @@ struct SparseGqaFixture {
     Tensor query, gate, out;
     PagedKVBatchLayerView cache;
     ops::QsaBatchView batch;
+    const RaggedBatchFixture* ragged_batch;
     ops::QsaBlockSelection selected;
-    ops::QsaSparseGqaExecutionEnvelope envelope;
+    ops::ContextBucket bucket;
     DeviceBuffer workspace_storage;
     std::optional<MemoryArena> workspace;
     std::size_t workspace_bytes, selected_tokens = 0, unique_tokens = 0, token_bytes = 0;
     std::size_t active_queries = 0, selected_ids = 0, table_entries = 0, active_rows = 0;
 
-    SparseGqaFixture(const Options& o, int tokens, CudaExecutionView execution)
-        : contexts(sparse_contexts(o, tokens)),
-          lengths(o.valid == "dense" ? std::vector<int>(o.batch, tokens)
-                                     : broadcast(measurement::integers(o.valid, 0), o.batch)) {
-        envelope.max_visible_tokens = o.context_capacity_explicit
-                                          ? o.context_capacity
-                                          : *std::max_element(contexts.begin(), contexts.end());
-        const int B                 = o.batch,
-                  logical =
-                      std::max(1, (*std::max_element(contexts.begin(), contexts.end()) + 63) / 64);
-        int pages = 2;
-        for (int b = 0; b < B; ++b) {
-            if (contexts[b] > int(envelope.max_visible_tokens) || lengths[b] > tokens ||
-                lengths[b] > contexts[b])
-                throw std::invalid_argument("invalid sparse context/valid length");
-            pages += (contexts[b] + 63) / 64;
+    SparseGqaFixture(const Options& o, int tokens, CudaExecutionView execution,
+                     const RaggedBatchFixture* packed_batch)
+        : ragged_batch(packed_batch) {
+        const int B       = packed_batch ? 1 : o.batch;
+        int shared_prefix = 0, max_visible = 0;
+        std::optional<RaggedPageMap> mapping;
+        if (packed_batch) {
+            contexts        = packed_batch->ends;
+            lengths         = packed_batch->spec.lengths;
+            max_visible     = *std::max_element(contexts.begin(), contexts.end());
+            const int S     = static_cast<int>(lengths.size());
+            bucket          = ragged_bucket(o, max_visible);
+            workspace_bytes = ops::qsa_sparse_gqa_ragged_workspace_capacity_bytes(
+                o.storage, o.query_heads, o.kv_heads, bucket, tokens, tokens, S, S,
+                execution.multiprocessor_count());
+            shared_prefix = o.shared_prefix_tokens;
+            mapping.emplace(*packed_batch, shared_prefix, false, 731);
+        } else {
+            if (o.explicit_valid)
+                lengths = o.valid == "dense" ? std::vector<int>(B, tokens)
+                                             : broadcast(measurement::integers(o.valid, 0), B);
+            else
+                lengths = workload::generate_batch_workload(
+                              tokens, tokens, B, workload::LengthDist::Uniform, o.valid_dist)
+                              .valid_columns;
+            contexts = broadcast(o.prefixes.empty() ? o.contexts : o.prefixes, B);
+            if (o.length_dist != workload::LengthDist::Uniform) {
+                if (o.contexts.size() != 1 || !o.prefixes.empty())
+                    throw std::invalid_argument("length-dist requires a single context length");
+                const int target = o.contexts.front();
+                if (target > 0) {
+                    auto shape    = workload::generate_batch_workload(target, 1, B, o.length_dist,
+                                                                      workload::ValidDist::Full);
+                    shared_prefix = shape.shared_prefix_tokens;
+                    contexts      = std::move(shape.row_contexts);
+                    for (int b = 0; b < B; ++b)
+                        contexts[b] = std::clamp(lengths[b], contexts[b], target);
+                }
+            }
+            const auto max_context = ops::context_bucket_tokens(ops::ContextBucket::K256);
+
+            for (int b = 0; b < B; ++b) {
+                if (!lengths[b]) {
+                    contexts[b] = 0;
+                    continue;
+                }
+                const auto end = std::int64_t(contexts[b]) + (o.prefixes.empty() ? 0 : lengths[b]);
+                if (end > max_context || lengths[b] > tokens || lengths[b] > end)
+                    throw std::invalid_argument("invalid sparse context/valid length");
+                contexts[b] = int(end);
+                max_visible = std::max(max_visible, contexts[b]);
+            }
+            const int capacity = o.context_capacity_explicit ? o.context_capacity : max_visible;
+            bucket             = o.bucket ? *o.bucket : ops::select_context_bucket(capacity);
+            workspace_bytes    = ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                o.storage, o.query_heads, o.kv_heads, bucket, B, tokens, tokens,
+                execution.multiprocessor_count());
+            if (std::uint32_t(max_visible) > ops::context_bucket_tokens(bucket))
+                throw std::invalid_argument("live sparse GQA context exceeds the bucket");
         }
+        const int logical       = mapping ? mapping->columns : std::max(1, (max_visible + 63) / 64);
+        const int table_height  = packed_batch ? packed_batch->table_rows() : B;
+        const int shared_pages  = mapping       ? mapping->shared_pages
+                                  : max_visible ? shared_prefix / 64
+                                                : 0;
+        std::int64_t page_count = shared_pages + 2;
+        if (mapping) {
+            page_count = mapping->pages;
+        } else {
+            for (int b = 0; b < B; ++b)
+                if (lengths[b]) page_count += (contexts[b] + 63) / 64 - shared_pages;
+        }
+        if (page_count > std::numeric_limits<int>::max() / 64 / std::max(1, o.kv_heads))
+            throw std::invalid_argument("too many sparse GQA cache pages");
+        const int pages = static_cast<int>(page_count);
         query_data  = make_bf16(std::size_t(256 * o.query_heads) * tokens * B, 101, -1.5f, 1.5f);
         gate_data   = make_bf16(std::size_t(256 * o.query_heads) * tokens * B, 103, -4.f, 4.f);
         output_data = make_zeros(query_data.size());
@@ -170,16 +217,26 @@ struct SparseGqaFixture {
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaStreamSynchronize(execution.stream()));
         }
-        std::vector<int> pos(tokens * B, -1), selectors(B, -1), table(logical * B, -1),
-            physical(pages), block_ids(std::size_t(512) * tokens * B, -1), block_counts(tokens * B);
+        std::vector<int> pos(packed_batch ? 0 : std::size_t(tokens) * B, -1), selectors(B, -1),
+            table, physical(pages), block_ids(std::size_t(512) * tokens * B, -1),
+            block_counts(std::size_t(tokens) * B);
         std::iota(physical.begin(), physical.end(), 0);
         std::mt19937 random(731);
         std::shuffle(physical.begin(), physical.end(), random);
-        int next = 0;
-        for (int b = 0; b < B; ++b) {
-            selectors[b] = lengths[b] ? B - 1 - b : -1;
-            for (int p = 0; p < (contexts[b] + 63) / 64; ++p)
-                table[(B - 1 - b) * logical + p] = physical[next++];
+        if (mapping)
+            table = std::move(mapping->table);
+        else
+            table.resize(std::size_t(logical) * B, -1);
+        int next = shared_pages;
+        std::vector<bool> shared_seen(std::size_t(shared_pages) * 64);
+        for (int b = 0; b < static_cast<int>(lengths.size()); ++b) {
+            if (!packed_batch) {
+                selectors[b] = lengths[b] ? B - 1 - b : -1;
+                for (int p = 0; p < (contexts[b] + 63) / 64; ++p)
+                    table[(B - 1 - b) * std::size_t(logical) + p] =
+                        physical[p < shared_pages ? p : next++];
+            }
+            const int start = packed_batch ? packed_batch->segment_begin(b) : b * tokens;
             std::vector<int> order(contexts[b] / 4);
             std::iota(order.begin(), order.end(), 0);
             std::shuffle(order.begin(), order.end(), random);
@@ -187,9 +244,9 @@ struct SparseGqaFixture {
             std::iota(random_order.begin(), random_order.end(), 0);
             std::vector<bool> seen(contexts[b]);
             for (int t = 0; t < lengths[b]; ++t) {
-                const int m = b * tokens + t, p = contexts[b] - lengths[b] + t, C = (p + 1) / 4,
-                          c     = std::min(o.selected_blocks, C);
-                pos[m]          = p;
+                const int m = start + t, p = contexts[b] - lengths[b] + t, C = (p + 1) / 4,
+                          c = std::min(o.selected_blocks, C);
+                if (!packed_batch) pos[m] = p;
                 block_counts[m] = c;
                 std::vector<int> chosen;
                 if (o.selection == "shared") {
@@ -219,7 +276,12 @@ struct SparseGqaFixture {
                 // A full selection is known from its count without inspecting ids.
                 if (c < C) selected_ids += c;
             }
-            unique_tokens += std::count(seen.begin(), seen.end(), true);
+            const bool shares_prefix =
+                !packed_batch || packed_batch->spec.histories[b] >= shared_prefix;
+            const auto shared = shares_prefix ? std::min(shared_seen.size(), seen.size()) : 0;
+            for (std::size_t j = 0; j < shared; ++j)
+                if (seen[j]) shared_seen[j] = true;
+            unique_tokens += std::count(seen.begin() + shared, seen.end(), true);
             bool active = false;
             for (std::size_t first = 0; first < seen.size(); first += 64) {
                 const bool used = std::any_of(seen.begin() + first,
@@ -230,10 +292,16 @@ struct SparseGqaFixture {
             }
             active_rows += active;
         }
+        unique_tokens += std::count(shared_seen.begin(), shared_seen.end(), true);
         CUDA_CHECK(cudaStreamSynchronize(execution.stream()));
-        positions                = measurement::make_i32(pos);
-        valid                    = measurement::make_i32(lengths);
-        table_rows               = measurement::make_i32(selectors);
+        if (!packed_batch) {
+            positions  = measurement::make_i32(pos);
+            valid      = measurement::make_i32(lengths);
+            table_rows = measurement::make_i32(selectors);
+            batch      = {Tensor(positions.span(), DType::I32, {tokens, B}),
+                          Tensor(valid.span(), DType::I32, {B}),
+                          Tensor(table_rows.span(), DType::I32, {B})};
+        }
         const auto table_offsets = packed->table_offsets(table);
         tables                   = DeviceBuffer(execution.device(), table_offsets.size() * 8);
         tables.copy_from_host(table_offsets.data(), tables.size());
@@ -242,30 +310,30 @@ struct SparseGqaFixture {
         query  = Tensor(query_data.span(), DType::BF16, {256, o.query_heads, tokens, B});
         gate   = Tensor(gate_data.span(), DType::BF16, {256, o.query_heads, tokens, B});
         out    = Tensor(output_data.span(), DType::BF16, {256, o.query_heads, tokens, B});
-        Tensor page_offsets(tables.span(), DType::I64, {logical, B});
-        cache           = {packed->plane(0, page_offsets),
-                           packed->plane(1, page_offsets),
+        Tensor page_offsets(tables.span(), DType::I64, {logical, table_height});
+        cache             = {packed->plane(0, page_offsets),
+                             packed->plane(1, page_offsets),
                  layout.key.has_scale() ? packed->plane(2, page_offsets) : PagedPlaneView{},
                  layout.value.has_scale() ? packed->plane(3, page_offsets) : PagedPlaneView{},
                  256,
-                           o.kv_heads,
-                           o.storage};
-        batch           = {Tensor(positions.span(), DType::I32, {tokens, B}),
-                           Tensor(valid.span(), DType::I32, {B}), Tensor(table_rows.span(), DType::I32, {B})};
-        selected        = {Tensor(ids.span(), DType::I32, {512, tokens, B}),
-                           Tensor(counts.span(), DType::I32, {tokens, B})};
-        workspace_bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
-            cache.storage, o.query_heads, o.kv_heads, tokens, tokens, B, envelope,
-            execution.multiprocessor_count());
-        workspace_storage =
-            DeviceBuffer(execution.device(), std::max<std::size_t>(256, workspace_bytes));
+                             o.kv_heads,
+                             o.storage};
+        selected          = {Tensor(ids.span(), DType::I32, {512, tokens, B}),
+                             Tensor(counts.span(), DType::I32, {tokens, B})};
+        workspace_storage = DeviceBuffer(
+            execution.device(),
+            packed_batch ? workspace_bytes : std::max<std::size_t>(256, workspace_bytes));
         workspace.emplace(workspace_storage.span());
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 
     void launch(CudaExecutionView execution) {
-        ops::qsa_sparse_gqa(query, gate, cache, batch, selected, envelope, *workspace, out,
-                            execution);
+        if (ragged_batch)
+            ops::qsa_sparse_gqa(query, gate, cache, ragged_batch->view, selected, bucket,
+                                *workspace, out, execution);
+        else
+            ops::qsa_sparse_gqa(query, gate, cache, batch, selected, bucket, *workspace, out,
+                                execution);
     }
 };
 } // namespace ninfer::bench::qsa

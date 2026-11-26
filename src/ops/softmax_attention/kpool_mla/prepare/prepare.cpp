@@ -23,7 +23,8 @@ RawField bind_raw(const Tensor& t) {
 void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMlaBatchView& batch,
              ConstKpoolTailStateView before, KpoolMlaCacheView cache,
              KpoolRawRecordWriteView records, KpoolTailStateView after, KpoolMlaPrepareOutputs out,
-             bool update, MemoryArena& arena, CudaExecutionView execution) {
+             bool update, MemoryArena& arena, CudaExecutionView execution,
+             const RaggedSequenceView* seq = nullptr) {
     const int T = x.ne[1], B = x.ne[2];
     const auto device   = execution.device();
     const auto profile  = kpool_mla_prepare_profile(p);
@@ -32,7 +33,7 @@ void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMla
     require(p.rms_epsilon > 0 && std::isfinite(p.rms_epsilon) && p.index_epsilon > 0 &&
                 std::isfinite(p.index_epsilon),
             "norm epsilons");
-    std::array<operand::Range, 24> inputs{};
+    std::array<operand::Range, 26> inputs{};
     int input_count  = 0;
     const auto input = [&](const Tensor& t, DType type, std::initializer_list<int> dims,
                            std::size_t alignment, const char* name) {
@@ -49,10 +50,15 @@ void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMla
     else
         require(!p.query_norm.data && !out.q_r.data, "History has no query operands");
     input(batch.positions, DType::I32, {T, B}, 4, "positions");
-    input(batch.valid_columns, DType::I32, {B}, 4, "valid columns");
-    input(batch.table_rows, DType::I32, {B}, 4, "table rows");
+    const int segments = seq ? seq->num_seqs() : B;
+    input(batch.valid_columns, DType::I32, {segments}, 4, "valid columns");
+    input(batch.table_rows, DType::I32, {segments}, 4, "table rows");
+    if (seq) {
+        inputs[input_count++] = operand::range(seq->cu_seqlens, kOperation);
+        inputs[input_count++] = operand::range(seq->token_to_seq, kOperation);
+    }
     for (const auto* f : {&before.raw_keys, &before.raw_gates}) {
-        tail_field(*f, 128, B, 1, device);
+        tail_field(*f, 128, segments, 1, device);
         inputs[input_count++] = operand::range(f->records.byte_offsets, kOperation);
     }
     latent_cache(cache.latent, 512, device);
@@ -97,8 +103,8 @@ void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMla
     else
         require(!out.head_coeff.data, "absent head coefficients");
     if (update) {
-        tail_field(after.raw_keys, 128, B, 1, device);
-        tail_field(after.raw_gates, 128, B, 1, device);
+        tail_field(after.raw_keys, 128, segments, 1, device);
+        tail_field(after.raw_gates, 128, segments, 1, device);
         inputs[input_count++] = operand::range(after.raw_keys.records.byte_offsets, kOperation);
         inputs[input_count++] = operand::range(after.raw_gates.records.byte_offsets, kOperation);
     } else {
@@ -112,7 +118,9 @@ void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMla
     for (int i = 0; i < output_count; ++i)
         for (int j = 0; j < input_count; ++j) operand::disjoint(outputs[i], inputs[j], kOperation);
     operand::device(arena.device(), device, kOperation, "workspace");
-    const auto layout        = prepare_workspace(geometry, update, T, B);
+    const bool packed        = seq && segments > 1;
+    const auto layout        = packed ? packed_prepare_workspace(geometry, T, T > segments)
+                                      : prepare_workspace(geometry, update, T, B);
     auto scope               = arena.scope();
     const auto scratch       = arena.alloc_bytes(layout.bytes, 256);
     const auto scratch_range = operand::range(scratch.data, scratch.bytes, kOperation);
@@ -178,7 +186,17 @@ void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMla
     a.rms_epsilon = p.rms_epsilon;
     a.key_epsilon = p.index_epsilon;
     a.update      = update;
-    launch_prepare(a, geometry, layout.columns, execution.stream());
+    if (packed)
+        launch_packed_prepare({a,
+                               static_cast<const int*>(seq->cu_seqlens.data),
+                               static_cast<const int*>(seq->token_to_seq.data),
+                               0,
+                               0,
+                               0,
+                               {}},
+                              geometry, *seq, layout.columns, execution.stream());
+    else
+        launch_prepare(a, geometry, layout.columns, execution.stream());
 }
 } // namespace
 
@@ -213,4 +231,51 @@ std::size_t kpool_mla_prepare_update_workspace_capacity_bytes(const KpoolMlaPrep
     const auto g = detail::kpool::prepare_geometry(p, storage, index_format, batch, lo, hi, sms);
     return detail::kpool::prepare_capacity(g, true, lo, hi, batch);
 }
+
+std::size_t kpool_mla_prepare_update_ragged_workspace_capacity_bytes(
+    const KpoolMlaPrepareProfile& profile, KpoolMlaStorage storage, KvCacheVectorFormat format,
+    int min_tokens, int max_tokens, int min_segments, int max_segments, int sm_count) {
+    using namespace detail::kpool;
+    const int packed = packed_extent_start(min_tokens, max_tokens, min_segments, max_segments,
+                                           "kpool_mla_prepare_update");
+    const auto geometry =
+        prepare_geometry(profile, storage, format, 1, min_tokens, max_tokens, sm_count);
+    std::size_t peak =
+        min_segments == 1 ? prepare_capacity(geometry, true, min_tokens, max_tokens, 1) : 0;
+    if (!packed) return peak;
+    const int window = prepare_window_columns();
+    for (int n = packed; n <= std::min(max_tokens, window); ++n)
+        peak = std::max(peak, packed_prepare_workspace(geometry, n, false).bytes);
+    // Above one window the layout is fixed. The largest feasible total
+    // witnesses the maximum, including carry if any segment can be non-singleton.
+    if (max_tokens > window)
+        peak = std::max(
+            peak, packed_prepare_workspace(geometry, max_tokens, max_tokens > min_segments).bytes);
+    return peak;
+}
+
+void kpool_mla_prepare_update(const Tensor& x, const KpoolMlaPrepareParameters& parameters,
+                              const KpoolMlaRaggedBatchView& batch, ConstKpoolTailStateView before,
+                              KpoolMlaCacheView cache, KpoolTailStateView after,
+                              KpoolMlaPrepareOutputs outputs, MemoryArena& workspace,
+                              CudaExecutionView execution) {
+    using namespace detail::kpool;
+    constexpr const char* op = "kpool_mla_prepare_update";
+    const auto& seq          = batch.ragged;
+    const auto device        = execution.device();
+    operand::ragged_batch(seq, batch.positions, batch.table_rows, op, device);
+    const int n = seq.total_tokens();
+    operand::tensor(x, DType::BF16, {4096, n}, 16, op, "input", device);
+    if (outputs.q_r.data)
+        operand::tensor(outputs.q_r, DType::BF16, {1536, n}, 16, op, "query output", device);
+    if (outputs.head_coeff.data)
+        operand::tensor(outputs.head_coeff, DType::FP32, {32, n}, 16, op, "head coefficients",
+                        device);
+    const KpoolMlaBatchView flat{batch.positions.view({n, 1}), seq.seq_lengths, batch.table_rows};
+    if (outputs.q_r.data) outputs.q_r = outputs.q_r.view({1536, n, 1});
+    if (outputs.head_coeff.data) outputs.head_coeff = outputs.head_coeff.view({32, n, 1});
+    execute(x.view({4096, n, 1}), parameters, flat, before, cache, {}, after, outputs, true,
+            workspace, execution, &seq);
+}
+
 } // namespace ninfer::ops

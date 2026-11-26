@@ -71,7 +71,10 @@ public:
             const auto ticket = session.start_prefill(sequence);
             if (!ticket) throw std::runtime_error("benchmark seed execution slot is occupied");
             auto progress = await<model::PrefillProgress>(*ticket);
-            if (!progress.complete) continue;
+            if (progress.rows.size() != 1) {
+                throw std::runtime_error("benchmark seed prefill returned invalid row count");
+            }
+            if (!progress.rows[0].complete) continue;
             if (!progress.pending || progress.pending->tokens().size() != 1) {
                 throw std::runtime_error(
                     "benchmark seed prefill did not license exactly one token");
@@ -94,7 +97,7 @@ public:
         std::vector<runtime::CommitDecision> decisions(batch);
         for (std::size_t row = 0; row < batch; ++row) {
             budgets[row] = {draft_tokens + 1};
-            units[row]   = {sequences[row], model::ExecutionUnitKind::Decode, draft_tokens + 1};
+            units[row]   = {sequences[row], model::ExecutionUnitKind::Decode, 1};
         }
         // Capacity policy is outside the complete execution interval.
         if (!session.reserve_units({units.data(), batch})) {

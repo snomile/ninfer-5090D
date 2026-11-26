@@ -1,10 +1,79 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/draft.h"
 #include "models/qwen3_5/execution/text.h"
+#include "ninfer/ops/indexing.h"
 
 #include <algorithm>
 
 namespace ninfer::models::qwen3_5::detail {
+
+void RankProgramImpl::begin_packed_target(ComputeOperation& operation) {
+    const auto& ragged = operation.packed_prefill->ragged;
+    const int segments = ragged.num_seqs(), tokens = ragged.total_tokens();
+    auto& frame      = resources.frame;
+    const auto input = frame.input_view(tokens, 1);
+    const auto& meta = frame.packed_prefill->device;
+    ++operation.attention.forwards;
+    operation.attention.rows += segments;
+    operation.attention.scheduled_positions += tokens;
+    operation.attention.valid_positions += tokens;
+
+    std::optional<execution::DFlashFeatureSink> features;
+    if (resources.dflash) {
+        const auto& draft = *resources.dflash;
+        features.emplace(draft.prefill_features.slice(1, 0, tokens),
+                         draft.prefill_positions.slice(0, 0, tokens), Tensor{},
+                         parameters.profile->config.draft->target_layer_ids);
+    }
+    const execution::TextInputs inputs{
+        .ids                       = input.ids,
+        .cache_positions           = input.cache_positions,
+        .rope_positions            = input.rope_positions,
+        .valid_columns             = {},
+        .kv_table_rows             = meta.main_tables.slice(0, 0, segments),
+        .state_source_offsets      = meta.source_offsets.slice(0, 0, segments),
+        .state_destination_offsets = meta.destination_offsets.slice(0, 0, segments),
+        .input_embeddings          = {},
+        .active_tokens             = operation.width,
+    };
+    resources.work.reset();
+    prefill_timer.start();
+    operation.text = std::make_unique<execution::TextRun>(
+        execution::TextExecutionView{parameters, resources.work, device.execution_view(),
+                                     resources.decoder.text_kv, resources.state_images.linear(),
+                                     resources.moe.get()},
+        inputs, execution::PackedPrefillUpdate{ragged}, target_bucket(), input.hidden,
+        features ? &*features : nullptr);
+    operation.row_finished = operation.text->start();
+}
+
+void RankProgramImpl::finish_packed_prefill(ComputeOperation& operation) {
+    const auto& ragged  = operation.packed_prefill->ragged;
+    const auto& frame   = resources.frame;
+    const auto& storage = *frame.packed_prefill;
+    const auto hidden   = frame.input_view(ragged.total_tokens(), 1).hidden;
+    if (backend == SpeculativeBackend::Mtp) align_packed_mtp_history(operation);
+    if (resources.dflash) {
+        auto& draft        = *resources.dflash;
+        const int tokens   = ragged.total_tokens();
+        const int segments = ragged.num_seqs();
+        const auto& local  = operation.packed_prefill->dflash_local_ragged;
+        const auto indices =
+            storage.device.dflash->source_indices.slice(0, 0, local.total_tokens());
+        execution::draft_append_context(
+            {parameters, resources.work, device.execution_view(), draft.local,
+             draft.full ? &*draft.full : nullptr, proposal_head},
+            draft.prefill_features.slice(1, 0, tokens),
+            draft.prefill_positions.slice(0, 0, tokens), ragged, local, indices,
+            storage.device.destination_offsets.slice(0, 0, segments),
+            storage.device.backend_tables.slice(0, 0, segments));
+    }
+    ops::scatter_ragged_last_columns(
+        hidden, ragged,
+        resources.state_images.continuation_hidden(
+            storage.device.destination_offsets.slice(0, 0, ragged.num_seqs())),
+        device.execution_view());
+}
 
 void RankProgramImpl::progress() {
     if (context_operation && !context_operation->bindings_submitted) {
@@ -34,7 +103,10 @@ void RankProgramImpl::progress() {
             operation.text->cancel();
             operation.text.reset();
         }
-        if (graphs) graphs->cancel();
+        if (operation.graph_target) {
+            operation.graph_target->cancel();
+            operation.graph_target = nullptr;
+        }
         if (resources.moe) resources.moe->cancel();
         gpu_timer.record_retirement();
         compute_retired.record(device.stream());
@@ -50,14 +122,27 @@ void RankProgramImpl::progress() {
                 operation.stage = ComputeStage::Readback;
                 break;
             }
-            if (std::holds_alternative<DecodeWork>(operation.request.work.operation)) {
-                if (!operation.speculative || !graphs) append_draft_history(operation);
-                if (operation.speculative) begin_draft(operation);
+            if (const auto* decode = std::get_if<DecodeWork>(&operation.request.work.operation)) {
+                if (!operation.verifies_drafts() || !graphs) append_draft_history(operation);
+                if (operation.verifies_drafts()) {
+                    begin_draft(operation);
+                    if (resources.moe && decode->narrowing) {
+                        operation.stage = ComputeStage::Proposal;
+                        break;
+                    }
+                }
             }
             if (std::holds_alternative<ForwardWork>(operation.request.work.operation))
                 append_draft_history(operation);
-            request_decision(operation);
             begin_target(operation);
+            request_decision(operation);
+            operation.stage = ComputeStage::Forward;
+            break;
+        case ComputeStage::Proposal:
+            if (!drafts_ready.ready()) return;
+            narrow_target(operation);
+            begin_target(operation);
+            request_decision(operation);
             operation.stage = ComputeStage::Forward;
             break;
         case ComputeStage::Forward:
@@ -66,8 +151,6 @@ void RankProgramImpl::progress() {
                 return;
             }
             if (std::holds_alternative<DecodeWork>(operation.request.work.operation)) {
-                if (backend == SpeculativeBackend::Mtp && !operation.speculative)
-                    align_mtp_history(operation);
                 if (!operation.projected) {
                     resources.work.reset();
                     project_decode(operation.shape.rows, operation.width);
@@ -77,7 +160,9 @@ void RankProgramImpl::progress() {
                 operation.stage = ComputeStage::AwaitDecision;
                 break;
             }
-            if (operation.width) {
+            if (operation.width && operation.packed_prefill) {
+                finish_packed_prefill(operation);
+            } else if (operation.width) {
                 if (backend == SpeculativeBackend::Mtp) align_mtp_history(operation);
                 if (resources.dflash) {
                     const int width = static_cast<int>(operation.width);
@@ -112,6 +197,12 @@ void RankProgramImpl::progress() {
                 operation.gpu.add_prefill(
                     static_cast<std::uint64_t>(prefill_timer.elapsed_ms() * 1.0e6));
             if (const auto* forward = std::get_if<ForwardWork>(&operation.request.work.operation)) {
+                if (operation.packed_prefill) {
+                    operation.stage = operation.packed_prefill->sampled_count
+                                          ? ComputeStage::AwaitDecision
+                                          : ComputeStage::Readback;
+                    break;
+                }
                 auto& result       = std::get<ForwardResult>(operation.result->output);
                 const auto& window = forward->inputs[operation.forward_row];
                 operation.forward_offset += operation.width;

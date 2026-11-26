@@ -50,23 +50,26 @@ __device__ __forceinline__ ScoreWork score_work(const IndexerArguments& a) {
                 span.live,
                 span.position};
     }
-    int groups = 0, work = 0;
+    int groups        = 0;
+    std::int64_t work = 0;
     for (int b = 0; b < a.batch; ++b) {
         const auto span = query_span(a, b);
         const int n     = span.groups<Queries>();
         groups += n;
-        work += n * span.visible;
+        work += std::int64_t(n) * span.visible;
     }
     if (!groups) return {};
-    int remaining = blockIdx.x;
+    const int available = max(0, int(gridDim.x) - groups);
+    int remaining       = blockIdx.x;
     for (int b = 0; b < a.batch; ++b) {
         const auto span = query_span(a, b);
         const int n     = span.groups<Queries>();
         if (!n) continue;
         // Reserve one worker per scored group, then distribute the remainder by
         // history length. Rounding down keeps the total within the captured grid.
-        const int workers = 1 + (int(gridDim.x) - groups) * span.visible / work;
-        const int jobs    = workers * n;
+        const int workers =
+            1 + (n == groups ? available / n : int(available * std::int64_t(span.visible) / work));
+        const int jobs = workers * n;
         if (remaining < jobs)
             return {b,
                     span.first + remaining % n * Queries,
@@ -75,6 +78,47 @@ __device__ __forceinline__ ScoreWork score_work(const IndexerArguments& a) {
                     span.live,
                     span.position};
         remaining -= jobs;
+    }
+    return {};
+}
+
+// A packed window has a launch-time tile map, but eligibility remains a
+// device decision. Count scored tiles before distributing the resident workers
+// so a deep segment still gets the full wave alongside all-select segments.
+template <int Queries, int Keys>
+__device__ __forceinline__ ScoreWork score_work(const PackedIndexerArguments& a) {
+    const int lane    = threadIdx.x % 32;
+    const int chunks  = (a.tile_count + 31) / 32;
+    const auto scored = [&](int chunk) {
+        const int i = chunk * 32 + lane;
+        bool active = false;
+        if (i < a.tile_count) {
+            const unsigned tile = a.tiles[i];
+            const int last      = (tile & 255) + (tile >> 8) - 1;
+            active              = a.end(last) / 4 > kIndexSelected;
+        }
+        return __ballot_sync(0xffffffffu, active);
+    };
+    int groups = 0;
+    for (int chunk = 0; chunk < chunks; ++chunk) groups += __popc(scored(chunk));
+    if (!groups) return {};
+    int rank          = int(blockIdx.x) % groups;
+    const int worker  = int(blockIdx.x) / groups;
+    const int workers = (int(gridDim.x) - 1 - rank) / groups + 1;
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        const unsigned mask = scored(chunk);
+        const int count     = __popc(mask);
+        if (rank >= count) {
+            rank -= count;
+            continue;
+        }
+        const int i         = __fns(mask, 0, rank + 1);
+        const unsigned tile = a.tiles[chunk * 32 + i];
+        const int first     = tile & 255;
+        const int column    = a.begin + first;
+        return {a.token_to_seq[column], first,
+                worker * Keys,          workers * Keys,
+                first + int(tile >> 8), a.positions[column] - first};
     }
     return {};
 }

@@ -123,10 +123,11 @@ SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
 
 SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile> profile,
                                       DeviceContext& device, const EngineOptions& options,
-                                      std::shared_ptr<const moe::Plan> moe) {
-    auto impl =
-        detail::make_sequence_planner_impl(std::move(profile), device, options, std::move(moe));
-    auto spec                    = context_spec(*impl->minimum);
+                                      std::shared_ptr<const moe::Plan> moe,
+                                      std::span<const std::uint32_t> target_widths) {
+    auto impl = detail::make_sequence_planner_impl(std::move(profile), device, options,
+                                                   std::move(moe), target_widths);
+    auto spec = context_spec(*impl->minimum);
     impl->capacity_plan.metadata = context::ContextDirectory::metadata_plan(spec);
     auto& metadata               = impl->capacity_plan.metadata;
     const auto checkpoints =
@@ -178,15 +179,24 @@ SessionPlan plan_session(const SequencePlan& sequence) {
     if (!sequence.impl_) throw std::invalid_argument("sequence plan is empty");
     const auto& source = *sequence.impl_;
     SessionPlan out;
-    out.batch_execution     = source.batch_execution;
+    out.batch_execution          = source.batch_execution;
+    out.decode_routes            = source.decode_routes;
+    out.split_proposal_narrowing = bool(source.moe);
+    out.decode_path         = source.batch_execution->graph_rows().empty() ? ExecutionPath::Eager
+                              : source.moe                                 ? ExecutionPath::Mixed
+                                                                           : ExecutionPath::Graph;
     out.profile             = source.profile;
     out.capacity            = source.capacity;
     out.max_concurrency     = source.max_concurrency;
     out.prefill_chunk       = source.prefill_chunk;
     out.draft_window        = source.draft_window;
     out.speculative_backend = source.speculative_backend;
+    out.length_policy            = source.length_policy;
+    if (source.moe && !source.moe->description().layers.empty())
+        out.hybrid_max_tokens = source.moe->description().layers.front().hybrid_max_tokens;
     out.context_cache       = source.context_cache;
     out.kv_storage          = source.kv_storage;
+    out.linear_state_dtype  = source.linear_state_dtype;
     out.proposal_head       = source.proposal_head;
     out.causal_scoring      = source.causal_scoring;
     out.vision_max_features = source.workspace.vision ? source.workspace.vision->max_features : 0;

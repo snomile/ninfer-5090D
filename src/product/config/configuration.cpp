@@ -127,6 +127,9 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
         case Field::KvDtype:
             value = std::string(kv_name(e.kv_cache));
             break;
+        case Field::LinearStateDtype:
+            value = std::string(linear_state_dtype_name(e.linear_state_dtype));
+            break;
         case Field::ContextCapacity:
             if (e.context_capacity.mode == ContextCapacityMode::Automatic)
                 value = std::string("auto");
@@ -180,6 +183,9 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
             if (e.speculative.backend == SpeculativeBackend::None) continue;
             value = std::string(e.speculative.proposal_head == ProposalHead::Full ? "full"
                                                                                   : "optimized");
+            break;
+        case Field::SpecLengthPolicy:
+            value = std::string(speculative_length_policy_name(e.speculative.length_policy));
             break;
         case Field::MediaCache:
             value = std::uint64_t{e.media_cache_bytes};

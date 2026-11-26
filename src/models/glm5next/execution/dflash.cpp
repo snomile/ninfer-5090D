@@ -49,17 +49,17 @@ std::size_t linear(const ops::LinearProfile& p, int lo, int hi) {
 }
 } // namespace
 
-ops::SlidingWindowAttentionGraphProfile DraftReadout::profile(std::uint32_t bound) const {
-    return ops::sliding_window_attention_graph_profile(geometry, context.capacity, {0, bound},
-                                                       query.ne[2], query.ne[3]);
+ops::OpGraphProfile DraftReadout::profile(ops::ContextBucket bucket) const {
+    return ops::sliding_window_attention_graph_profile(geometry, context.capacity, bucket,
+                                                       query.ne[3], query.ne[2]);
 }
 
-void DraftReadout::execute(std::uint32_t bound, CudaExecutionView cuda) const {
+void DraftReadout::execute(ops::ContextBucket bucket, CudaExecutionView cuda) const {
     MemoryArena arena(scratch);
     auto out = output;
     ops::sliding_window_attention(query, key, value, positions, valid_columns, geometry,
                                   context.capacity, float(1.0 / std::sqrt(geometry.head_dim)),
-                                  context, {0, bound}, arena, out, cuda);
+                                  context, bucket, arena, out, cuda);
 }
 
 DraftAttentionRun::DraftAttentionRun(const Parameters& p, DraftExecution e, const DraftInputs& in,
@@ -83,9 +83,11 @@ DraftReadout DraftAttentionRun::readout() {
                      {}};
     auto scope       = execution_.workspace.scope();
     const auto bytes = ops::sliding_window_attention_workspace_capacity_bytes(
-        out.geometry, out.context.capacity, {0, p.config.text.max_context}, residual_.ne[1],
-        residual_.ne[1], residual_.ne[2]);
-    out.scratch = execution_.workspace.alloc_bytes(bytes);
+        out.geometry, out.context.capacity,
+        ops::ContextBucketRange::through(p.config.text.max_context), residual_.ne[2],
+        residual_.ne[1], residual_.ne[1]);
+    out.scratch =
+        bytes ? execution_.workspace.alloc_bytes(bytes) : MemorySpan{nullptr, 0, cuda_.device()};
     return out;
 }
 
@@ -107,7 +109,7 @@ void DraftAttentionRun::execute(const DraftSubmit& submit) {
     if (submit)
         submit(call);
     else
-        call.execute(inputs_.context_bound, cuda_);
+        call.execute(inputs_.bucket, cuda_);
     finish_dynamic_branch(v.output.view({v.output.ne[0] * v.output.ne[1], w, b}), p.output,
                           p.attention_conv, v.branch, residual_, execution_.parallel, cuda_);
 }
@@ -166,7 +168,8 @@ void DFlashRun::finish() {
     ops::candidate_selector_path(v.gathered, v.projected, inputs_.anchors, p.predecessor_codebook,
                                  p.successor_codebook, profile.public_tokens, inputs_.frontiers,
                                  inputs_.sampling, outputs_.candidate_ids, outputs_.drafts,
-                                 outputs_.proposal_q, inputs_.live_rows, arena, cuda_);
+                                 outputs_.proposal_q, outputs_.confidences, inputs_.live_rows,
+                                 arena, cuda_);
 }
 
 void draft_append_context(const Parameters& p, DraftExecution e, const Tensor& features,
@@ -195,10 +198,36 @@ void draft_append_context(const Parameters& p, DraftExecution e, const Tensor& f
                                 layers, profile.draft->context, envelope, e.workspace, cuda);
 }
 
+void draft_append_context(const Parameters& p, DraftExecution e, const Tensor& features,
+                          const Tensor& positions, const ops::RaggedSequenceView& ragged,
+                          const Tensor& offsets, CudaExecutionView cuda) {
+    const auto& profile = *p.profile;
+    const auto& draft   = *p.draft;
+    auto scope          = e.workspace.scope();
+    const int tokens    = ragged.total_tokens();
+    auto v              = workspace::draft_context(e.workspace, profile, tokens);
+    ops::linear(features.view({features.ne[0], tokens}), draft.feature_projection.weight,
+                v.projected, draft.feature_projection.policy, e.workspace, cuda);
+    e.parallel.gather(v.projected, v.gathered, cuda);
+    ops::rmsnorm_gathered_features(v.gathered, draft.context_norm,
+                                   profile.config.draft->rms_norm_eps, v.normalized, cuda);
+    std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeLayers> layers;
+    if (draft.layers.size() != layers.size())
+        throw std::invalid_argument("DFlash context layer group differs from materialization");
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        const auto& layer = draft.layers[i];
+        layers[i]         = {layer.context_key, layer.context_value, layer.key_norm,
+                             e.states.draft_layer(i, offsets)};
+    }
+    ops::context_kv_materialize(v.normalized, ragged, positions, layers, profile.draft->context,
+                                e.workspace, cuda);
+}
+
 std::size_t draft_workspace_capacity(const ModelProfile& p, int width, int max_batch) {
     WorkspaceLayoutBuilder a;
-    const auto& c = *p.config.draft;
-    const int h   = dimension(p.config.text.hidden);
+    const auto& c      = *p.config.draft;
+    const int h        = dimension(p.config.text.hidden);
+    const auto buckets = ops::ContextBucketRange::through(p.config.text.max_context);
     for (int b = 1; b <= max_batch; ++b) {
         auto batch  = a.scope();
         const int m = width * b;
@@ -214,8 +243,7 @@ std::size_t draft_workspace_capacity(const ModelProfile& p, int width, int max_b
                                       g.query_heads * g.head_dim};
                 scratch(a, ops::linear_split_workspace_capacity_bytes({layer.kvq, {}}, rows, m, m));
                 scratch(a, ops::sliding_window_attention_workspace_capacity_bytes(
-                               g, c.sliding_window.value(), {0, p.config.text.max_context}, width,
-                               width, b));
+                               g, c.sliding_window.value(), buckets, b, width, width));
             }
             {
                 auto scope = a.scope();
@@ -233,11 +261,10 @@ std::size_t draft_workspace_capacity(const ModelProfile& p, int width, int max_b
             (void)workspace::draft_finish(a, p, width - 1, b);
             const auto& head = p.draft->head;
             scratch(a, ops::linear_topk_workspace_capacity_bytes(head.qtype, head.n, head.k,
-                                                                 head.policy, (width - 1) * b,
-                                                                 (width - 1) * b));
-            scratch(a, linear(p.draft->selector, (width - 1) * b, (width - 1) * b));
+                                                                 head.policy, b, (width - 1) * b));
+            scratch(a, linear(p.draft->selector, b, (width - 1) * b));
             scratch(a, ops::candidate_selector_path_workspace_capacity_bytes(
-                           ops::CandidateSelectorInput::GatheredKeys, width - 1, width - 1, b, b));
+                           ops::CandidateSelectorInput::GatheredKeys, 1, width - 1, b, b));
         }
     }
     return a.peak_bytes();
@@ -265,6 +292,26 @@ std::size_t draft_context_workspace_capacity(const ModelProfile& p, const Execut
             DType::BF16,
             {dimension(p.config.text.hidden * p.config.draft->target_layer_ids.size()), retained});
         append(retained, 1);
+    }
+    {
+        auto scope         = a.scope();
+        const int max_cols = dimension(std::min<std::uint64_t>(
+            s.prefill_chunk,
+            std::uint64_t(s.max_concurrency) * std::uint64_t(p.draft->context.capacity)));
+        const bool split =
+            sequence_parallel_policy(p.local.size).partition(dimension(s.prefill_chunk), 0).split();
+        const bool may_truncate = s.prefill_chunk > p.draft->context.capacity;
+        if (split || may_truncate) {
+            (void)a.alloc(
+                DType::BF16,
+                {dimension(p.config.text.hidden * p.config.draft->target_layer_ids.size()),
+                 max_cols});
+        }
+        if (may_truncate) (void)a.alloc(DType::I32, {max_cols});
+        (void)workspace::draft_context(a, p, max_cols);
+        scratch(a, linear(p.draft->feature_projection, 1, max_cols));
+        scratch(a, ops::context_kv_materialize_workspace_capacity_bytes(
+                       p.draft->context, 1, max_cols, 1, dimension(s.max_concurrency)));
     }
     return a.peak_bytes();
 }

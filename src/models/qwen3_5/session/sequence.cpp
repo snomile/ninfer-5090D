@@ -109,6 +109,10 @@ std::uint32_t SessionImpl::window_end(const SequenceState& state, const RequestC
                                       std::uint32_t begin, std::uint32_t end,
                                       const vision::Window& window) const {
     end = std::min(end, begin + prefill_chunk);
+    // Recovery binding already owns a finite progress grant. A peer may finish
+    // or an optional capture may be skipped before that grant is executed.
+    if (request.lifecycle == Lifecycle::Prefilling && request.recovery)
+        end = std::min(end, request.recovery->coverage.main_frontier);
     if (request.lifecycle == Lifecycle::Prefilling &&
         request.base->summary.prompt_tokens > 2ULL * prefill_chunk &&
         std::any_of(requests.begin(), requests.end(), [&](const auto& peer) {
@@ -117,7 +121,10 @@ std::uint32_t SessionImpl::window_end(const SequenceState& state, const RequestC
         // Bound the non-preemptible forward pass while another lane can publish output.
         // Keep requests fitting two nominal chunks intact to avoid extra short-tail passes.
         // Demand and execution use this same window, and pure prefill keeps the full chunk.
-        end = std::min(end, begin + std::max(1U, prefill_chunk / 16));
+        // Packed prefill can leave a peer decoding while a non-trivial prompt
+        // tail remains. Keep that tail out of the peer's token latency budget.
+        const auto peer_chunk = std::clamp(prefill_chunk / 16, 1U, 32U);
+        end = std::min(end, begin + peer_chunk);
     }
     if (request.capture_reservation) end = std::min(end, request.capture_reservation->frontier);
     if (begin < request.base->summary.prompt_tokens)

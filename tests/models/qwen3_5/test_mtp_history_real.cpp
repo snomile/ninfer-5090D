@@ -120,10 +120,10 @@ public:
         if (forward) {
             DeviceBuffer output(device, input.conditioning.size() * sizeof(std::uint16_t));
             Tensor hidden_output(output.span(), DType::BF16, {hidden, input.width, input.batch});
-            const auto maximum =
-                *std::max_element(input.positions.begin(), input.positions.end()) + 1;
-            q35::execution::mtp_forward(execution, values, {1, static_cast<std::uint32_t>(maximum)},
-                                        hidden_output);
+            const auto maximum = *std::max_element(input.positions.begin(), input.positions.end());
+            const auto bucket  = ninfer::ops::select_context_bucket(
+                static_cast<std::uint32_t>(std::max(1, maximum + 1)));
+            q35::execution::mtp_forward(execution, values, bucket, hidden_output);
             fixture_.device().synchronize();
         } else {
             q35::execution::mtp_history(execution, values,
@@ -213,9 +213,9 @@ public:
         for (std::uint32_t kind = 0; kind < 2; ++kind)
             for (auto& page : pages_[kind])
                 page = pool_.resolve(reservation.materialize(pool_.record_class(kind + 1)));
-        q35::ContextWork bindings;
-        q35::Work work;
         for (std::uint32_t lane = 0; lane < kBatch; ++lane) {
+            q35::ContextWork bindings;
+            q35::Work work;
             rows_[lane] = {.member            = {{lane + 1, 1}, {{lane}, 1}},
                            .source_state      = {lane, 1},
                            .destination_state = {lane, 1},
@@ -232,11 +232,11 @@ public:
                     0,
                     {static_cast<std::int64_t>(pages_[pool][lane * 2].offset),
                      static_cast<std::int64_t>(pages_[pool][lane * 2 + 1].offset)}});
+            work.operation = std::move(bindings);
+            auto ticket    = submit(std::move(work), runtime::FrameKind::Context);
+            (void)result(ticket);
+            retire(ticket);
         }
-        work.operation = std::move(bindings);
-        auto ticket    = submit(std::move(work), runtime::FrameKind::Context);
-        (void)result(ticket);
-        retire(ticket);
     }
 
     void forward(std::uint32_t lane, int count, q35::ForwardPurpose purpose, bool visual = false) {
@@ -256,7 +256,7 @@ public:
         work.inputs.push_back(input);
         if (purpose == q35::ForwardPurpose::Control) {
             work.control_last_tokens = {input.tokens.back()};
-            work.sampling            = {{{}, false}};
+            work.sampling            = {{.constrained = false, .sample = false}};
         }
         const auto hidden = native_.rank().resources.frame.spec.hidden;
         std::optional<runtime::ExecutionTicket> ticket;
@@ -264,8 +264,10 @@ public:
         std::vector<std::uint16_t> embeddings;
         DeviceBuffer visual_storage;
         if (visual) {
-            // Isolate embedding-coordinate alignment from image encoding. These exact embeddings
-            // are consumed by Main and must also feed the shifted MTP token positions.
+            // Isolate embedding-coordinate alignment from image encoding. Text-only Prefill
+            // routes to the packed path, whereas real visual prefill takes the single-sequence
+            // forward/align_mtp_history path shared with Replay.
+            work.purpose = q35::ForwardPurpose::Replay;
             manual = std::make_unique<q35::detail::ComputeOperation>(
                 runtime::ExecutionRequest<q35::ExecutionTypes>{{}, {}, {.operation = work}});
             native_.rank().initialize_inputs(*manual);
@@ -342,6 +344,78 @@ public:
         oracle_.compare(lane, rows_[lane].backend_frontier);
     }
 
+    void packed_prefill(std::array<int, kBatch> counts) {
+        q35::ForwardWork work;
+        work.purpose = q35::ForwardPurpose::Prefill;
+        work.shape   = native_.session_plan.batch_execution->exact(kBatch, kBatch);
+        int total    = 0;
+        for (std::uint32_t lane = 0; lane < kBatch; ++lane) {
+            const auto base  = rows_[lane].main_frontier;
+            const auto count = counts[lane];
+            require(count > 0, "packed prefill test requires positive counts");
+            work.rows.push_back(rows_[lane]);
+            q35::InputWindow input;
+            input.tokens.resize(count);
+            input.rope_positions.resize(3 * count);
+            for (int i = 0; i < count; ++i) {
+                input.tokens[i] = 198 + (base + i) % 29;
+                for (int axis = 0; axis < 3; ++axis)
+                    input.rope_positions[axis * count + i] = static_cast<int>(base + i) + 2 * axis;
+            }
+            work.inputs.push_back(std::move(input));
+            total += count;
+        }
+        const auto inputs = work.inputs;
+        const auto ticket = submit({.operation = std::move(work)}, runtime::FrameKind::Compute);
+        (void)result(ticket);
+        const auto hidden = native_.rank().resources.frame.spec.hidden;
+        const auto produced =
+            read<std::uint16_t>(native_.rank().resources.frame.input_view(total, 1).hidden);
+        (void)native_.executor().commit(ticket, {});
+        retire(ticket);
+        int offset = 0;
+        for (std::uint32_t lane = 0; lane < kBatch; ++lane) {
+            const auto base   = rows_[lane].main_frontier;
+            const auto count  = counts[lane];
+            const auto& input = inputs[lane];
+            const int skip    = base == 0 ? 1 : 0;
+            if (count > skip) {
+                HistoryInput expected;
+                expected.width  = count - skip;
+                expected.batch  = 1;
+                expected.counts = {expected.width};
+                expected.lanes  = {static_cast<int>(lane)};
+                expected.conditioning.resize(std::size_t(hidden) * expected.width);
+                expected.ids.resize(expected.width);
+                expected.positions.resize(expected.width);
+                expected.rope.resize(3 * expected.width);
+                for (int i = 0; i < expected.width; ++i) {
+                    const auto p = base + i + skip - 1;
+                    const auto* h =
+                        p < base ? hidden_[lane].data() + std::size_t(p) * hidden
+                                 : produced.data() + std::size_t(offset + p - base) * hidden;
+                    std::copy_n(h, hidden, expected.conditioning.data() + std::size_t(i) * hidden);
+                    expected.ids[i]       = input.tokens[i + skip];
+                    expected.positions[i] = p;
+                    for (int axis = 0; axis < 3; ++axis)
+                        expected.rope[axis * expected.width + i] =
+                            p < base ? rows_[lane].tail_rope_position[axis]
+                                     : input.rope_positions[axis * count + p - base];
+                }
+                oracle_.history(expected);
+            }
+            hidden_[lane].insert(hidden_[lane].end(),
+                                 produced.begin() + std::size_t(offset) * hidden,
+                                 produced.begin() + std::size_t(offset + count) * hidden);
+            rows_[lane].main_frontier += count;
+            rows_[lane].backend_frontier = rows_[lane].main_frontier - 1;
+            for (int axis = 0; axis < 3; ++axis)
+                rows_[lane].tail_rope_position[axis] = input.rope_positions[axis * count + count - 1];
+            oracle_.compare(lane, rows_[lane].backend_frontier);
+            offset += count;
+        }
+    }
+
     void checkpoint_clone() {
         q35::Work work;
         work.context.operations.emplace_back(
@@ -374,7 +448,7 @@ public:
         work.rows         = {rows_[1]};
         work.inputs       = {q35::InputWindow{}};
         work.sample       = q35::SamplePurpose::FirstToken;
-        work.sampling     = {{{}, false}};
+        work.sampling     = {{.constrained = false, .sample = true}};
         const auto ticket = submit({.operation = std::move(work)}, runtime::FrameKind::Compute);
         auto value        = std::get<q35::ForwardResult>(result(ticket).output);
         require(value.generated && value.generated->counts == std::vector<std::uint32_t>{1},
@@ -401,9 +475,17 @@ public:
     }
 
     void decode(std::array<std::uint32_t, 2> extents, bool counterfactual) {
-        q35::DecodeWork work;
+        const auto& session = native_.session_plan;
+        const models::PhysicalBatchShape shape{kBatch, kBatch};
+        std::array<models::speculative::RoundMember, kBatch> members;
+        for (std::size_t i = 0; i < members.size(); ++i)
+            members[i].hard_limit = members[i].granted_limit = extents[i];
+        q35::DecodeWork work(models::speculative::DecodeRoundPlan::select(
+                                 SpeculativeBackend::Mtp, kDrafts, 1, shape, session.decode_path,
+                                 session.decode_routes.get(), members, extents),
+                             session.decode_path);
         for (std::uint32_t lane = 0; lane < kBatch; ++lane)
-            work.rows.push_back({rows_[lane], anchors_[lane], extents[lane], 8, {}});
+            work.rows.push_back({rows_[lane], anchors_[lane], {}});
         auto ticket          = submit({.operation = work}, runtime::FrameKind::Compute);
         const auto output    = std::get<q35::GeneratedResult>(result(ticket).output);
         auto& native         = native_.rank();
@@ -419,25 +501,25 @@ public:
         HistoryInput step;
         step.width  = 1;
         step.batch  = kBatch;
-        step.counts = {1, 1};
+        step.counts = {int(extents[0] != 0), int(extents[1] != 0)};
         step.lanes  = {0, 1};
         step.conditioning.resize(hidden * kBatch);
         step.ids.assign(anchors_.begin(), anchors_.end());
         step.positions.resize(kBatch);
         step.rope.resize(kBatch * 3);
         for (std::uint32_t lane = 0; lane < kBatch; ++lane) {
-            std::copy_n(hidden_[lane].data() + std::size_t(rows_[lane].main_frontier - 1) * hidden,
-                        hidden, step.conditioning.data() + lane * hidden);
-            step.positions[lane] = rows_[lane].main_frontier - 1;
+            if (const auto f = rows_[lane].main_frontier) {
+                std::copy_n(hidden_[lane].data() + std::size_t(f - 1) * hidden, hidden,
+                            step.conditioning.data() + lane * hidden);
+                step.positions[lane] = f - 1;
+            }
             for (int axis = 0; axis < 3; ++axis)
                 step.rope[axis * kBatch + lane] = rows_[lane].tail_rope_position[axis];
         }
-        oracle_.history(step, operation.speculative);
-        if (!operation.speculative) oracle_.compare_inputs(step);
+        if (operation.verifies_drafts()) oracle_.history(step, true);
         const auto rebuild = [&](std::array<std::uint32_t, 2> accepted, bool run_production) {
-            if (!operation.speculative) return;
             HistoryInput expected;
-            expected.width = kDrafts;
+            expected.width = std::max(1, width - 1);
             expected.batch = kBatch;
             expected.lanes = {0, 1};
             expected.conditioning.resize(std::size_t(hidden) * expected.width * kBatch);
@@ -445,17 +527,23 @@ public:
             expected.positions.resize(expected.width * kBatch);
             expected.rope.resize(expected.width * kBatch * 3);
             for (std::uint32_t lane = 0; lane < kBatch; ++lane) {
-                expected.counts.push_back(static_cast<int>(accepted[lane] - 1));
+                const int skip = rows_[lane].main_frontier == 0 || extents[lane] != 0;
+                expected.counts.push_back(static_cast<int>(accepted[lane]) - skip);
                 for (int i = 0; i < expected.width; ++i) {
                     if (i >= expected.counts[lane]) continue;
-                    const auto dst = lane * expected.width + i, src = lane * width + i;
-                    std::copy_n(target.data() + std::size_t(src) * hidden, hidden,
+                    const int column     = i + skip;
+                    const auto dst       = lane * expected.width + i;
+                    const auto src       = lane * width + column;
+                    const auto* previous = column ? target.data() + std::size_t(src - 1) * hidden
+                                                  : step.conditioning.data() + lane * hidden;
+                    std::copy_n(previous, hidden,
                                 expected.conditioning.data() + std::size_t(dst) * hidden);
-                    expected.ids[dst]       = ids[src + 1];
-                    expected.positions[dst] = positions[src];
+                    expected.ids[dst]       = ids[src];
+                    expected.positions[dst] = column ? positions[src - 1] : step.positions[lane];
                     for (int axis = 0; axis < 3; ++axis)
                         expected.rope[axis * expected.width * kBatch + dst] =
-                            rope[axis * width * kBatch + src];
+                            column ? rope[axis * width * kBatch + src - 1]
+                                   : step.rope[axis * kBatch + lane];
                 }
             }
             if (run_production) {
@@ -468,13 +556,14 @@ public:
                                            frame.host_commit.accepted_columns.data(),
                                            kBatch * sizeof(std::int32_t), cudaMemcpyHostToDevice,
                                            native_.device().stream()));
-                native.rebuild_mtp_history(kBatch);
+                native.rebuild_mtp_history(kBatch, width);
                 native_.device().synchronize();
                 oracle_.compare_inputs(expected);
             }
             oracle_.history(expected);
-            for (std::uint32_t lane = 0; lane < kBatch; ++lane)
-                oracle_.compare(lane, rows_[lane].main_frontier + accepted[lane] - 1);
+            if (run_production)
+                for (std::uint32_t lane = 0; lane < kBatch; ++lane)
+                    oracle_.compare(lane, rows_[lane].main_frontier + accepted[lane] - 1);
         };
         if (counterfactual) {
             // Exercise actual-A rebuilding independently of the model's stochastic acceptance.
@@ -482,7 +571,7 @@ public:
             for (const auto accepted : {1U, 2U, kDrafts + 1}) rebuild({accepted, 1}, true);
         }
         std::array<std::uint32_t, 2> accepted{output.counts[0], output.counts[1]};
-        if (operation.speculative) rebuild(accepted, true);
+        rebuild(accepted, false);
         q35::Commit commit;
         for (auto count : accepted) commit.rows.push_back({count, false, false});
         (void)native_.executor().commit(ticket, std::move(commit));
@@ -592,10 +681,20 @@ int main() {
         cases.forward(0, 2, q35::ForwardPurpose::Control);
         cases.forward(1, 3, q35::ForwardPurpose::Replay);
         cases.decode({kDrafts, 0}, true);
+        cases.decode({2, 1}, false);
+        cases.decode({0, 1}, false);
         cases.decode({0, 0}, false);
+        cases.decode({0, 0}, false);
+        cases.decode({kDrafts, kDrafts}, false);
         cases.forward(0, 4, q35::ForwardPurpose::Prefill, true);
         cases.reset_for_visual_root();
         cases.forward(1, 3, q35::ForwardPurpose::Prefill, true);
+        cases.reset_for_visual_root();
+        cases.decode({1, 0}, false);
+        cases.decode({1, 1}, false);
+        cases.reset_for_visual_root();
+        cases.packed_prefill({4, 1});
+        cases.packed_prefill({5, 6});
         std::cout << "OK MTP independent Main-conditioning oracle ["
                   << (use_graph ? "graph" : "eager") << "]: " << cases.checks() << " KV checks\n";
     } catch (const std::exception& error) {

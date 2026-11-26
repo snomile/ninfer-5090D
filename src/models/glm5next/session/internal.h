@@ -96,6 +96,7 @@ struct Sequence {
     std::uint64_t membership_mark = 0;
     bool computing                = false;
     SpeculativeStats speculative;
+    speculative::SequenceSpeculativeState speculative_state;
 };
 
 struct Suspended {
@@ -197,7 +198,10 @@ struct ComputeTransaction {
     runtime::ExecutionTicket ticket;
     std::vector<SequenceHandle> members;
     std::vector<WorkRow> rows;
-    std::vector<std::uint32_t> draft_extents;
+    std::optional<speculative::DecodeRoundPlan> round;
+    std::vector<std::uint8_t> could_speculate;
+    std::optional<speculative::CostQuery> cost_query;
+    bool record_online_cost = true;
     std::optional<ComputeResult> result;
     ExecutionSample observed_result;
     std::vector<runtime::CommitDecision> decisions;
@@ -299,6 +303,7 @@ public:
     [[nodiscard]] PhysicalUsageSnapshot usage() const noexcept;
     std::shared_ptr<const ModelDefinition> definition;
     const SessionPlan plan;
+    speculative::SpeculativeCostModel cost_model;
     const ExecutionShape& shape;
     runtime::Executor<ExecutionTypes>* executor = nullptr;
     std::unique_ptr<context::ContextDirectory> directory_owner;

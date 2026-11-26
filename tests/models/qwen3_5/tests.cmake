@@ -10,6 +10,10 @@ ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
   LIBRARIES ninfer_engine ninfer_core)
 
+ninfer_add_test(ninfer_qwen3_5_packed_prefill_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_packed_prefill.cpp"
+  LIBRARIES ninfer_model_control ninfer_model_execution ninfer_model_loading)
+
 ninfer_add_test(ninfer_qwen3_5_state_image_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state_image.cpp"
   LIBRARIES ninfer_engine ninfer_core)
@@ -21,6 +25,13 @@ ninfer_add_test(ninfer_qwen3_5_state_image_layout_test
 ninfer_add_test(ninfer_qwen3_5_native_transactions_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_native_transactions.cpp"
   LIBRARIES ninfer_model_execution ninfer_model_loading ninfer_core)
+
+ninfer_add_test(ninfer_qwen3_5_dynamic_speculation_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dynamic_speculation_real.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/dynamic_speculation/rounds.cpp"
+  LIBRARIES ninfer_engine ninfer_model_execution ninfer_model_loading)
+
+ninfer_test_interpose(ninfer_qwen3_5_dynamic_speculation_real_test cudaGraphLaunch)
 
 ninfer_add_test(ninfer_qwen3_5_mtp_history_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_history_real.cpp"
@@ -103,6 +114,7 @@ set_tests_properties(ninfer_qwen3_5_agent_continuation_real_test PROPERTIES
 set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_loading_real_test
   ninfer_qwen3_5_native_transactions_test
+  ninfer_qwen3_5_dynamic_speculation_real_test
   ninfer_qwen3_5_mtp_history_real_test
   ninfer_qwen3_5_prefix_real_test
   ninfer_qwen3_5_terminal_publication_real_test
